@@ -39,6 +39,9 @@ run_mutation() {
   if [ -n "$FILTER" ] && [[ "$label" != *"$FILTER"* ]]; then return; fi
   echo "=================================================="
   echo "MUTATION ${label}"
+  # The baseline has to be taken while the tree is clean — taking it after the mutation is applied
+  # compares the mutated run against itself and reports every mutation as survived.
+  baseline "$testspec"
   python3 - "$file" "$py" <<'EOF'
 import sys, pathlib
 path, src = pathlib.Path(sys.argv[1]), sys.argv[2]
@@ -56,7 +59,6 @@ EOF
     head -5 "$WORK/tsc.txt"
     git checkout -- "$file"; MUTATED=""; return
   fi
-  baseline "$testspec"
   npx vitest --run "$testspec" > "$WORK/run.txt" 2>&1
   local before after
   before=$(printf '%s\n' "${BASELINE[$testspec]}")
