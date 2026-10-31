@@ -95,13 +95,9 @@ run_mutation "M3 traceback gets no share of the limit" src/manager.ts '    const
 ---MUTATE---
     const tracebackBudget = 0;' "test/honesty.test.ts"
 
-run_mutation "M4 start failure drops the startup output again" src/channel.ts '    if (!last) return;
+run_mutation "M4 start failure drops the startup output again" src/channel.ts '    const parts = [this.deathNote, this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined, this.startupOutput()];
 ---MUTATE---
-    if (!last) {
-      this.loose = [];
-      this.looseBytes = 0;
-      return;
-    }' "test/lifecycle.test.ts"
+    const parts = [this.deathNote, this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined];' "test/lifecycle.test.ts"
 
 run_mutation "M5 fatal frame is not kept" src/channel.ts '        this.fatalNote = text;
 ---MUTATE---
@@ -219,10 +215,23 @@ run_mutation "R3-07 the startup buffer drops whole chunks again" src/channel.ts 
 run_mutation "R3-07 keepNewest keeps the oldest bytes instead of the newest" src/channel.ts '  const dropped = total - cap;
   const kept: Buffer[] = [];
   let skip = dropped;
+  for (const chunk of chunks) {
+    if (chunk.length <= skip) {
+      skip -= chunk.length;
+      continue;
+    }
+    kept.push(skip > 0 ? chunk.subarray(skip) : chunk);
+    skip = 0;
+  }
 ---MUTATE---
   const dropped = total - cap;
   const kept: Buffer[] = [];
-  const skip = 0;' "test/buffers.test.ts"
+  let taken = 0;
+  for (const chunk of chunks) {
+    if (taken >= cap) break;
+    kept.push(taken + chunk.length > cap ? chunk.subarray(0, cap - taken) : chunk);
+    taken += chunk.length;
+  }' "test/buffers.test.ts"
 
 run_mutation "F3-01 the exception name is quoted unclipped in the result" src/manager.ts '    const ename = frame?.ename ? oneLine(frame.ename, ENAME_CHARS) : null;
 ---MUTATE---
@@ -248,7 +257,7 @@ run_mutation "R3-10 capture between two cells is parked in the later cell's log 
       return;
     }
 ---MUTATE---
-    if (false && this.lastClosed) {
+    if (this.lastClosed && false) {
       this.outOfBandOutput = true;
       this.lastClosed.lateWrite(chunk);
       return;
