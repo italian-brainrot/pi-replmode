@@ -1,19 +1,12 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.6.3/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
   "vcs": {
     "enabled": true,
     "clientKind": "git",
     "useIgnoreFile": true
   },
   "files": {
-    "includes": [
-      "**",
-      "!**/node_modules",
-      "!**/dist",
-      "!**/*.log",
-      "!**/python",
-      "!**/*.py"
-    ]
+    "includes": ["**", "!**/node_modules", "!**/dist", "!**/*.log", "!**/python", "!**/*.py", "!**/*.md"]
   },
   "formatter": {
     "enabled": true,
@@ -47,9 +40,17 @@
   },
   "overrides": [
     {
-      "includes": [
-        "test/**"
-      ],
+      "includes": ["src/wire.ts", "test/wire.test.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noControlCharactersInRegex": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["test/**"],
       "linter": {
         "rules": {
           "suspicious": {
