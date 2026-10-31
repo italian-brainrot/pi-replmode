@@ -114,9 +114,11 @@ Everything a cell printed goes to a log file, whether or not it fit in the tool 
   history/<channel>.jsonl  one line per cell, so a new session can see what a lost channel held
 ```
 
-A channel name that is not already a plain file name (`notes/live`, `a b`) gets a short digest appended
-in those three places, so two different channel names never share a daemon log, a history file or an
-IPython profile.
+A channel name that is not already a plain file name (`notes/live`, `a b`) — or that already *looks*
+digested, because a stem is a name a model can copy back — gets a short digest of the real name appended in
+those three places, so two different channel names never share a daemon log, a history file or an IPython
+profile. When a channel's Python process dies before it can start, the host writes what it captured into
+`daemon/<channel>.log` and sends the failed call to that file, since the daemon never opened it.
 
 Retained logs are pruned at session start (3 days, 200 files).
 

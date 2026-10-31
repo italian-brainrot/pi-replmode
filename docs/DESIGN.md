@@ -140,7 +140,11 @@ run(code, timeout = 60, channel = "main")
   answer**: the traceback arrives in the frame, not the capture, so it is given whatever the capture did
   not need (never less than a quarter of the limit) rather than riding on top of it, and when it is
   shortened the whole thing is appended to the exec log and the same log-plus-global escape hatch
-  applies. The exception's own `evalue` is clipped to one line, because the traceback already carries it.
+  applies; the totals quoted in the truncation note are counted from the log *after* that append, so they
+  describe the file the model is sent to (R3-09). The exception's own `evalue` and `ename` are clipped to
+  one line each, because the traceback already carries them — and everything else the host pastes into an
+  answer (the daemon's note ring, the names the cell bound, the channel name) is bounded where it is
+  quoted, because a cell can choose the size of all of them (R3-01).
 - `timeout` expiry does **not** kill anything: the host detaches, returns
   `moved to background with ID: repl-<id>` plus the log path and the last ~4 KB, and keeps draining
   the capture pipe into that log. The `exec_end` frame arrives later and completes the task record.
@@ -217,8 +221,12 @@ a dead channel).
   exists for a channel that has no live daemon, per the spec. The channel name is used as three file
   names — history, daemon log, IPython profile — so they all come from one function (`names.ts`): a name
   that is already a file name keeps it, anything else gets a short digest of the real name appended, and
-  `a/b` and `a_b` no longer share a file (R2-04). The note is keyed by the *real* name the record
-  carries, never by the file stem, or a running channel gets announced as one that was lost.
+  a name that already *looks* digested gets one appended too, because otherwise the stem of one channel is
+  a name that maps to itself and two channels share a file (R3-03). So `a/b` and `a_b` no longer share a
+  file (R2-04), and neither do `r3-dig/x` and `r3-dig_x-f395bbcba5`. The note is keyed by the *real* name
+  the record carries, never by the file stem, or a running channel gets announced as one that was lost;
+  and when two files do remember one channel (the upgrade from before the digests), the newest record by
+  its own timestamp wins (R3-08).
 - Daemon death (user code segfaults, `os._exit`, OOM) → protocol EOF → mark channel dead, fail the
   in-flight call with what was captured, recreate on next use. EOF on the frame stream counts as death
   even if the process is still there: a daemon that closed its own protocol descriptor can never answer
@@ -360,8 +368,11 @@ Settled with the user; implement these, do not re-open them.
    the daemon created. Between blocks attribute, flag the channel, say so in the result; during a block,
    nothing is claimed. Reopen only with a cheap signal, never with a pump.
 6. **One encoder for every file name a channel name becomes** (`names.ts`). Not a constrained name
-   language — the model may name a channel `notes/live` — and not naive sanitisation, which collides.
-   A digest suffix appears only for names that are not already file names.
+   language — the model may name a channel `notes/live` — and not naive sanitisation, which collides. A
+   digest suffix appears for names that are not already file names *and* for names that already look
+   digested, since a stem is a name a model can copy back into `channel` (R3-03). The consequence to
+   remember: the encoder is not idempotent, and only a channel's real name may be passed to it. A channel
+   name is also capped in length, because it is quoted in results and in every later session's prompt.
 
 ## Where the next session starts
 

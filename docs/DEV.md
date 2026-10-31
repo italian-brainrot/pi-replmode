@@ -34,7 +34,9 @@ src/               the extension: index.ts (registration), manager.ts (policy: r
 test/              vitest, loading the extension the way pi does (test/helpers/extension.ts) and
                    talking to real daemons: run/background (the contract), capture/resilience/cap
                    (attribution, interrupts, lifecycle), lifecycle (stub interpreters: never-ready,
-                   frame-then-death, protocol EOF), wire/format/prompt/registration/env
+                   frame-then-death, protocol EOF), limits (what a result may cost), names (channel
+                   names and the files they become), prompt/registration (the model-facing surface),
+                   wire/buffers (pure arithmetic: the capture splitter, the bounded startup buffer)
 
 docs/AUDIT.md      the tester↔fixer log. Every failing test that documents a defect carries its
                    issue id (`R1-03`) in a comment, and the matching entry explains the fix.
@@ -42,7 +44,8 @@ scripts/dev.mjs    the watch loop
 scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so there is one
                    definition of where the environment lives)
 scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
-                   "is this fix actually pinned?" check, run it after a pass's fixes
+                   "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
+                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is ~30 mutations / ~3 min
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
 ```
 
@@ -64,8 +67,11 @@ spikes/            the experiments that proved interrupt and formatter behaviour
 - **Is a fix actually pinned?** `bash scripts/mutation-audit.sh` applies one deliberate break to a fixed
   defect at a time, runs the test file that should notice, and reverts with `git checkout`. A mutation
   that changes nothing means the fix has no test behind it — pass 3 found two that way (the `evalue`
-  clipping, and `flushLoose` going through `Exec.lateWrite`). Add the mutation to the script when you fix
-  something, and keep the list short enough to run in under a minute.
+  clipping, and `flushLoose` going through `Exec.lateWrite`), and the pass-3 fixes found three of their
+  own (the capacity wording, `bg_stop`'s "variables", and two copies of one bound masking each other).
+  Add the mutation to the script when you fix something — prose fixes get mutations too. The script
+  reverts with `git checkout`, so **commit before running it**, and pass a label substring (`… R3-0`)
+  while iterating; the whole list is about three minutes.
 - **Real pi smoke**, which catches what neither suite does (registration, prompt section, real
   harness): use a throwaway agent dir so the user's settings are untouched.
 
@@ -77,7 +83,13 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   PI_CODING_AGENT_DIR=/tmp/pi-smoke-agent pi --no-builtin-tools -p "Use the run tool twice: set answer = 6*7, then print(answer)."
   ```
 
-  It answers 42 when registration, the prompt section, and cross-call state all work.
+  It answers 42 when registration, the prompt section, and cross-call state all work. Two more prompts are
+  worth running after anything that touches startup or death: a channel named `-smoke-dash` (a leading dash
+  must not reach argparse as a separate token, and the definitions note should still be there), and
+  `import os; os._exit(3)` followed by a second call on the same channel (the death reported, a fresh
+  channel next). For `bg_stop`, start a background cell that installs
+  `signal.signal(signal.SIGINT, lambda *a: os._exit(7))` and stop it: the answer must say the channel went
+  with the cell.
 
 ## Things that bite
 
@@ -102,26 +114,36 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   and `Channel.wait` report `dead` when the process went away, even if `exec_end` had arrived first.
 - **Attribution of late bytes has a hard edge.** Bytes that arrive while no block is open go to the log of
   the exec whose block closed last (they came from its threads or children), under a header, capped at
-  256 KB. Only output from before the first block ever opened is held for the next block. Bytes that
-  arrive **while a block is open** cannot be told apart from that cell's own output — the whole channel
-  shares one capture stream — so the host flags a channel that has produced out-of-band bytes and says so
-  in every later result from it. Do not word that header, that note, or the DESIGN paragraph as if the
-  host knows more than that (R2-07); and do not "fix" it with per-exec capture pipes without reading the
-  deadlock argument in `docs/AUDIT.md`.
+  256 KB. Only output from before the first block ever opened is held for the next block — that buffer
+  (`loose`, 64 KB) is trimmed inside its oldest chunk by `keepNewest` and never dropped whole, so the
+  newest bytes survive; for a channel that never reported `ready`, the host writes what it received into
+  the daemon's log path and points the model at that file, because the daemon never opened it and a
+  `log`-frame file could never have held capture-stream bytes (R3-07). Bytes that arrive **while a block is
+  open** cannot be told apart from that cell's own output — the whole channel shares one capture stream —
+  so the host flags a channel that has produced out-of-band bytes and says so in every later result from
+  it. Do not word that header, that note, or the DESIGN paragraph as if the host knows more than that
+  (R2-07); the header for pre-first-block bytes is a different one, because no cell had ended (R3-10). Do
+  not "fix" any of it with per-exec capture pipes without reading the deadlock argument in
+  `docs/AUDIT.md`.
 - **A channel name is three file names** — the daemon log, the history file, the IPython profile — and
   they must come from `names.ts`, the one place that keeps the mapping one-to-one. Naive sanitising puts
   `a/b` and `a_b` in one log, one history file and one sqlite profile; keying the "these channels are
   gone" note by the *file stem* instead of the record's real name tells the model a running channel
-  died (R2-04). Two holes to keep in mind while it is verbatim-or-digest: a digested stem is itself a legal
-  name, so the mapping has fixed points unless the digest is applied to names that already look digested
-  (R3-03), and the name also travels as a daemon argument, where a leading `-` is read as an option
-  (R3-02 — pass it as `--channel=<name>`).
+  died (R2-04). Two holes to keep in mind while it is verbatim-or-digest: the stem this function produces
+  is itself a legal name, so a name that already looks digested (`-<10 hex>`) must never be kept verbatim
+  or the mapping has fixed points (R3-03) — which also means `channelFileStem` is *not* idempotent and
+  nothing may feed a stem back into it; and the name travels as a daemon argument, where a leading `-`
+  reads as an option, so it is passed as one token, `--channel=<name>` (R3-02). `run` also refuses names
+  over 200 characters, because a channel name is quoted in results, in the history file and in every later
+  session's prompt section (F3-02).
 - **Anything the host pastes into an answer is part of the size of the answer.** The 50 000 budget covers
-  the capture and the traceback, but `deadResult` also pastes the daemon's note ring and the result pastes
-  `definitions`, and both were bounded by *count* rather than by bytes, which a cell controls: a `signal`
-  handler's `__name__` reaches a note, and Python identifiers may be 4095 characters (R3-01). Bound such
-  fields with `oneLine` where they are quoted, and remember that `definitions` also lands in the history
-  file and from there in the prompt section of every later session.
+  the capture and the traceback, and most of what is left is text a *cell* (or a caller) chooses: the
+  daemon's `log` frames, reachable from a cell via a `signal` handler's `__name__`; the names a cell bound,
+  which land in the result, in the history file, and in the prompt section of every later session; an
+  exception's `__name__`, bounded only by what `type()` accepts; and the channel name itself. Bound every
+  one of them where it is quoted (`oneLine`, with the limits as constants in `manager.ts`/`prompt.ts`, and
+  the note ring clipped in `Channel.note` so the host never holds the whole string). `details.definitions`
+  is deliberately the raw list.
 - **The 50 000-character limit covers the whole answer, not just the capture.** The traceback arrives in
   the `exec_end` frame and is appended after the capture, so it needs its own share of the budget or a
   cell that raises with a row of data in its message returns a result of unbounded size (R2-02). If you
