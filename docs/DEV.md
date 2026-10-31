@@ -45,7 +45,8 @@ scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so
                    definition of where the environment lives)
 scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
                    "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
-                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is ~30 mutations / ~3 min
+                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 36 mutations /
+                   ~14 minutes (it typechecks each mutation and re-runs a baseline per test file)
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
 ```
 
@@ -75,7 +76,11 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   own (the capacity wording, `bg_stop`'s "variables", and two copies of one bound masking each other).
   Add the mutation to the script when you fix something — prose fixes get mutations too. The script
   reverts with `git checkout`, so **commit before running it**, and pass a label substring (`… R3-0`)
-  while iterating; the whole list is about three minutes.
+  while iterating; the whole list is about fourteen minutes.
+  Two things it guards against, both learned the hard way: a mutation is applied only if the tree still
+  `tsc`s (an anchor that no longer matches the code's shape is skipped loudly rather than counted as a
+  survival — three anchors had rotted that way), and a mutation counts as dead only when the **set of
+  failing test names** changes, because a suite with tests red on purpose fails no matter what you break.
 - **Real pi smoke**, which catches what neither suite does (registration, prompt section, real
   harness): use a throwaway agent dir so the user's settings are untouched.
 
@@ -93,7 +98,9 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   `import os; os._exit(3)` followed by a second call on the same channel (the death reported, a fresh
   channel next). For `bg_stop`, start a background cell that installs
   `signal.signal(signal.SIGINT, lambda *a: os._exit(7))` and stop it: the answer must say the channel went
-  with the cell.
+  with the cell. Since R4-06, one more: start a call whose channel is slow to come up and abort it, then
+  `ps` for a `python -m replmode` that outlived the call — an aborted start must not leave a daemon holding
+  a slot, and must not run its cell.
 
 ## Things that bite
 

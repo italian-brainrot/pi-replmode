@@ -1779,10 +1779,27 @@ the answer to say what did happen.
 
 ### Mutation re-run
 
-`scripts/mutation-audit.sh` grew four lines (36 total): the three new pins this pass added
-(R3-03's uppercase digest, R3-10's late-bytes routing, R3-07's append-not-truncate) and R3-09's line
-totals. Full pass on the committed tree: **see the table in the next commit's note** — it was run after
-this section was written, so the result is recorded in `MEMORY.md` and in the commit that follows.
+`scripts/mutation-audit.sh` grew four lines (36 in the list). Running it exposed two faults in the script
+itself, and fixing them changed the verdict, so they are worth recording:
+
+- **The verdict was an exit code, and red tests make that meaningless.** With thirteen tests failing on
+  purpose, every mutation "dies". The script now takes a **baseline of failing test names** per target
+  file and calls a mutation dead only when that set changes — and it prints which new tests noticed. (A
+  first attempt at this took the baseline *after* applying the mutation, so the first mutation per file
+  was compared with itself and nine known-dead mutations, M1 among them, came out as survived. The
+  baseline has to be taken on a clean tree.)
+- **Three anchors had stopped compiling and were silently skipped.** `npx tsc --noEmit` now gates every
+  mutation. M4's text predated pass 3's `loose`/`startupOutput` refactor (it named `looseBytes`, which no
+  longer exists), `keepNewest`'s assigned to a `const`, and R3-10's kept a `lastClosed` access inside a
+  branch TypeScript had proved unreachable. All three are rewritten and all three now die on their tests.
+
+Full pass on the committed tree, in 14 minutes: **36 mutations run, 34 died, 2 survived — `M6`
+(`flushLoose`'s `Exec.lateWrite` → `Exec.write`) and `M11` (`failure()`'s choice of status), exactly the
+two pass 3 accepted and argued.** The four anchors this pass added each died on the test written for it:
+the uppercase digest on the two injectivity pins, the late-bytes misrouting on "once a block has opened,
+the startup header is never used again", the truncating second failed start on "both leave their complaint
+in the file they point at", and the cut-based line total on "the line count it quotes comes from the same
+count as the character count".
 
 ### Handoff to the fixer (pass 4)
 
