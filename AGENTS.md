@@ -1,6 +1,6 @@
 # pi-replmode
 
-This is an execution feature for Pi coding agent where the model interacts with the environment via a stateful IPython REPL. This is similar to codemode, but allows the model to define it's own tools as python functions. This project is mostly being developed by you (the AI), and your own tools in Pi will eventually be replaced with this project's.
+`pi-replmode` allows the model to run commands and write files using a stateful IPython REPL. This is similar to codemode, but allows the model to define it's own tools as python functions. This project is mostly being developed by you (the AI), and your own tools in Pi will eventually be replaced with this project's.
 
 ## Coding guide for AI agents
 
@@ -21,7 +21,7 @@ Execute code in stateful IPython REPL. This is how agent reads, edits, writes fi
 
 Args:
 
-- code (str) - code to send to REPL. Standard REPL semantics - typing an expression at the end is shorthand for print(repr(expression)). Top-level await supported by ipython.
+- code (str) - code to send to REPL. Standard REPL semantics - typing an expression at the end is shorthand for print(repr(expression)). IPython magic commands are supported. Top-level await supported by ipython. If expression at the end returns an object that supports IPython Rich Display Format, it should use that method or repr depending on format. For example `_repr_html_` is usually less machine-readable than `repr`, so `repr` should be preferred. If format method is image, send visual content to model.
 - timeout (int) = 60 - timeout in seconds, after timeout, execution moves to background with output streamed to a temporary file, and returns id.
 - channel (str) = "main" - isolated REPL instance, auto-created if doesn't exist. Running commands in REPL which currently has background command running is not allowed. Multiple channels can be used to work on different tasks concurrently.
 
@@ -38,6 +38,10 @@ Args:
 - timeout (int) = 600  - timeout in seconds
 
 Background task handling is similar to `/home/qq/distrobox/ubuntu/Projects/my-pi-extensions/packages/pi-bg-tasks`.
+
+### bg_stop
+
+Stop a background task by id (send KeyboardInterrupt).
 
 ## REPL tools
 
@@ -61,8 +65,7 @@ Ask user question, or ask them to perform an action that AI can't perform (such 
 
 Args:
     question (str): Text of the question.
-    choices (Sequence[str]): List of choices, can be empty.
-    allow_manual (bool): Whether to add additional choice to type the answer manually. Defaults to True.
+    choices (Sequence[str]): List of choices, can be empty. There is always an additional choice to type the answer manually.
 
 Returns:
     str: The answer
@@ -85,6 +88,6 @@ Env comes with preinstalled packages:
 
 On harness restart, all variables in the env may be lost. This is fine - in other harnesses tmp folder is lost on restart, agent can recreate it easily. Append a notification about this to the chat.
 
-## Compatibility with other extensions
+## Compatibility
 
 Unlike codemode, replmode is isolated and doesn't integrate tools from extensions and MCP servers.
