@@ -1,0 +1,62 @@
+{
+  "name": "pi-replmode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: one stateful IPython REPL instead of a pile of one-shot tools. Registers run, bg_wait and bg_stop.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "repl",
+    "ipython",
+    "python",
+    "stateful"
+  ],
+  "files": [
+    "src",
+    "python",
+    "requirements.txt",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "npm run typecheck && npm run lint && npm run test && npm run pytest",
+    "dev": "node scripts/dev.mjs",
+    "fmt": "biome check --write .",
+    "install:local": "pi install .",
+    "lint": "biome check .",
+    "py:test": "node scripts/py.test.mjs",
+    "py:env": "node scripts/py.env.mjs",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "uninstall:local": "pi remove ."
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.3",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@types/node": "^22.20.5",
+    "jiti": "2.7.0",
+    "typebox": "1.3.27",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "npm": ">=10.0.0"
+  }
+}

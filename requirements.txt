@@ -1,0 +1,26 @@
+# The REPL environment. This file is the source of truth for what `run` can import; the venv
+# itself lives outside the repository (see docs/DESIGN.md, "Python environment").
+#
+# Pinned exactly: the env directory is named after a hash of this file plus the interpreter, so a
+# changed pin means a fresh env rather than a half-upgraded one. Bump a pin, run `npm run py:env`.
+#
+# Only ipython, numpy and pillow are used by the daemon itself. Everything else is installed once
+# and never imported at startup, so a heavy set costs disk and sync time, not latency.
+#
+# pytest is here on purpose: the daemon's own test suite runs against this environment, and a model
+# doing test-driven work in the REPL can run its own tests with it.
+ipython==9.18.0
+numpy==2.5.4
+pillow==13.0.0
+pandas==3.1.0
+polars==2.1.0
+scipy==1.18.1
+matplotlib==3.11.2
+httpx==0.28.1
+requests==2.34.2
+pyyaml==6.0.3
+scikit-learn==1.9.1
+opencv-python-headless==5.0.0.93
+librosa==1.0.0
+playwright==1.64.1
+pytest==9.2.0

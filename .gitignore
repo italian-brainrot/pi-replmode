@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Tooling output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local state
+*.log
+.DS_Store
+.pi/settings.local.json
+.pi/agent/
+.venv/
+.pytest_cache/
+__pycache__/
