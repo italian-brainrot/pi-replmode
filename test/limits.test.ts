@@ -11,9 +11,11 @@
  * expected to fail until it is fixed.
  */
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MAX_OUTPUT_CHARS } from "../src/format.ts";
+import { channelFileStem } from "../src/names.ts";
 import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
@@ -126,6 +128,56 @@ describe("text the daemon chooses", () => {
     for (const task of listed.details?.tasks ?? []) {
       expect((task.ename ?? "").length, `the listing reports ename as ${task.ename?.length} characters`).toBeLessThanOrEqual(200);
     }
+  });
+
+  it("F3-03: and the channel's history file does not keep the names whole either", async () => {
+    // The result and the prompt section are two copies of what a cell bound; the history file is the copy
+    // that outlives the session and is re-read by every later one. Bounding it where it is written is what
+    // keeps a 3001-character identifier from being carried around for ever, whatever later code quotes.
+    const names = Array.from({ length: 20 }, (_, index) => `z`.repeat(3000) + index);
+    await run(`for n in ${JSON.stringify(names)}:\n    exec(n + " = 1")`, { channel: "l-histsize" });
+
+    const path = join(ext.agentDir, "replmode", "history", `${channelFileStem("l-histsize")}.jsonl`);
+    const recorded = readFileSync(path, "utf8");
+    expect(recorded, "the history file does not record what the cell defined").toContain('"definitions"');
+    expect(recorded, "the history file kept no usable form of the names").toContain("z".repeat(60));
+    expect(recorded, "a 3000-character remembered name was written whole to the history file").not.toContain("z".repeat(500));
+    expect(recorded.length, `the history file for one channel is ${recorded.length} characters`).toBeLessThan(20_000);
+  });
+
+  it("F3-04: and the prompt section bounds a name it is quoted from any history file", async () => {
+    // The other half of the same bound: a history file may have been written by a build that did not clip
+    // (or by anything else at all), so the section has to shorten what it quotes rather than trust the
+    // record. This is the copy that is re-sent on every request of every later session.
+    const measure = async () => {
+      const sections: Record<string, string> = {};
+      await ext.emit({ type: "session_start", sessionId: `f3-04-${Date.now()}-${Math.random()}` }, { hasUI: true });
+      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
+      return sections.replmode ?? "";
+    };
+
+    const before = await measure();
+    const dir = join(ext.agentDir, "replmode", "history");
+    mkdirSync(dir, { recursive: true });
+    const names = Array.from({ length: 20 }, (_, index) => "q".repeat(3000) + index);
+    const record = {
+      ts: new Date(Date.now() + 60_000).toISOString(),
+      id: "repl-hintq000",
+      channel: "h-hintq",
+      status: "completed",
+      elapsed: 1,
+      code: "for n in names: exec(n + ' = 1')",
+      definitions: names,
+    };
+    writeFileSync(join(dir, "h-hintq.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
+
+    const after = await measure();
+    expect(after, "the section no longer names what a cell defined").toContain("defined:");
+    expect(after, "a remembered 3000-character name is quoted whole in the prompt section").not.toContain("q".repeat(300));
+    expect(after.length, `the prompt section grew from ${before.length} to ${after.length} over one remembered cell`).toBeLessThan(
+      before.length + 1_000,
+    );
+    expect(readdirSync(dir), "the hand-written history file was rewritten by the way").toContain("h-hintq.jsonl");
   });
 });
 

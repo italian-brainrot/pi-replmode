@@ -354,6 +354,10 @@ time.sleep(600)
         expect(failed.isError).toBe(true);
         const shown = text(refused);
         expect(shown, `the refusal blames busy channels when the only occupier is still starting: ${shown}`).toMatch(/starting|coming up/);
+        // Say which one, and do not claim busy-ness that does not exist: "all N channels are busy" in a
+        // session with nothing running sends the model to `bg_stop` with no task to stop.
+        expect(shown, `the refusal still claims channels are busy when nothing is running: ${shown}`).not.toMatch(/are busy/);
+        expect(shown, `the refusal does not name the channel holding the slot: ${shown}`).toContain("l-occupier");
         expect(shown).toContain("PI_REPLMODE_MAX_CHANNELS");
       });
     } finally {

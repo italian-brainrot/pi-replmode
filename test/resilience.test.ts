@@ -91,6 +91,8 @@ describe("killing a channel", () => {
     expect(stopped.details.status).toBe("dead");
     expect(shown, `the stop answer hides that the channel died: ${shown}`).toMatch(/channel[^\n]*(gone|ended|died|dead)/);
     expect(shown, `the stop answer does not mention the interrupt that did it: ${shown}`).toMatch(/interrupt|SIGINT/);
+    // The promise `bg_stop` breaks here is about the variables, so the answer has to say that word.
+    expect(shown, `the stop answer does not say the channel's variables went with it: ${shown}`).toMatch(/variables/);
 
     // The variables really are gone, which is the thing the model has to be told before it reaches for
     // them rather than after.
