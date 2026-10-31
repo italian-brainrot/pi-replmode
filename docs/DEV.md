@@ -24,12 +24,18 @@ Run a single host test file: `npx vitest --run test/background.test.ts`.
 ```
 python/replmode/   the channel daemon: wire.py (frames, sentinels), shell.py (IPython + pi ns),
                    daemon.py (raw asyncio loop, capture, interrupt, setvar)
-python/tests/      pytest, driving the daemon over the real protocol
+python/tests/      pytest, driving the daemon over the real protocol. `test_daemon.py` holds the
+                   `Daemon` client (two reader threads, frame/block waits); `test_hardening.py`
+                   imports it rather than duplicating it
 src/               the extension: index.ts (registration), manager.ts (policy: run/bg/truncation/
                    history/cap), channel.ts (one daemon process: pipes, execs, logs, interrupt),
                    wire.ts (frame parsing + CaptureSplitter), env.ts, paths.ts, format.ts, prompt.ts
 test/              vitest, loading the extension the way pi does (test/helpers/extension.ts) and
-                   talking to real daemons
+                   talking to real daemons: run/background (the contract), capture/resilience/cap
+                   (attribution, interrupts, lifecycle), wire/format/prompt/registration/env
+
+docs/AUDIT.md      the tester↔fixer log. Every failing test that documents a defect carries its
+                   issue id (`R1-03`) in a comment, and the matching entry explains the fix.
 scripts/dev.mjs    the watch loop
 scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so there is one
                    definition of where the environment lives)

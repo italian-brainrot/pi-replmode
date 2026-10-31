@@ -47,6 +47,27 @@ describe("ensureEnv", () => {
     }
   }, 600_000);
 
+  it("builds once when two channels ask for the environment at the same time", async () => {
+    // Two channels starting at once must not start two `uv` runs against the same directory. The
+    // mkdir lock covers two pi processes; this covers one process asking twice concurrently.
+    const temp = makeTempDir("replmode-pyenv-");
+    const dir = join(temp.path, "env");
+    process.env.PI_REPLMODE_ENV_DIR = dir;
+    try {
+      const seen: string[] = [];
+      const [first, second] = await Promise.all([ensureEnv((m) => seen.push(`a:${m}`)), ensureEnv((m) => seen.push(`b:${m}`))]);
+      expect(first.python).toBe(second.python);
+      expect(first.created).toBe(second.created);
+      expect(first.seconds).toBe(second.seconds);
+      expect(seen.filter((line) => line.startsWith("a:"))).toHaveLength(seen.length);
+      expect(seen.filter((line) => line.startsWith("b:"))).toHaveLength(0);
+      expect(existsSync(join(dir, ".complete"))).toBe(true);
+    } finally {
+      delete process.env.PI_REPLMODE_ENV_DIR;
+      temp.dispose();
+    }
+  }, 600_000);
+
   it("names the environment it would use, after the interpreter and the pins", async () => {
     const withOverride = process.env.PI_REPLMODE_ENV_DIR;
     try {
