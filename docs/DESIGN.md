@@ -60,20 +60,21 @@ Host → daemon:
 | --- | --- | --- |
 | `execute` | `id`, `code` | run a cell |
 | `interrupt` | – | `os.kill(pid, SIGINT)` equivalent; aborts the running cell only |
-| `setvar` | `id`, `name` | bind the full capture of exec `id` to a global (truncation escape hatch) |
-| `call_reply` | `id`, `ok`, `value` / `error` | answer to a daemon-initiated call |
-| `shutdown` | `grace` | exit cleanly |
+| `setvar` | `name`, `path` or `text` | bind text (or the contents of `path`) to a global — the truncation escape hatch, where the host hands over the log file rather than its contents |
+| `call_reply` | `id`, `ok`, `value` / `error` | answer to a daemon-initiated call *(M3: nothing sends `call` yet)* |
+| `shutdown` | – | exit cleanly |
 
 Daemon → host:
 
 | frame | fields | meaning |
 | --- | --- | --- |
-| `ready` | `pid`, `python`, `ipython`, `cwd` | daemon up, channel usable |
+| `ready` | `channel`, `pid`, `ppid`, `cwd`, `python`, `ipython`, `startup_ms`, `log` | daemon up, channel usable |
 | `output` | *(out of band — the capture pipe, not JSON)* | |
-| `exec_end` | `id`, `ok`, `status` (`ok`\|`error`\|`interrupted`), `traceback`, `result_repr?`, `elapsed` | cell finished |
-| `display` | `id`, `mimes` (`image/png`, `text/plain`, …) | an image/rich object reached the model |
-| `call` | `id`, `kind` (`ask`\|`subagent`\|`notify`), `args` | daemon asks the host to do something; blocks the cell until `call_reply` |
+| `exec_end` | `id`, `ok`, `status` (`ok`\|`error`\|`interrupted`), `elapsed`, `ename?`, `evalue?`, `traceback?`, `definitions?` | cell finished. The repr of the last expression is already in the capture, so it is not repeated here; `definitions` names what the cell bound |
+| `display` | `id`, `mimes` (`image/png`, `text/plain`, …) | an image/rich object reached the model *(M3: recognised and ignored)* |
+| `call` | `id`, `kind` (`ask`\|`subagent`\|`notify`), `args` | daemon asks the host to do something; blocks the cell until `call_reply` *(M3)* |
 | `log` | `level`, `text` | daemon diagnostics (also mirrored to the log file) |
+| `fatal` | `error`, `traceback?` | the daemon cannot continue; the channel is over |
 
 Exec boundaries in the capture pipe are marked with a sentinel
 (`b"\x00\x1ePIRB\x1e<exec-id>\n"`), so the host knows where one cell's output ends, where a
@@ -194,17 +195,23 @@ expected to be fluent in Python already.
 
 ## Testing & tooling
 
-Mirror the my-pi-extensions setup: `tsc --noEmit`, biome, vitest, a `pi install .` package manifest,
-a `npm run dev` that launches pi with the extension from source.
+Both suites drive **real processes**; there is no fake daemon. A channel daemon starts in about
+10 ms, and the interesting failures live in the pipes, the signal handling and the exit path, which
+a scripted fake would paper over.
 
-- **Python**: `pytest` over the daemon, driven through the real protocol (spawn the daemon, speak to
-  it): state persistence, magics, top-level await, traceback capture, interrupt mid-cell and mid
-  `pi.ask`, `setvar`, sentinel framing, image formatters, death handling.
-- **Host**: vitest against a fake daemon (script the frames) for timeout→background, truncation +
-  nonce var, busy-channel errors, `bg_wait` listing, reload re-adoption; plus real-daemon
-  integration tests for the paths fakes can't prove.
-- Fixture: a fake `pi` binary for `run_subagent`, like pi-subagent's `fixtures/fake-pi.mjs`.
-- CI: `.github/workflows` running typecheck+lint+vitest and pytest in a `uv`-installed env.
+- **pytest** (`python/tests/test_daemon.py`, `npm run py:test`) spawns the daemon and speaks the
+  protocol to it: state, magics, top-level await, subprocess capture, sentinel framing, tracebacks,
+  syntax errors, interrupts mid-cell and while idle, the signal-mask restore, `setvar`, guards,
+  large output, unicode, malformed frames, death.
+- **vitest** (`test/`, `npm test`) loads `src/index.ts` through a recording `ExtensionAPI` harness
+  (`test/helpers/extension.ts` — any new `pi.*` dependency the extension takes has to be added
+  there, so tests keep covering the real path) and then runs real daemons: capture attribution,
+  truncation and the nonce global, busy channels, `bg_wait`/`bg_stop`, daemon death and
+  recreation, reload re-adoption, the channel cap, the environment build, the prompt surface.
+- **`npm run dev`** watches `src/`, `test/` and `python/` and re-runs the suite the change belongs
+  to; `npm run dev -- --all` is the whole gate (typecheck, biome, vitest, pytest) and is what CI
+  runs (`.github/workflows/ci.yml`).
+- Operational notes, debugging tricks and a real-`pi` smoke recipe: [DEV.md](DEV.md).
 
 ## Validated facts (from the `/tmp` spikes, not assumed)
 
@@ -225,16 +232,32 @@ a `npm run dev` that launches pi with the extension from source.
   objects exposing `_repr_png_`, without enabling those formatters globally.
 - pi's tool contract allows image content directly: `AgentToolResult.content` is
   `(TextContent | ImageContent)[]`.
+- pi 1.4.0 activates extension tools on registration while built-ins follow the `defaultTools`
+  setting, so `"defaultTools": []` (or `--no-builtin-tools`) is a complete replacement and the
+  extension never has to touch the active tool set. Verified with a real `pi --no-builtin-tools`
+  session, not just by reading `settings-manager.js`.
+- `structuredContent` is not validated against `outputSchema` at runtime in pi 1.4.0; the schema is
+  descriptive (it matters for a model that writes a wrapper around the tool).
+- `/reload` clears pi's extension module cache but keeps the Node process and its child pipes: a
+  manager rebuilt from the module would orphan running daemons, hence the `globalThis` singleton.
 
 ## Milestones
 
-1. **M1 — core**: daemon + protocol + capture + `run` (foreground, single channel) + truncation +
-   traceback handling + real tests. Usable as the only execution tool.
-2. **M2 — concurrency**: timeouts → background, `bg_wait`/`bg_stop`, multiple channels, busy-channel
-   rules, reload re-adoption, history + restart notification.
-3. **M3 — round trips**: display/image pipeline, `read_image`, `ask`, `run_subagent`, `call` pump.
-4. **M4 — packaging & polish**: venv strategy, prompt section, TUI renderers, README, CI, decide the
-   built-in-tool question, then flip this repo over to dogfooding itself.
+1. **M1 — core**: done. Daemon, protocol with sentinels, fd-level capture, `run` end to end,
+   truncation with log + nonce global, tracebacks, both test suites.
+2. **M2 — concurrency**: done. Timeout → background (never a kill), `bg_wait`, `bg_stop`
+   (SIGINT, escalation to a channel kill only when asked), channels with a per-channel mutex, the
+   process cap, busy-channel errors, reload re-adoption, per-channel history and the restart
+   notification.
+3. **M3 — round trips**: not started. The `display` frame is recognised and ignored, and the `call`
+   pump is absent. What it needs: formatter selection with `include=(...)` per object (spike
+   proves the call shape), `display` → image content in the `run` result, `pi.read_image`, sync
+   `pi.ask` and `pi.run_subagent` over the stdin pump, and the `call`/`call_reply` pump in the
+   daemon. `pi.ask` from Python alone is the piece most likely to fight the interrupt design, so
+   start with `read_image`, which has no round trip.
+4. **M4 — packaging & polish**: mostly done (env strategy, prompt section, README, CI, the
+   displacement question settled). Left: TUI renderers for a backgrounded cell, and flipping this
+   repo over to dogfooding itself.
 
 ## Decisions the spec left open
 
@@ -250,9 +273,13 @@ Settled with the user; implement these, do not re-open them.
 4. **`pi.ask` is sync** (returns `str`, implemented with the stdin pump, still interruptible) and
    always offers a manual answer choice.
 
-## Suggested build order for the next session
+## Where the next session starts
 
-M1 without shortcuts: the daemon, the protocol with sentinels, `run` end to end, and the real-process
-tests are the parts everything else stands on. `docs/DESIGN.md` → `README.md` → `AGENTS.md` are the
-three things to keep honest; the spikes that proved the interrupt and display behaviour live in
-`spikes/headless-ipython.py` and `spikes/interrupt-and-formatters.py` and are worth re-reading before M3.
+M3, in the order above: `read_image` and the display pipeline first, then the `call` pump for
+`pi.ask` and `pi.run_subagent`. The parts everything else stands on — daemon, protocol, capture,
+interrupt semantics — are built and covered by real-process tests, so the risk in M3 is concentrated
+in the display formatters and in a synchronous round trip that stays interruptible.
+
+`README.md`, `AGENTS.md` and this file are the three things to keep honest; `docs/DEV.md` carries the
+operational detail. The spikes in `spikes/` are worth re-running before touching formatters: they
+are the evidence for `include=(...)` selection and for the interrupt design.
