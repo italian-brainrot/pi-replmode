@@ -12,6 +12,7 @@
 - You should be very proactive with maintaining this repo, if you encounter a difficulty, make sure to improve the code or the tooling so that future sessions will not encounter it. This includes improving logging, tests, development documentation, and setting up development tools. It is also completely acceptable to add and change dependencies as well do big rewrites if necessary.
 - You are also responsible for handling git, push your changes to github when you are done.
 - Prompts and tool description should generally be short, concise, and avoid unnecessary instructions, to give the model more freedom in how it can use them.
+- When running smoke tests, keep thinking on for `qwen38-flash-next`, it's a quant calibrated for thinking enabled and might perform weirdly without it.
 
 ## Pi tools
 
