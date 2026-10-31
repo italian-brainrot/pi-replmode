@@ -12,6 +12,27 @@ set -u
 cd /home/qq/distrobox/ubuntu/Projects/pi-replmode
 
 FILTER="${1:-}"
+WORK=$(mktemp -d)
+MUTATED=""
+SURVIVED=()
+NOTICED=0
+TOTAL=0
+cleanup() { [ -n "$MUTATED" ] && git checkout -- $MUTATED; rm -rf "$WORK"; }
+trap cleanup EXIT INT TERM
+
+# Which test names fail in a file, one per line. The count is not enough: while the audit loop is
+# running, some tests are red on purpose, so "something failed" says nothing about whether the
+# mutation was noticed. A mutation dies when the *set of failing test names* changes.
+failing_names() { grep -E "^[[:space:]]+× " "$1" 2>/dev/null | sed "s/^[[:space:]]*× //; s/[[:space:]]*[0-9]*ms[[:space:]]*$//" | sort; }
+
+declare -A BASELINE
+baseline() {
+  local spec="$1"
+  if [ -n "${BASELINE[$spec]+set}" ]; then return; fi
+  npx vitest --run "$spec" > "$WORK/base.txt" 2>&1
+  BASELINE[$spec]=$(failing_names "$WORK/base.txt")
+  echo "  baseline: $(printf '%s\n' "${BASELINE[$spec]}" | grep -c . ) failing test(s) in $spec before any mutation"
+}
 
 run_mutation() {
   local label="$1" file="$2" py="$3" testspec="$4"
@@ -28,8 +49,30 @@ if old not in text:
 path.write_text(text.replace(old, new, 1))
 EOF
   if [ $? -ne 0 ]; then echo "  (skipped: anchor)"; git checkout -- "$file"; return; fi
-  npx vitest --run "$testspec" 2>&1 | grep -E "^\s+[×✓] |Tests  " | tail -10
+  MUTATED="$file"
+  # A mutation that does not compile is not a mutation: it proves nothing, and it wastes the run.
+  if ! npx tsc --noEmit > "$WORK/tsc.txt" 2>&1; then
+    echo "  !! THE MUTATION DOES NOT COMPILE — fix the anchor, this is not a survival:"
+    head -5 "$WORK/tsc.txt"
+    git checkout -- "$file"; MUTATED=""; return
+  fi
+  baseline "$testspec"
+  npx vitest --run "$testspec" > "$WORK/run.txt" 2>&1
+  local before after
+  before=$(printf '%s\n' "${BASELINE[$testspec]}")
+  after=$(failing_names "$WORK/run.txt")
+  TOTAL=$((TOTAL + 1))
+  if [ "$before" = "$after" ]; then
+    echo "  SURVIVED — no test noticed; either add one or argue it in docs/AUDIT.md"
+    SURVIVED+=("$label")
+  else
+    NOTICED=$((NOTICED + 1))
+    echo "  died — new failing tests:"
+    comm -13 <(printf '%s' "$before") <(printf '%s' "$after") | grep -v "^$" | sed 's/^/    × /'
+    grep -E "^[[:space:]]+Error|Test Files " "$WORK/run.txt" | head -3 | sed 's/^/    /'
+  fi
   git checkout -- "$file"
+  MUTATED=""
 }
 
 # ── pass 2's fixes, as found by pass 3 ───────────────────────────────────────
@@ -235,4 +278,6 @@ run_mutation "R3-09 the line total comes from the cut rather than from the file"
       const totalLines = cut.totalLines;' "test/limits.test.ts"
 
 echo "=================================================="
+echo "MUTATIONS RUN: $TOTAL — noticed: $NOTICED — SURVIVED: ${#SURVIVED[@]}"
+for s in "${SURVIVED[@]}"; do echo "  survived: $s"; done
 git status --short
