@@ -349,3 +349,292 @@ for `qwen38-flash-next` per `AGENTS.md`): three calls, state across them, report
 exited, neither the channel daemon nor the `subprocess.Popen(['bash','-c','sleep 45'])` the model had
 spawned was left running, which is the R1-10 promise end to end. Pass 2 should re-run it if it touches
 the daemon's startup, the capture path, or teardown.
+
+---
+
+## Pass 2 — 2026-11-01
+
+Gate at the start: green — `tsc`, `biome`, 95 vitest, 42 pytest.
+Gate at the end: `tsc` and `biome` green, **114 vitest (104 pass, 10 fail)**, **47 pytest green**. Every
+vitest failure is a test this pass wrote to hold a defect below; none is a weakened or flaky leftover.
+Two full runs back to back produced the same 10 failures, and the whole pytest suite ran twice with no
+flake. New files: `test/honesty.test.ts`, `test/names.test.ts`; new tests in `test/format.test.ts`,
+`test/capture.test.ts`, `test/cap.test.ts`, `test/lifecycle.test.ts`, `test/resilience.test.ts`,
+`test/reload.test.ts`, `python/tests/test_hardening.py`. Nothing was deleted or loosened: the only
+removed lines in the diff are a docstring sentence and an import that got wider.
+
+Ten findings: **four BUGs, five PAPERCUTs, one MISSING-COVERAGE.** No BLOCKER. Two of the four BUGs
+(R2-01, and the reporting half of R2-04) came from the pass-1 fixes themselves.
+
+### R2-01 — BUG — a log bigger than the read window loses its tail completely
+
+`truncateMiddle(text, max, ratio, totals)` (the R1-09 fix) computes the cut position from `totals`,
+which describe the **whole file**, and then slices `text`, which is the **8 MB tail window** `readLog`
+handed it. `tailStart = totalChars - tailBudget` is therefore an offset past the end of the string being
+cut: `text.slice(tailStart)` is empty. The result is a head of ~30 KB taken from the middle of the log,
+nothing from the end, and a note that admits it:
+
+```
+[output truncated: showing 29928 of at least 16777216 characters at the start and 0 at the end
+ (516 of at least 291179 lines)]
+```
+
+The prompt promises "head and tail kept", and for a long run the last lines are exactly the ones that
+matter (the summary, the exception, the final progress line). The existing R1-09 test only checks the
+totals, and the "keeps the tail" test only checks that the *file* is big, which is why this slipped
+through.
+
+Repro: `test/format.test.ts::R2-01` (a 54 KB window plus `totals` for a 7 MB file → `tailChars === 0`)
+and `test/capture.test.ts::R2-01` (a real 200 000-line cell whose `print('THE VERY LAST LINE')` never
+reaches the result).
+
+Suggested fix: keep `totals` for **reporting** and compute the cut in the coordinates of the text in
+hand — `cutAtLineEnd(text, text.length - tailBudget, text.length - floor(tailBudget * 0.4))`. Verified:
+with that one-line change the new tests pass and every pre-existing `truncateMiddle` expectation
+(head+tail, line boundaries, the single-oversized-line fallback, the totals themselves) still holds.
+The "N characters not shown" arithmetic stays right either way, since it subtracts the shown pieces
+from the file's totals.
+
+### R2-02 — BUG — the traceback gets no share of the 50 000-character limit
+
+The 50 000 budget is spent entirely on the capture, and the traceback is appended afterwards,
+unbounded. A cell that raises with data in its message — the thing that failed to parse, a row, a diff,
+which is exactly what a model writes when it is debugging — blows the limit wide open:
+
+```python
+raise ValueError('unparseable: ' + 'x' * 300000)   # → a 300 336-character tool result
+```
+
+`details.evalue` and `structuredContent.error.evalue` carry the same string again. Nothing downstream
+catches it: pi does not cap a tool result (`pi-agent-core` has no such limit), so the whole thing lands
+in the model's context. `AGENTS.md` states the limit as a property of the tool, not of one part of the
+result. A 400-frame recursive traceback is fine (IPython collapses repeats), so the hole is specifically
+the exception value and the `evalue` field.
+
+Repro: `test/honesty.test.ts::R2-02`. The sibling test in the same describe (a deep recursion) passes,
+which pins what is *not* the problem.
+
+Suggested fix: give the traceback a share of the budget (a few KB, head+tail), and make the full text
+reachable the same way the capture is — append it to the exec log before truncating it in the result,
+and say so in the note. Cap `details.evalue` / `structuredContent.error.evalue` to one short line; the
+traceback already contains it.
+
+### R2-03 — BUG — the channel cap is not enforced when calls arrive together
+
+`makeRoom()` counts `this.channels`, and `createChannel()` calls it *before* `ensureEnv()` and
+`startChannel()` put anything in that map. A burst of concurrent `run` calls therefore measures the cap
+five times against an empty set and then starts five daemons. With `PI_REPLMODE_MAX_CHANNELS=2` and five
+parallel calls on five channel names, all five daemons are alive afterwards. The cap is the only thing
+standing between a session and N × ~45 MB of idle IPython, `run` is registered
+`executionMode: "parallel"`, and `promptGuidelines` says "use separate channels for independent
+long-running work" — so the recommended pattern is the one that defeats it. On the first call of a
+session the window is much wider still, because every call waits inside `ensureEnv` for the same venv
+build.
+
+Repro: `test/cap.test.ts::R2-03` — asserts at most `cap` live daemons after `Promise.all` of five calls;
+gets five.
+
+Suggested fix: count in-flight creations against the cap (`this.starting` already exists for the
+same-name case) and decide the room one channel at a time — either a small mutex around
+`makeRoom`+create, or have `makeRoom` treat `starting` as live. Either shape leaves the existing
+"all N channels are busy" refusal as the outcome for the calls that do not fit, which is already
+tested in this file.
+
+### R2-04 — BUG — channel names that collide once sanitised, and a live channel reported as lost
+
+A channel name is used as a map key and, after `safeChannelName`/`historyFileName` (two copies of the
+same function: replace every non-alphanumeric with `_`, cut at 40), as three file names: the daemon log,
+the history file and the IPython profile directory. Two consequences:
+
+1. **A live channel is announced to the model as gone.** `lostChannelNotes()` keys its map by the
+   history *file stem* and then asks `this.channels.get(<stem>)`. For any name that is not already a file
+   name, the stem is not a key in the live map, so `run(channel: "notes/live")` is followed — at the next
+   `session_start`, in the same process — by a prompt section saying
+   `notes/live: last cell completed … — their variables were lost` and a matching `ui.notify`. The
+   channel is running, its variables are bound, and the model is told the opposite and invited to
+   "re-create what you need".
+2. **Two channels share one history file.** `a/b` and `a_b` both append to `a_b.jsonl`, so only the
+   newest of the two survives, and the note reports the *stem*, not a name the model ever used. They also
+   share a daemon log (the two daemons' lines interleave — confirmed by hand) and an IPython profile
+   (two `history.sqlite` writers in one directory).
+
+Repro: `test/names.test.ts` — two tests, one per consequence.
+
+Suggested fix: one shared encoder, collision-free (sanitise, then append a short hash of the real name
+when the sanitised form is not unique — or always). Key the note by the record's own `channel` field,
+which already holds the real name (`recordHistory` writes it; `lastHistoryByChannel` currently overwrites
+it with the file stem), and check liveness against that. If instead a name is going to be constrained,
+say so in the `channel` parameter description — right now it says nothing about what a name may contain.
+
+### R2-05 — PAPERCUT — `run`'s structuredContent does not match the outputSchema `run` declares
+
+Measured across eight paths:
+
+| path | problem |
+| --- | --- |
+| background (`timeout: 0`) | no `output`, no `truncated` — both declared required |
+| busy-channel refusal | no `output`, no `truncated`, no `elapsed_seconds`; `status: "error"` |
+| empty code / invalid timeout | same, plus `status: "error"` |
+| dead channel | no `truncated` |
+
+`status: "error"` is not in the declared union (`completed|failed|interrupted|running|dead`) and is not a
+`TaskStatus`; it comes from `failure()` in `index.ts`, which also puts `"dead"` in `details.status` for
+the same result, so the two views disagree. DESIGN notes the schema is descriptive and not validated at
+runtime, which is precisely why it matters: it is what a model reads when it wraps the tool, and what any
+later validation would check.
+
+Repro: `test/honesty.test.ts::R2-05` — one test, a message listing every path and every problem.
+
+Suggested fix: decide one shape and make both ends agree — mark `output`/`truncated`/`elapsed_seconds`
+optional (they genuinely do not exist for a call that never reached a daemon) or fill them with defaults,
+and give `failure()` a status from the enum that matches `details.status`.
+
+### R2-06 — PAPERCUT — a channel that cannot start says nothing about why
+
+The daemon goes out of its way to explain a failed start, and the host throws the explanation away:
+
+- a `fatal` frame ("IPython is not installed in this environment") lands in `channel.notes()`, which is
+  only ever shown by `deadResult` — the "could not start" path never reads it;
+- the interpreter's own traceback, which lands on the capture stream when the cached environment is
+  broken, is dropped by construction: `onExit` calls `flushLoose()` (which empties `this.loose`) *before*
+  `readyFail(... startupOutput() ...)`, so `startupOutput()` — whose docstring says a startup traceback is
+  "the one thing worth reporting" — is always empty there;
+- `flushLoose()` also writes with `Exec.write`, which no-ops once the exec's log fd is closed, so trailing
+  capture for a settled exec is silently dropped rather than appended the way `lateWrite` does it.
+
+The model gets `channel "x" could not start: the Python process behind channel "x" ended (exit code 1)`
+and a daemon log that may not exist at all.
+
+Repro: `test/lifecycle.test.ts` — two tests using stub interpreters (a `fatal` frame, and a bare
+interpreter crash).
+
+Suggested fix: build the start-failure message from `deathNote` + the `fatal` frame text +
+`startupOutput()` (read before the buffer is emptied; `flushLoose` should append through the same path
+`lateWrite` uses). `manager.run`'s `catch` around `getChannel` just forwards `error.message`, so the fix
+belongs in `Channel.onExit`/`startChannel`.
+
+### R2-07 — PAPERCUT — R1-08's fix is the easy half: an orphan's output still lands inside a later cell
+
+The fix attributes bytes that arrive **while no block is open** to the exec that closed last. But an
+orphan that keeps writing spends most of its time while *some later cell's block is open*, and those
+bytes go into that cell's output stream, indistinguishable from its own prints: cell two, which sleeps
+two seconds, comes back as
+
+```
+CELL two start
+ORPHIN-7 … ORPHIN-40
+CELL two end
+```
+
+with no marker and no note. The attribution point also walks forward: `lastClosed` is whichever exec
+closed last, so a four-second orphan had LATE-1…10 in the producer's log, LATE-11…25 in the *next*
+cell's log under a header claiming "output that arrived after this cell ended", and would have continued
+into the third. That header is literally true and practically misleading.
+
+Repro: `test/capture.test.ts::R2-07` (written the way R1-08 was: fail only if the output is contaminated
+*and* undisclosed, so either fix shape passes).
+
+Suggested fix, in order of honesty: (a) the real fix is one capture pipe per exec — `_begin` installs a
+fresh pipe pair on fd 1/2, the host keeps draining the older execs' pipes into their own logs — which
+makes attribution exact and is a DESIGN change to the "two pipes" model, so it needs deciding, not
+sneaking; (b) the cheap fix is to say precisely what is guaranteed: rewrite the attribution paragraph in
+DESIGN.md and the "things that bite" bullet in DEV.md to state that only bytes between blocks are
+attributable, and word the header so it does not imply causation ("output that arrived during this block
+from something other than this cell" is not knowable, so the honest version is "unattributable output").
+
+### R2-08 — PAPERCUT — `Exec.killRequested` has no reader: pass 1's fix made a branch unreachable
+
+`Channel.onExit` sets `exec.status = exec.killRequested ? "interrupted" : "dead"` for an unsettled exec,
+and then `Exec.finalize` — which `onExit` calls two lines later, after having set `deathNote` — unconditionally
+overwrites the status with `"dead"`. So the intent (a cell whose interrupt happened to take the daemon
+with it is reported as interrupted) is silently gone, and the field is written in three places and read
+in one that cannot matter. It is not wrong behaviour — R1-06 says death outranks everything — it is dead
+code that reads like a guarantee.
+
+No test (there is no observable behaviour to pin). Suggested fix: delete the ternary and the field, or
+keep the field and use it in the *text* ("the interrupt took the daemon with it") which is the case a
+model would otherwise misread.
+
+### R2-09 — PAPERCUT — a cell that leaves the process group is out of the group kill's reach
+
+`channel.ts`'s header and DESIGN both promise that closing a channel takes down "anything the cell
+started". A child started with `start_new_session=True` (or a double fork — a normal way to launch a dev
+server that should survive) moves into a group of its own, so `killGroup(-pid)` cannot see it: the daemon
+goes, the server stays. This is not fixable by signalling harder without walking a process tree, which
+would be worse.
+
+Repro/pin: `test/resilience.test.ts::R2-09` — a **passing** test that asserts the escape and says out
+loud that it should be updated if the kill ever gets smarter. Suggested fix: state the exception next to
+the promise in `channel.ts`, DESIGN.md and (one clause) the `bg_stop` parameter description.
+
+### R2-10 — MISSING-COVERAGE — the model-facing prompt has not caught up with what the tool does
+
+The section and the guidelines are accurate as far as they go, and three things the model routinely needs
+are missing: `bg_stop {kill: true}` is never mentioned outside the parameter description; nothing tells
+the model that killing a channel also ends the servers, builds and training loops its cells started
+(R2-09's exception doubly so); and the guidelines push "use separate channels" — the pattern R2-03 shows
+is unbounded — without mentioning that the channel count is capped and the idlest channel is quietly
+retired with its variables. One line each in `SECTION_LINES`, plus a `promptGuidelines` entry, and a
+`test/prompt.test.ts` assertion per line.
+
+Also unprobed and unpinned, deliberately left alone: a `code` string big enough to exceed the daemon's
+`MAX_FRAME_BYTES` (64 MB) is dropped as `_overlong`, leaving an exec the host believes in — the channel
+then looks busy forever until it is killed. Unreachable through the tool layer (a 64 MB tool-call
+argument), and the honest fix is host-side: refuse an over-long cell before sending it.
+
+### Re-checking pass 1's fixes
+
+Each R1-nn was re-run (`npm run py:test -- -k <name>`, the vitest file named in the pass-1 table) and
+attacked again at the fix rather than the symptom:
+
+| id | what pass 2 tried against the fix | result |
+| --- | --- | --- |
+| R1-01 | eight `await` shapes — `TaskGroup`, `shield`, `gather(shield(…))`, an `Event` another task also waits on, `create_subprocess_exec().communicate()` (the transport's own exit waiters), `run_in_executor`, an `await` inside a `with open(...)` whose `finally` must run, and `asyncio.wait([...])`. New: `test_an_interrupt_reaches_a_cell_parked_on_any_shape_of_await` | held. Every shape stopped, `status: "interrupted"`, daemon alive, next cell answered. No descent hung the loop, corrupted a sibling task or left a cell half-dead. A `shield` leaves its inner task running — that is what `shield` means — and it surfaces as nothing |
+| R1-02 | a cell that sets `SIG_DFL` *and* leaves a SIGINT pending (new host test in `test/lifecycle.test.ts`): the pending signal is delivered during the epilogue, the default action kills the daemon | held, honestly: the call comes back `dead` with the "variables are lost" note, the next call reports `[new channel]` |
+| R1-03 | interrupts fired continuously across exec boundaries while cells start and finish; a `setvar` on a FIFO (unchanged) | held: 12/12 cells reported, daemon alive and answering |
+| R1-04 | re-ran the hostile-frame test | held |
+| R1-05 | a cell that puts a **pipe it made itself** on fd 1 and reads from it (new: `test_a_cell_that_moves_fd_1_onto_its_own_pipe_does_not_blind_the_channel`) — harder than `/dev/null` because there is a reader on the other end | held: nothing leaked into the protocol, no `_nonjson` frames, the daemon logged "restored fd 1", and the next cell's output arrived |
+| R1-06 | death landing after `exec_end` two ways: the SIG_DFL case above, and a mute daemon that exits *before* the 500 ms EOF grace (new test asserts the real exit code survives the grace timer) | held; the guard `if (this.closed) return` in `onExit` keeps the reason from being overwritten |
+| R1-07 | re-ran the forged-marker test; also forged a marker carrying a **real** exec id of the channel | held: the marker stays data. A forged marker with a genuine id closes that block early and the rest of the cell arrives as late output under the "after this cell ended" header — self-inflicted, and the header is not a lie |
+| R1-08 | an orphan that outlives its cell by several seconds while two more cells run | **partly broken — R2-07.** Between-block bytes are attributed and capped exactly as promised; during-block bytes are not attributable at all |
+| R1-09 | re-ran; added a log past `countOutput`'s 16 MB scan cap (new passing test asserts the "at least" wording) | the totals are honest; **the fix broke the tail — R2-01** |
+| R1-10 | re-ran both kill tests; added the `PI_REPLMODE_KEEP_RUNNING=0` replacement path (new passing test) and `start_new_session=True` (R2-09) | held for everything in the group; a child that leaves the group is unreachable |
+| R1-11 | re-ran; added `PI_REPLMODE_READY_TIMEOUT_MS=1` against a healthy environment (new passing test) | held: clean failure, daemon reaped, retry works |
+| R1-12 | re-ran `test/env.test.ts` | held |
+| R1-13 | re-ran the torn-record and rotation tests; then attacked *the file naming* rather than the parsing | parsing held; **the naming is R2-04** |
+
+### Probed and found solid (no findings)
+
+- **Reload and session replacement against everything new.** A cell backgrounded in one runtime is
+  waited for and stopped from the next (`bg_wait`, `bg_stop` — new test in `test/reload.test.ts`);
+  channels, their variables and their `pid`s survive; a quit after a reload still takes the group down.
+  Late capture is still attributed to the right exec across a reload. `/new`, `/resume` and `/fork` keep
+  daemons, `PI_REPLMODE_KEEP_RUNNING=0` shuts them down, and a `run` racing `session_shutdown quit` comes
+  back `dead` with nothing left running afterwards (new test in `test/reload.test.ts` and one in
+  `test/resilience.test.ts`).
+- **Concurrency at the edges.** `bg_wait` racing `bg_stop {kill: true}` and a second plain `bg_stop` on
+  the same task: one coherent story, no double-kill, no wedged registry. Two `run`s racing an LRU
+  eviction: the evicted channel's state is gone and its next call says `[new channel]`. A `run` racing a
+  channel kill gets a fresh channel and the `[new channel …]` banner, which is the truth. `makeRoom`
+  never picks a channel with a cell in flight, and there is no window in which a channel with a call in
+  flight looks idle (nothing between `begin()`, `send()` and `wait()` awaits).
+- **The interrupt ladder's text.** `timeout: 0` → `bg_wait` → `bg_stop` → `bg_stop {kill: true}` in one
+  channel: each answer says what it did and points at the log; a stopped-then-listed task reports
+  `interrupted`, and after a kill the task leaves the registry (defensible — the listing is for things
+  that can still be waited on — but the killed task's log path is then only in the earlier message).
+- **Cells that reach for the wire.** `breakpoint()` and `%debug` fail with the patched `input()` error
+  instead of reading frames (new pytest), and `sys.stdin.readline()` in a cell returns immediately
+  because the daemon keeps fd 0 non-blocking — no hang, no stolen frame.
+- **Interrupt storms across exec boundaries.** 12 cells with a SIGINT every ~20 ms: every exec is
+  bracketed by exactly two whole markers (the prefix count and the completed-marker count agree), no
+  half-written boundary, daemon alive, channel usable (new pytest test).
+- **Hostile channel names as file names.** `../../escape` and `...` are sanitised; nothing escapes the
+  history or daemon directories (the collision is R2-04, the traversal is not).
+- **Daemon-log growth.** Every restore and normalisation emits one `log` frame per exec; the host's
+  `daemonNotes` ring is capped at 40, `loose` at 64 KB, late capture at 256 KB per exec, exec records at
+  100 per channel and the task registry at 200. A cell cannot make the daemon emit a frame per *byte*.
+- **The EOF-vs-exit grace.** A daemon that closes its protocol stream and stays alive is declared gone
+  in well under the timeout; one that exits at 300 ms keeps its exit code (new test).
+- **`details.status` vs the text** in the paths that pass: interrupted calls say "the channel and its
+  variables are intact" only when the channel is really alive; dead ones say both what finished and that
+  the state is gone.

@@ -41,6 +41,39 @@ describe("reload", () => {
     agent.dispose();
   });
 
+  it("carries background tasks over to the new runtime, where they can still be waited for and stopped", async () => {
+    // A cell that had already moved to the background when `/reload` happened belongs to the new
+    // runtime: the task registry lives on the same manager, and `bg_wait`/`bg_stop` go by task id.
+    const agent = makeTempDir("replmode-agent-");
+    const env = { PI_REPLMODE_MAX_CHANNELS: "12" };
+    const first = await loadExtension({ agentDir: agent.path, env });
+    const task = await first.callTool("run", {
+      code: "import time\nfor _ in range(4): time.sleep(0.5)\nprint('finished on its own')",
+      channel: "x-bgreload",
+      timeout: 0,
+    });
+    expect(task.details.status).toBe("running");
+
+    await first.emit({ type: "session_shutdown", reason: "reload" });
+    first.dispose();
+    vi.resetModules();
+
+    const second = await loadExtension({ agentDir: agent.path, env });
+    const waited = await second.callTool("bg_wait", { timeout: 20 });
+    const listing = text(waited);
+    expect(listing).toContain(task.details.id);
+    expect(listing).toContain("completed");
+
+    // The channel and its variables survived too, and the second runtime can still use them.
+    const state = await second.callTool("run", { code: "print('state kept')", channel: "x-bgreload" });
+    expect(text(state)).toContain("state kept");
+    expect(text(state)).not.toContain("[new channel");
+
+    await second.emit({ type: "session_shutdown", reason: "quit" });
+    second.dispose();
+    agent.dispose();
+  });
+
   it("keeps channels alive across a session replacement, and shuts them down on quit", async () => {
     const agent = makeTempDir("replmode-agent-");
     const first = await loadExtension({ agentDir: agent.path, env: { PI_REPLMODE_MAX_CHANNELS: "12" } });

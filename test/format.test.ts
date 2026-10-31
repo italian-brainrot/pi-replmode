@@ -47,6 +47,23 @@ describe("truncateMiddle", () => {
     expect(cut.text).toContain("characters and");
   });
 
+  it("R2-01: keeps a tail when the text is a window into a much bigger log", () => {
+    // `readLog` hands `truncateMiddle` the last few megabytes of an enormous log and `totals` says how
+    // big the whole file is. The cut has to be computed against the text actually in hand: quote the
+    // whole-log offsets to the cutter and it asks for a tail that begins past the end of the window,
+    // so nothing from the end of the log survives at all.
+    const window = longText(6000, 8);
+    const totals = { chars: window.length + 7_000_000, lines: 6000 + 100_000 };
+    const cut = truncateMiddle(window, 50_000, 0.6, totals);
+    expect(cut.truncated).toBe(true);
+    expect(cut.tailChars, "the tail fell off the end of the window").toBeGreaterThan(0);
+    expect(cut.text).toContain(`${String(5999).padStart(8, "0")}\n`);
+    expect(cut.text.length).toBeLessThanOrEqual(50_000);
+    // The totals quoted back are still the file's, not the window's.
+    expect(cut.totalChars).toBe(totals.chars);
+    expect(cut.windowed).toBe(true);
+  });
+
   it("counts lines the way a reader would", () => {
     expect(truncateMiddle("a\nb\nc", 100).totalLines).toBe(3);
     expect(truncateMiddle("a\nb\nc\n", 100).totalLines).toBe(3);

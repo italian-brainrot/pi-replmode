@@ -120,6 +120,58 @@ os._exit(3)
   });
 });
 
+describe("a channel that cannot start at all", () => {
+  it("R2-06: passes on what the daemon said about why", async () => {
+    // The daemon goes out of its way to send a `fatal` frame when it knows the reason (no IPython, a
+    // shell that failed to build). The model has to be told that, not just that the process ended: the
+    // alternative is being handed an exit code and nothing to act on.
+    const script = `import sys
+sys.stdout.write(${JSON.stringify('{"t":"fatal","error":"IPython is not installed in this environment","traceback":"ImportError: no module named IPython"}')} + "\\n")
+sys.stdout.flush()
+sys.exit(1)
+`;
+    const result = await withStub("fatal-startup", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-fatal" }));
+    expect(result.isError).toBe(true);
+    const shown = text(result);
+    expect(shown, `the daemon's own explanation never reached the model: ${shown}`).toContain("IPython is not installed");
+  });
+
+  it("R2-06: keeps the interpreter's own complaint when it dies before speaking", async () => {
+    // A cache directory left behind by an upgraded Python produces an interpreter that fails on import
+    // and writes a traceback to the capture stream. `Channel.startupOutput()` exists for exactly this
+    // case, and it is only ever read after `flushLoose()` has emptied the buffer it reads from.
+    const script = `import sys
+sys.stderr.write("Traceback (most recent call last):\\n  File \\"<frozen app>\\", line 1, in <module>\\nImportError: the environment is broken\\n")
+sys.exit(1)
+`;
+    const result = await withStub("silent-crash", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-crash" }));
+    expect(result.isError).toBe(true);
+    const shown = text(result);
+    expect(shown, `an interpreter that said why it failed is reported as a bare exit code: ${shown}`).toContain(
+      "the environment is broken",
+    );
+  });
+
+  it("leaves nothing running when the ready timeout fires on an environment that is fine", async () => {
+    // A one-millisecond ready timeout can only ever lose the race with a real interpreter; what matters
+    // is that the attempt is reaped and the next call starts clean.
+    const result = await ext.callTool("run", { code: "print(1)", channel: "l-fastready" }, {});
+    const saved = process.env.PI_REPLMODE_READY_TIMEOUT_MS;
+    process.env.PI_REPLMODE_READY_TIMEOUT_MS = "1";
+    try {
+      const failed = await ext.callTool("run", { code: "print(1)", channel: "l-fastready-2" });
+      expect(failed.isError).toBe(true);
+      expect(text(failed)).toContain("did not report ready");
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_READY_TIMEOUT_MS;
+      else process.env.PI_REPLMODE_READY_TIMEOUT_MS = saved;
+    }
+    const retry = await ext.callTool("run", { code: "print('the channel is fine after a lost race')", channel: "l-fastready" });
+    expect(text(retry)).toContain("the channel is fine after a lost race");
+    void result;
+  });
+});
+
 describe("a daemon that closes its own protocol stream", () => {
   it("is treated as gone rather than left busy forever", async () => {
     // A cell that closes the daemon's private descriptors can leave a process that is alive, holds a
@@ -137,5 +189,48 @@ time.sleep(300)
     expect(result.isError).toBe(true);
     expect(result.details.status).toBe("dead");
     expect(text(result)).toContain("protocol stream");
+  });
+
+  it("R1-06: reports the real exit when a mute daemon gets up before the EOF grace runs out", async () => {
+    // EOF on the frame stream counts as death, but the host waits 500 ms in case the exit event is on
+    // its way with the actual reason. A daemon that dies inside that window must be reported with its
+    // exit status, not with the vaguer "closed its protocol stream".
+    const script = `import sys, time
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-eofexit")}\n`)})
+sys.stdout.flush()
+os = __import__("os")
+os.close(1)
+time.sleep(0.3)
+os._exit(9)
+`;
+    const result = await withStub("eof-exit", script, {}, () =>
+      ext.callTool("run", { code: "print(1)", channel: "l-eofexit", timeout: 20 }),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.details.status).toBe("dead");
+    const shown = text(result);
+    expect(shown, `the real exit was overwritten by the grace timer: ${shown}`).toContain("exit code 9");
+  });
+
+  it("R1-06: reports the death of a daemon a cell killed by leaving SIGINT at its default action", async () => {
+    // The disposition is only normalized at the *start* of a cell, so a cell that puts SIGINT back to
+    // SIG_DFL and leaves one pending is delivered during the epilogue, and the default action ends the
+    // process. `exec_end` may already be on the wire: the call still has to say the channel is gone.
+    const warm = await ext.callTool("run", { code: "durable = 'kept'", channel: "l-dfl" });
+    void warm;
+    const result = await ext.callTool("run", {
+      code: "import signal, os\nsignal.signal(signal.SIGINT, signal.SIG_DFL)\nsignal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})\nos.kill(os.getpid(), signal.SIGINT)\nprint('left a pending SIGINT')",
+      channel: "l-dfl",
+      timeout: 20,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.details.status, "a cell that killed its own daemon was reported as an ordinary call").toBe("dead");
+    const shown = text(result);
+    expect(shown).toMatch(/ended|gone/);
+    expect(shown).toContain("variables are lost");
+
+    const next = await ext.callTool("run", { code: "print(durable)", channel: "l-dfl" });
+    expect(text(next)).toContain("[new channel");
+    expect(next.isError).toBe(true);
   });
 });

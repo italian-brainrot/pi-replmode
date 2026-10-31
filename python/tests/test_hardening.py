@@ -5,13 +5,14 @@ places where a failure is expensive and easy to miss: an interrupt that has to r
 not running Python bytecode, a frame handler that raises, input that is hostile rather than merely
 malformed, and a cell that damages the streams the daemon depends on.
 
-Tests whose comment names an issue id (R1-nn) are the ones that document a defect found in the
-pass-1 audit: they are expected to fail until the daemon is fixed.
+Tests whose comment names an issue id (R1-nn, R2-nn) are the ones that document a defect found by an
+audit pass: they are expected to fail until the daemon is fixed.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import signal
 import time
 from pathlib import Path
@@ -322,3 +323,156 @@ def test_a_cell_that_closes_the_daemons_own_descriptors_ends_the_channel_cleanly
     )
     code = daemon.wait_exit(timeout=20)
     assert code is not None and code != 0, f"a daemon that cannot talk should exit, not hang (got {code})"
+
+
+# ── Pass 2: how far the `await` interrupt actually reaches ───────────────────
+#
+# `Runner.interrupt_cell` descends `task._fut_waiter` to find the future to put the KeyboardInterrupt
+# on. That is a private asyncio attribute, so every shape of `await` a cell can park on is a way for
+# the descent to be wrong: a task leaked, the loop hung, or the cell never stopped.
+
+AWAIT_SHAPES = {
+    # A child task inside a TaskGroup: the descent has to land on the child's own waiter and the
+    # group's error handling must not swallow or multiply the interrupt.
+    "taskgroup": "async with asyncio.TaskGroup() as tg:\n    tg.create_task(asyncio.sleep(20))",
+    # A shield leaves an inner task running on purpose: the interrupt may stop the cell, but the
+    # shielded task must not be left in a state that later surfaces as an unretrieved error.
+    "shield": "await asyncio.shield(asyncio.sleep(20))",
+    "gather_shield": "await asyncio.gather(asyncio.shield(asyncio.sleep(20)), asyncio.sleep(20))",
+    # A future that another task of the cell's own is waiting on as well.
+    "shared_event": "ev = asyncio.Event()\nasync def other():\n    await ev.wait()\ntask = asyncio.create_task(other())\nawait ev.wait()",
+    # The transport's own exit waiters, which the child watcher completes from the loop.
+    "subprocess_transport": "proc = await asyncio.create_subprocess_exec('sleep', '20')\nawait proc.communicate()",
+    # An executor future that a worker thread will complete whether we like it or not.
+    "executor": "await asyncio.get_running_loop().run_in_executor(None, time.sleep, 20)",
+    # A `finally` that has to run for the cell to release a file it opened.
+    "in_a_with_block": "with open(os.devnull) as handle:\n    await asyncio.sleep(20)",
+}
+
+
+def test_an_interrupt_reaches_a_cell_parked_on_any_shape_of_await(daemon: Daemon) -> None:
+    """R1-01's fix has to work for the awaits a model actually writes, not just `asyncio.sleep`."""
+    for index, (shape, body) in enumerate(AWAIT_SHAPES.items()):
+        exec_id = f"repl-shape{index:02d}"
+        code = f"import asyncio, os, time\nprint('started {shape}')\n{body}\nprint('finished {shape}')"
+        daemon.send({"t": "execute", "id": exec_id, "code": code})
+        time.sleep(0.7)
+        daemon.interrupt()
+
+        try:
+            frame = daemon.wait_frame("exec_end", exec_id, timeout=12)
+        except AssertionError as error:  # a shape that hangs the loop is the worst failure
+            raise AssertionError(f"{shape}: the cell was never stopped; daemon alive={daemon.proc.poll() is None}") from error
+        assert frame["status"] == "interrupted", f"{shape}: the cell was not interrupted: {frame}"
+        assert daemon.proc.poll() is None, f"{shape}: the interrupt killed the daemon"
+
+        _, out = daemon.execute(f"print('usable after {shape}')", exec_id=f"repl-shape{index:02}b")
+        assert f"usable after {shape}" in out, f"{shape}: the channel stopped answering"
+
+
+def test_interrupts_across_exec_boundaries_never_tear_a_sentinel(daemon: Daemon) -> None:
+    """The `deferred_interrupt` block exists so a SIGINT cannot land mid-marker.
+
+    Interrupts are fired continuously while cells start and finish, where the opening and closing
+    sentinels are written. Every exec must still be bracketed by exactly two whole markers: one torn
+    marker is a block that never closes, and the host would wait for a boundary that never arrives.
+    """
+    ids = [f"repl-storm{i:02d}" for i in range(12)]
+    for exec_id in ids:
+        daemon.send(
+            {
+                "t": "execute",
+                "id": exec_id,
+                "code": "print('cell start')\nimport time\ntime.sleep(0.15)\nprint('cell end')",
+            }
+        )
+        time.sleep(0.02)
+        daemon.interrupt()
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        frames, _ = daemon.snapshot()
+        if sum(1 for frame in frames if frame.get("t") == "exec_end") >= len(ids):
+            break
+        time.sleep(0.1)
+
+    frames, capture = daemon.snapshot()
+    ends = [frame for frame in frames if frame.get("t") == "exec_end"]
+    assert len(ends) == len(ids), f"{len(ends)} of {len(ids)} cells reported in"
+    assert daemon.proc.poll() is None, "the interrupt storm killed the daemon"
+
+    markers = re.findall(rb"\x00\x1ePIRB\x1e([a-z0-9-]*)\n", capture)
+    for exec_id in ids:
+        seen = markers.count(exec_id.encode())
+        assert seen == 2, f"{exec_id} is bracketed by {seen} markers, not 2: the block is torn"
+    # A marker whose bytes were written but whose id was never finished is a block that never closes:
+    # the prefix count and the completed-marker count have to agree exactly.
+    prefixes = capture.count(b"\x00\x1ePIRB\x1e")
+    assert prefixes == len(markers), f"{prefixes - len(markers)} boundary markers were started and never completed"
+
+    _, out = daemon.execute("print('usable after the storm')", exec_id="repl-storm99")
+    assert "usable after the storm" in out
+
+
+def test_a_cell_that_moves_fd_1_onto_its_own_pipe_does_not_blind_the_channel(daemon: Daemon) -> None:
+    """R1-05's repair, with a redirect harder than `/dev/null`.
+
+    A cell that puts a pipe it made itself onto fd 1 points the stream at something with a reader
+    attached. The repair compares device and inode, so it has to notice; if it did not, the cell's
+    output would go into the pipe forever and the marker would still be written to the daemon's own
+    reference, which is exactly the kind of silent half-capture this design cannot afford.
+    """
+    _, first = daemon.execute(
+        "import os\nread_fd, write_fd = os.pipe()\nos.dup2(write_fd, 1)\nos.write(1, b'sent to my own pipe\\n')\nprint('not captured')\nos.close(write_fd)\nprint('read back', os.read(read_fd, 100))",
+        exec_id="repl-pipe01",
+        timeout=20,
+    )
+    assert "not captured" not in first, "the cell's own redirect was not honoured"
+    assert "sent to my own pipe" not in first
+
+    frames, capture = daemon.snapshot()
+    junk = [frame for frame in frames if frame.get("t") == "_nonjson"]
+    assert not junk, f"the cell's pipe leaked into the protocol: {junk}"
+    assert b"my own pipe" not in capture, "the cell's private pipe was read as capture"
+
+    assert daemon.proc.poll() is None
+    _, out = daemon.execute("print('the next cell is captured again')", exec_id="repl-pipe02")
+    assert "captured again" in out
+    assert "restored fd" in daemon.log_path.read_text(), "the repair was not reported"
+
+
+# ── Pass 2: the cell cannot reach the protocol ───────────────────────────────
+
+
+def test_the_debugger_cannot_eat_the_protocol(daemon: Daemon) -> None:
+    """`breakpoint()` and `%debug` are things models really write, and pdb reads stdin.
+
+    stdin is the protocol. A debugger that got a real read would consume the host's next frame and
+    leave the channel waiting for an answer that was eaten.
+    """
+    frame, _ = daemon.execute("x = 1\nbreakpoint()\nprint('after')", exec_id="repl-bp0001")
+    assert frame["status"] == "error", f"breakpoint() did not fail with a clear error: {frame}"
+    assert "stdin carries the pi protocol" in (frame.get("evalue") or "")
+    assert daemon.proc.poll() is None
+
+    debug_frame, _ = daemon.execute("%debug 1/0", exec_id="repl-dbg001", timeout=20)
+    assert debug_frame["status"] in ("ok", "error", "interrupted"), debug_frame
+    assert daemon.proc.poll() is None, "the debugger killed the daemon"
+
+    _, out = daemon.execute("print('the debugger took nothing off the wire')", exec_id="repl-dbg002")
+    assert "took nothing off the wire" in out
+
+
+def test_a_cell_reading_stdin_does_not_block_the_channel(daemon: Daemon) -> None:
+    """`sys.stdin` is the protocol pipe, and the daemon keeps it non-blocking for that reason.
+
+    A blocking read on fd 0 would stop the loop, and the bytes it took would be frames the host is
+    still waiting on.
+    """
+    frame, block = daemon.execute("import sys\nprint('read', repr(sys.stdin.readline()))", exec_id="repl-std001", timeout=15)
+    assert frame["status"] in ("ok", "error"), frame
+    assert daemon.proc.poll() is None, "reading stdin hung the daemon"
+    assert "read" in block
+
+    _, out = daemon.execute("print('still answering')", exec_id="repl-std002")
+    assert "still answering" in out

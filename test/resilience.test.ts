@@ -134,4 +134,68 @@ describe("killing a channel", () => {
     await ext.emit({ type: "session_shutdown", reason: "quit" });
     await waitFor(() => !isPidAlive(childPid), 10_000, "the cell's child to die with the session");
   });
+
+  it("R2: a session replacement with PI_REPLMODE_KEEP_RUNNING=0 takes the group down too", async () => {
+    // The same promise, reached by the other switch: keeping channels alive across `/new` is the
+    // default, and turning it off has to be as thorough as a quit.
+    const pidFile = `${ext.agentDir}/keepzero-child.pid`;
+    const started = await run(
+      `import subprocess\nchild = subprocess.Popen(['bash','-c','sleep 90'], stdin=subprocess.DEVNULL)\nopen(${JSON.stringify(pidFile)},'w').write(str(child.pid))\nprint('spawned for a replacement')`,
+      { channel: "r-keepzero", timeout: 15 },
+    );
+    await waitFor(() => existsSync(pidFile), 15_000, "the cell to record its child's pid");
+    const childPid = Number(readFileSync(pidFile, "utf8"));
+
+    const saved = process.env.PI_REPLMODE_KEEP_RUNNING;
+    process.env.PI_REPLMODE_KEEP_RUNNING = "0";
+    try {
+      await ext.emit({ type: "session_shutdown", reason: "new" });
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_KEEP_RUNNING;
+      else process.env.PI_REPLMODE_KEEP_RUNNING = saved;
+    }
+    await waitFor(() => !isPidAlive(started.details.pid!), 15_000, "the daemon to go with the replacement");
+    await waitFor(() => !isPidAlive(childPid), 10_000, "the cell's child to go with it");
+  });
+
+  it("reports a foreground call whose channel is shut down underneath it", async () => {
+    // `session_shutdown` can land while a cell is running: the call has to come back with the truth
+    // rather than hang, and nothing may keep running afterwards.
+    const warm = await run("print('warm')", { channel: "r-quitrace" });
+    const pid = warm.details.pid!;
+    const inFlight = run("import time\nfor _ in range(20): time.sleep(0.5)", { channel: "r-quitrace", timeout: 12 });
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+
+    const result = await inFlight;
+    expect(result.isError).toBe(true);
+    expect(result.details.status).toBe("dead");
+    await waitFor(() => !isPidAlive(pid), 15_000, "the daemon to go away");
+
+    // A later call gets a fresh channel rather than a wedge.
+    const after = await run("print('usable again')", { channel: "r-quitrace", timeout: 20 });
+    expect(text(after)).toContain("usable again");
+  });
+
+  it("R2-09: a cell that leaves the process group is out of reach of the group kill", async () => {
+    // Pinned as a limitation, not as desired behaviour: `start_new_session=True` (or a double fork)
+    // moves a child into a group of its own, so closing a channel cannot reach it. The promise in
+    // `channel.ts` and DESIGN.md is about what a *cell started*, so either the docs have to carry the
+    // exception or the kill has to do more than signal a group. If the kill improves, update this test.
+    const pidFile = `${ext.agentDir}/escaped-child.pid`;
+    const started = await run(
+      `import subprocess\nchild = subprocess.Popen(['bash','-c','sleep 120'], start_new_session=True, stdin=subprocess.DEVNULL)\nopen(${JSON.stringify(pidFile)},'w').write(str(child.pid))\nprint('left the group')`,
+      { channel: "r-escape", timeout: 15 },
+    );
+    await waitFor(() => existsSync(pidFile), 15_000, "the cell to record its child's pid");
+    const childPid = Number(readFileSync(pidFile, "utf8"));
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    await waitFor(() => !isPidAlive(started.details.pid!), 15_000, "the channel daemon to go");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const escaped = isPidAlive(childPid);
+    process.kill(childPid, "SIGKILL"); // do not leave it for the next test
+    expect(escaped, "the group kill now reaches processes outside the channel's group: update the docs").toBe(true);
+  });
 });

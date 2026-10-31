@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
+import { isPidAlive, type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
 
@@ -23,6 +23,26 @@ afterAll(async () => {
 });
 
 describe("the channel cap", () => {
+  it("R2-03: a burst of parallel calls on new channels does not walk past the cap", async () => {
+    // The prompt tells the model to use separate channels for independent work, and `run` is
+    // registered with `executionMode: "parallel"`, so several channels are created at the same instant.
+    // Each one measures the cap before any of them exists, so none of them evicts anything.
+    const saved = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "2";
+    try {
+      const started = await Promise.all(
+        [1, 2, 3, 4, 5].map((n) => ext.callTool("run", { code: `print(${n})`, channel: `k-par${n}`, timeout: 30 })),
+      );
+      const pids = started.map((result) => result.details.pid).filter((pid) => pid !== undefined) as number[];
+      const live = pids.filter((pid) => isPidAlive(pid));
+      expect(live.length, `${live.length} channel daemons are alive with the cap set to 2`).toBeLessThanOrEqual(2);
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = saved;
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+    }
+  });
+
   it("refuses a new channel when every existing one is busy, and says how to free one", async () => {
     const busy = await ext.callTool("run", { code: "import time\ntime.sleep(5)", channel: "k-busy", timeout: 0 });
     expect(busy.details.status).toBe("running");

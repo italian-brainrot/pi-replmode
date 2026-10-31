@@ -123,6 +123,24 @@ describe("a process that outlives its cell", () => {
     expect(shown).toContain("CELL-TWO");
     expect(shown, "the flood leaked into the next cell").not.toContain("99999");
   });
+
+  it("R2-07: an orphan that writes while a later cell runs is not presented as that cell's output", async () => {
+    // R1-08 fixed the bytes that arrive *between* blocks. The harder half is the bytes that arrive
+    // while some other cell's block is open: at the file-descriptor level they are indistinguishable
+    // from that cell's own output, so the host either separates the streams or says so.
+    await run(
+      "import subprocess\nsubprocess.Popen(['bash','-c','for i in $(seq 1 40); do echo ORPHIN-$i; sleep 0.05; done'])\nprint('spawned a talkative child')",
+      { channel: "c-orphanblock" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const second = await run("import time\nprint('SLOW-CELL start')\ntime.sleep(2)\nprint('SLOW-CELL end')", { channel: "c-orphanblock" });
+    const shown = text(second);
+    expect(shown).toContain("SLOW-CELL end");
+    const contaminated = /ORPHIN-/.test(shown);
+    const disclosed = /(after .* ended|not from this cell|another process|earlier cell)/i.test(shown);
+    expect(contaminated && !disclosed, `another cell's child wrote into this cell's own output: ${shown.slice(0, 400)}`).toBe(false);
+  });
 });
 
 describe("a log bigger than the read window", () => {
@@ -149,6 +167,29 @@ describe("a log bigger than the read window", () => {
     // The note reads "showing X of N characters", so N has to be the log's size. `readLog` returns a
     // tail window, and the window's length is what gets reported today.
     expect(claimed, `the note claims ${claimed} characters for a ${logChars} character log`).toBeGreaterThanOrEqual(logChars * 0.98);
+  });
+
+  it("R2-01: still shows the end of a log it could not read whole", async () => {
+    // The head-and-tail promise is the whole point of the truncation, and a tail window is exactly
+    // where it matters most: the last lines of a long run are the ones that say what happened.
+    const result = await run("for i in range(200000): print(f'line {i} ' + 'pad' * 15)\nprint('THE VERY LAST LINE')", {
+      channel: "c-tailcut",
+      timeout: 180,
+    });
+    const shown = text(result);
+    expect(result.details.truncated, "the log was not truncated after all").toBe(true);
+    expect(shown, `the end of the log is missing from the result: ${shown.slice(-400)}`).toContain("THE VERY LAST LINE");
+  });
+
+  it("says what it gave up on counting once the log passes the scan limit", async () => {
+    // `countOutput` stops at 16 MB, so the totals quoted for a bigger log are a floor, and the note
+    // has to read like one.
+    const result = await run("for i in range(320000): print(f'line {i} ' + 'pad' * 15)", { channel: "c-countcap", timeout: 240 });
+    const shown = text(result);
+    const note = /showing [\d]+ of (at least )?(\d+) characters/.exec(shown);
+    expect(note, `no truncation note in: ${shown.slice(-600)}`).not.toBeNull();
+    expect(Number(note![2]), "the scan cap should have been reached").toBeGreaterThanOrEqual(16 * 1024 * 1024);
+    expect(note![1], `a log past the scan limit is reported as if it were counted exactly: ${note![0]}`).toBe("at least ");
   });
 });
 
