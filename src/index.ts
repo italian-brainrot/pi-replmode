@@ -9,7 +9,7 @@
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ChannelBusyError } from "./channel.ts";
-import { DEFAULT_BG_WAIT_TIMEOUT_SEC, getManager, type ReplResult, type RunParams, resolveTimeout } from "./manager.ts";
+import { DEFAULT_BG_WAIT_TIMEOUT_SEC, getManager, type ReplResult, type RunParams, resolveTimeout, type TaskStatus } from "./manager.ts";
 import { renderSection, SECTION_NAME } from "./prompt.ts";
 
 const RUN_DESCRIPTION =
@@ -46,11 +46,15 @@ const RUN_OUTPUT = Type.Object(
       Type.Literal("dead"),
     ]),
     channel: Type.String(),
-    output: Type.String(),
-    truncated: Type.Boolean(),
+    // Optional because they genuinely do not exist for a call that never reached a daemon: a busy
+    // channel, an empty cell, an invalid timeout, and a cell the tool handed to the background have no
+    // output, no truncation decision and no elapsed time to report yet. The schema has to describe the
+    // answers the tool actually gives — it is what a model reads when it wraps the tool (R2-05).
+    output: Type.Optional(Type.String()),
+    truncated: Type.Optional(Type.Boolean()),
     full_output_path: Type.Optional(Type.String()),
     variable: Type.Optional(Type.String()),
-    elapsed_seconds: Type.Number(),
+    elapsed_seconds: Type.Optional(Type.Number()),
     error: Type.Optional(Type.Object({ ename: Type.String(), evalue: Type.String() })),
   },
   { additionalProperties: true },
@@ -66,7 +70,10 @@ const BG_STOP_PARAMETERS = Type.Object({
   kill: Type.Optional(
     Type.Boolean({
       description:
-        "Take the whole channel down to stop a task that ignores SIGINT. This ends every cell in that channel and loses its variables; only reach for it when a plain stop fails.",
+        "Take the whole channel down to stop a task that ignores SIGINT. This ends every cell in that channel " +
+        "and everything those cells started — servers, builds, subprocesses — except any that moved into a " +
+        "process group of their own, which the kill cannot reach. Its variables go with it; only reach for it " +
+        "when a plain stop fails.",
     }),
   ),
 });
@@ -89,6 +96,8 @@ export default function (pi: ExtensionAPI): void {
       "Do not re-import or re-compute what the channel already has; check with `dir()` or `%who_ls` when unsure.",
       "Pass a longer `timeout` only for work you expect to take that long; a cell that outlives its timeout moves to the background and blocks its channel.",
       "Use separate channels for independent long-running work; one channel runs one cell at a time.",
+      "Channels are capped: at the cap the idlest one is retired with its variables, and if they are all busy a new channel is refused. Keep the count to what you need.",
+      "`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started.",
     ],
 
     async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<ReplResult> {
@@ -183,11 +192,15 @@ export default function (pi: ExtensionAPI): void {
 /** A thrown error becomes a tool error rather than a pi-level crash. */
 function failure(error: unknown, channel: string): ReplResult {
   const text = error instanceof Error ? error.message : String(error);
-  const known = error instanceof ChannelBusyError;
+  // A status from the enum the tool declares, and the same one in both views of the result: a busy
+  // channel is `running`, and every other refusal here is a call that never got a live channel. The
+  // `"error"` this used to put in `structuredContent` is not a status at all, and contradicted
+  // `details.status` in the same object (R2-05).
+  const status: TaskStatus = error instanceof ChannelBusyError ? "running" : "dead";
   return {
     content: [{ type: "text", text }],
-    details: { channel, status: known ? "running" : "dead" },
-    structuredContent: { status: known ? "running" : "error", channel, error: text },
+    details: { channel, status },
+    structuredContent: { status, channel, error: text },
     isError: true,
   };
 }

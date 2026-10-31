@@ -39,6 +39,38 @@ async function section(): Promise<string> {
   return sections.replmode ?? "";
 }
 
+describe("what the model is told about stopping a task and about the channel cap", () => {
+  it("R2-10: the section covers bg_stop's escalation, what killing a channel costs, and the cap", async () => {
+    // The guidelines push the separate-channels pattern, and the escape hatch for a wedged task is in a
+    // parameter description the model may not re-read at the moment it needs it. Both belong where the
+    // model looks first.
+    const shown = await section();
+    expect(shown, "the section never mentions the kill escalation").toContain("kill: true");
+    expect(shown, "the section does not say what killing a channel takes down").toMatch(/servers, builds and subprocesses/);
+    expect(shown, "the section does not say channels are capped").toMatch(/capped/);
+    expect(shown, "the section does not say the idlest channel is retired with its variables").toMatch(
+      /idlest .* is retired with its variables/,
+    );
+  });
+
+  it("the tool's own guidelines carry the same two facts", () => {
+    const guidelines = ext.tools.get("run")!.promptGuidelines ?? [];
+    const joined = guidelines.join("\n");
+    expect(joined).toMatch(/cap|capped/i);
+    expect(joined).toMatch(/idlest/);
+    expect(joined).toMatch(/kill: true/);
+  });
+
+  it("R2-09: the kill says what it cannot reach", () => {
+    // The group kill is the promise; a child that left the group is the exception, and a model that is
+    // told "this ends everything the cells started" will otherwise go on believing the port is free.
+    const parameters = ext.tools.get("bg_stop")!.parameters as { properties: { kill?: { description?: string } } };
+    const description = parameters.properties?.kill?.description ?? "";
+    expect(description).toContain("servers");
+    expect(description, "the kill is promised to reach things it cannot reach").toMatch(/process group/);
+  });
+});
+
 describe("lost channels", () => {
   it("says nothing about them before any channel has run", async () => {
     const shown = await section();

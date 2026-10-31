@@ -35,7 +35,8 @@ export interface Truncation {
  *
  * `totals` is what the whole log holds, when `text` is only a window into it (see `readLog`). Without
  * it the notes would quote the window: "1 000 of 8 388 588 characters" for a 15 MB log, numbers that
- * match nothing the model can go and look at.
+ * match nothing the model can go and look at. `totals` is for *reporting only* — where to cut is
+ * decided against `text`, or a windowed read loses its tail (R2-01).
  */
 export function truncateMiddle(
   text: string,
@@ -65,12 +66,15 @@ export function truncateMiddle(
   const headBudget = Math.floor(contentBudget * headRatio);
   const tailBudget = contentBudget - headBudget;
 
+  // Both cuts are in the coordinates of the text in hand, never of the file it came from: for a
+  // windowed read `totalChars` is the size of the whole log, and a tail offset measured in those
+  // coordinates starts past the end of the window, which loses the end of the log entirely.
   let headEnd = cutAtLineStart(text, headBudget, Math.floor(headBudget * 0.4));
-  let tailStart = cutAtLineEnd(text, totalChars - tailBudget, totalChars - Math.floor(tailBudget * 0.4));
+  let tailStart = cutAtLineEnd(text, text.length - tailBudget, text.length - Math.floor(tailBudget * 0.4));
   if (tailStart <= headEnd) {
     // A single line longer than the whole budget: fall back to a raw character cut.
     headEnd = headBudget;
-    tailStart = totalChars - tailBudget;
+    tailStart = text.length - tailBudget;
   }
 
   const head = text.slice(0, headEnd);

@@ -68,7 +68,8 @@ A cell that passes its `timeout` keeps running: you get a task ID and a log path
 busy until it finishes. Aborting the call (Esc) sends one SIGINT — the cell ends as interrupted and
 the channel keeps everything. Only `bg_stop { kill: true }` destroys a channel, and it takes down the
 process group with it: a dev server, a build or a training loop the cell started goes with the channel
-rather than being left behind holding a port.
+rather than being left behind holding a port. A child that moved into a process group of its own
+(`start_new_session=True`, `setsid`, a double fork) is outside that kill's reach and does survive.
 
 A cell that stops a signal, or sits in something CPython cannot interrupt (`os.system`, a C extension
 holding the GIL), will not stop for SIGINT. `bg_stop` says so rather than killing anything; `kill: true`
@@ -76,9 +77,10 @@ is then the only way out, and it costs the channel's variables.
 
 ### Output over 50 000 characters
 
-The middle is cut, head and tail kept, and nothing is simply dropped: the whole output is written to
-a per-cell log file, and the same log is bound to a global named `_out_a91f0c` in that channel, so
-the next cell can slice it without re-running anything.
+The limit covers the whole answer, the traceback included. The middle is cut, head and tail kept, and
+nothing is simply dropped: the whole output is written to a per-cell log file, and the same log is
+bound to a global named `_out_a91f0c` in that channel, so the next cell can slice it without
+re-running anything.
 
 ## Python environment
 
@@ -111,6 +113,10 @@ Everything a cell printed goes to a log file, whether or not it fit in the tool 
   daemon/<channel>.log   the daemon's own diagnostics
   history/<channel>.jsonl  one line per cell, so a new session can see what a lost channel held
 ```
+
+A channel name that is not already a plain file name (`notes/live`, `a b`) gets a short digest appended
+in those three places, so two different channel names never share a daemon log, a history file or an
+IPython profile.
 
 Retained logs are pruned at session start (3 days, 200 files).
 

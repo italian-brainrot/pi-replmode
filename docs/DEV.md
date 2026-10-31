@@ -29,7 +29,8 @@ python/tests/      pytest, driving the daemon over the real protocol. `test_daem
                    imports it rather than duplicating it
 src/               the extension: index.ts (registration), manager.ts (policy: run/bg/truncation/
                    history/cap), channel.ts (one daemon process: pipes, execs, logs, interrupt),
-                   wire.ts (frame parsing + CaptureSplitter), env.ts, paths.ts, format.ts, prompt.ts
+                   wire.ts (frame parsing + CaptureSplitter), env.ts, paths.ts, names.ts (channel →
+                   file names), format.ts, prompt.ts
 test/              vitest, loading the extension the way pi does (test/helpers/extension.ts) and
                    talking to real daemons: run/background (the contract), capture/resilience/cap
                    (attribution, interrupts, lifecycle), lifecycle (stub interpreters: never-ready,
@@ -92,10 +93,24 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   holds back only the bytes that could begin a sentinel, so ordinary output is not delayed and a
   sentinel split across any chunk boundary still reassembles. A death outranks a frame: `Exec.finalize`
   and `Channel.wait` report `dead` when the process went away, even if `exec_end` had arrived first.
-- **Attribution of late bytes.** Bytes that arrive while no block is open go to the log of the exec
-  whose block closed last (they came from its threads or children), under a header, capped at 256 KB.
-  Only output from before the first block ever opened is held for the next block. If you change this,
-  the model loses the ability to tell whose bytes it is looking at.
+- **Attribution of late bytes has a hard edge.** Bytes that arrive while no block is open go to the log of
+  the exec whose block closed last (they came from its threads or children), under a header, capped at
+  256 KB. Only output from before the first block ever opened is held for the next block. Bytes that
+  arrive **while a block is open** cannot be told apart from that cell's own output — the whole channel
+  shares one capture stream — so the host flags a channel that has produced out-of-band bytes and says so
+  in every later result from it. Do not word that header, that note, or the DESIGN paragraph as if the
+  host knows more than that (R2-07); and do not "fix" it with per-exec capture pipes without reading the
+  deadlock argument in `docs/AUDIT.md`.
+- **A channel name is three file names** — the daemon log, the history file, the IPython profile — and
+  they must come from `names.ts`, the one place that keeps the mapping one-to-one. Naive sanitising puts
+  `a/b` and `a_b` in one log, one history file and one sqlite profile; keying the "these channels are
+  gone" note by the *file stem* instead of the record's real name tells the model a running channel
+  died (R2-04).
+- **The 50 000-character limit covers the whole answer, not just the capture.** The traceback arrives in
+  the `exec_end` frame and is appended after the capture, so it needs its own share of the budget or a
+  cell that raises with a row of data in its message returns a result of unbounded size (R2-02). If you
+  shorten anything, put the full text in the exec log and bind the nonce global — that is the deal every
+  shortening here makes.
 - **An interrupt has two paths.** Running bytecode: CPython's default handler raises in the cell.
   Parked on an `await`: the loop catches the `KeyboardInterrupt` and `Runner.interrupt_cell` puts it on
   the future the cell task waits for (`asyncio.Task` has no `throw`). Keep the raw loop and the default
@@ -110,7 +125,12 @@ spikes/            the experiments that proved interrupt and formatter behaviour
 - **Closing a channel always group-kills.** `Channel.close` sends `shutdown`, waits, and then takes the
   process group down regardless — the daemon answers `shutdown` quickly, so an escalation that only
   fires when it does not would never run, and every server or build the cell started would survive the
-  channel that made it.
+  channel that made it. The exception is written down in three places (the `channel.ts` header,
+  DESIGN, and the `kill` parameter text): a child that left the group is out of reach.
+- **The channel cap counts daemons that are still starting.** `run` is parallel and the prompt recommends
+  one channel per piece of work, so five calls on five new names arrive in one tick; counting only
+  daemons that have answered gives five processes under a cap of 2 (R2-03). Anything that moves the
+  `channels.set` / `starting.delete` handoff has to keep the union of the two maps correct.
 - **vitest timing**: `bg_wait` returns when *any* task finishes, so assertions about elapsed time
   must be relative to when each task was started, not to the cell's own length. Anything that waits on
   real signal delivery is timing-sensitive; prefer `waitFor` over fixed sleeps, and never assert on

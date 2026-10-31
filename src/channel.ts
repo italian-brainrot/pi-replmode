@@ -4,7 +4,9 @@
  * The host never kills a channel to end a cell — it sends SIGINT, which IPython turns into a
  * KeyboardInterrupt inside the cell and recovers from. Killing happens only when the whole channel is
  * being closed, and then it always takes the process group down: a dev server, a build or a training
- * loop started by a cell must not outlive the channel that made it.
+ * loop started by a cell must not outlive the channel that made it. One exception, not fixable without
+ * walking a process tree: a child that leaves the group (`start_new_session=True`, a double fork) is
+ * out of reach of `kill(-pid)` and survives the channel (R2-09).
  *
  * Output handling is the subtle part. Frame delivery (stdout) and output capture (stderr) are
  * separate pipes with no ordering between them, so an exec is finished only when *both* its
@@ -19,6 +21,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, write
 import { join } from "node:path";
 import type { PythonEnv } from "./env.ts";
 import { MAX_READ_BYTES, type Truncation, truncateMiddle } from "./format.ts";
+import { channelFileStem } from "./names.ts";
 import { DAEMON_LOG_DIR, EXEC_LOG_DIR, ensureDirs, IPYTHON_DIR, PYTHON_PACKAGE_DIR } from "./paths.ts";
 import { CaptureSplitter, type DaemonFrame, type ExecStatus, type HostFrame, parseFrame, stripSentinels } from "./wire.ts";
 
@@ -28,6 +31,10 @@ const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
 /** How long a missing closing sentinel is tolerated before the exec is called finished anyway. */
 const SENTINEL_GRACE_MS = 750;
+/** How long a dead channel's stdio is given to drain before its start failure is reported (R2-06). */
+const STDIO_DRAIN_MS = 200;
+/** How much of a failed daemon's own complaint reaches the model; the rest stays in its log file. */
+const START_FAILURE_MAX_CHARS = 3000;
 /** How long an interrupt is given before an aborted call gives up and backgrounds the cell. */
 const INTERRUPT_GRACE_MS = 3000;
 /** Output streamed to the UI while a foreground cell runs. */
@@ -118,7 +125,12 @@ export class Exec {
     this.lateBytes += chunk.length;
     if (!this.lateAnnounced) {
       this.lateAnnounced = true;
-      this.appendToFile(Buffer.from("\n[output that arrived after this cell ended]\n", "utf8"));
+      // Careful with this wording: the exec this lands in is the one whose block closed last, which is
+      // the most likely producer but not a proven one — an orphan that keeps writing wanders into later
+      // execs' logs too. Say whose log it is, not what caused it (R2-07).
+      this.appendToFile(
+        Buffer.from("\n[output that arrived after this cell ended: from something the channel left running, not from a cell]\n", "utf8"),
+      );
     }
     const room = LATE_MAX_BYTES - (this.lateBytes - chunk.length);
     if (chunk.length > room) {
@@ -148,6 +160,15 @@ export class Exec {
         }
       }
     }
+  }
+
+  /** Append text to this exec's log after its block closed and its descriptor went away.
+   *
+   * Used for the full traceback: it is not capture, but it belongs with this cell's output, and the
+   * shortened version in the result has to point at something that still holds the whole thing (R2-02).
+   */
+  appendNote(text: string): void {
+    this.appendToFile(Buffer.from(text, "utf8"));
   }
 
   closeLog(): void {
@@ -246,8 +267,13 @@ export class Channel {
   private sink: Exec | null = null;
   /** The exec whose closing boundary we saw last: the producer of any late capture bytes. */
   private lastClosed?: Exec;
+  /** Capture seen outside any block: this channel has a writer that is not the cell. */
+  private outOfBandOutput = false;
   private lock: Promise<unknown> = Promise.resolve();
   private readonly daemonNotes: string[] = [];
+  /** What the daemon said in its `fatal` frame: the reason it could not start, in its own words. */
+  private fatalNote?: string;
+  private startFailureReported = false;
   private readySettle: (frame: ReadyFrame) => void = () => {};
   private readyFail: (error: Error) => void = () => {};
 
@@ -262,7 +288,7 @@ export class Channel {
     this.env = start.env;
     this.pid = proc.pid ?? -1;
     this.proc = proc;
-    this.daemonLogPath = join(DAEMON_LOG_DIR, `${safeChannelName(start.name)}.log`);
+    this.daemonLogPath = join(DAEMON_LOG_DIR, `${channelFileStem(start.name)}.log`);
 
     this.readyPromise = new Promise<ReadyFrame>((resolve, reject) => {
       this.readySettle = resolve;
@@ -338,9 +364,14 @@ export class Channel {
       case "log":
         this.note(`${frame.level}: ${frame.text}`);
         return;
-      case "fatal":
-        this.note(`daemon reported a fatal error: ${frame.error}${frame.traceback ? `\n${frame.traceback}` : ""}`);
+      case "fatal": {
+        const text = `${frame.error}${frame.traceback ? `\n${frame.traceback}` : ""}`;
+        // Kept separately from the note ring: a channel that died at startup has to put this in front
+        // of the model, and `notes()` is only ever read when building a dead cell's result (R2-06).
+        this.fatalNote = text;
+        this.note(`daemon reported a fatal error: ${text}`);
         return;
+      }
       case "display":
         // Rich display lands in M3; recognised so it is never mistaken for noise.
         return;
@@ -356,8 +387,12 @@ export class Channel {
     }
     // Nothing is writing into a block. Since the last block closed, the capture stream has been
     // written by whatever the previous cell left behind, so that is whose log it goes to: presenting
-    // it as the next cell's output would be a lie, and dropping it silently would be worse.
+    // it as the next cell's output would be a lie, and dropping it silently would be worse. It is also
+    // the only evidence available that a *later* cell's output may be contaminated: bytes that arrive
+    // while a block is open cannot be told apart from that block's own output at the descriptor level,
+    // so the honest part is that this channel has a second writer (R2-07).
     if (this.lastClosed) {
+      this.outOfBandOutput = true;
       this.lastClosed.lateWrite(chunk);
       return;
     }
@@ -413,12 +448,44 @@ export class Channel {
       // Every exec in the channel shares the process that just went away, including one that had
       // already finished: an `exec_end` that arrived seconds before the death still means the
       // channel is over, and a result built now has to say so.
-      exec.deathNote ??= this.deathNote;
+      const interrupt = !exec.settled && exec.killRequested ? ", shortly after an interrupt was requested for this cell" : "";
+      exec.deathNote ??= `${this.deathNote}${interrupt}`;
       if (exec.settled) continue;
-      if (exec.status === "running") exec.status = exec.killRequested ? "interrupted" : "dead";
+      // The status is `finalize`'s to decide — death outranks whatever the frame claims (R1-06). Pass 2
+      // found that an earlier version set a status here which `finalize` overwrote two lines later, so
+      // the fact that an interrupt was involved was silently dropped; it goes in the note now, where a
+      // model actually reads it (R2-08).
       exec.finalize();
     }
-    this.readyFail(new Error(`${this.deathNote}${this.startupOutput() ? `:\n${this.startupOutput()}` : ""}`));
+    this.reportStartFailureSoon();
+  }
+
+  /**
+   * Tell whoever was waiting for `ready` that this channel is not coming, with everything the process
+   * managed to say about why (R2-06).
+   *
+   * `exit` can be emitted before the last of the child's stderr reaches us, and an interpreter that
+   * died on import writes its complaint there, so the report waits for the pipes to close — briefly,
+   * and bounded, because a process that closes nothing must not hang the call.
+   */
+  private reportStartFailureSoon(): void {
+    const timer = setTimeout(() => this.reportStartFailure(), STDIO_DRAIN_MS);
+    timer.unref?.();
+    this.proc.once("close", () => {
+      clearTimeout(timer);
+      this.reportStartFailure();
+    });
+  }
+
+  private reportStartFailure(): void {
+    if (this.startFailureReported) return;
+    this.startFailureReported = true;
+    const parts = [this.deathNote, this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined, this.startupOutput()];
+    // The whole answer still has to fit the tool's limit, and a broken interpreter can write a great
+    // deal before it dies: keep the head and the tail, and send the model to the daemon's log for the
+    // rest. Tail-heavy, because the line that says *why* is at the end of a traceback.
+    const said = truncateMiddle(parts.filter((part): part is string => Boolean(part?.trim())).join("\n"), START_FAILURE_MAX_CHARS, 0.35);
+    this.readyFail(new Error(said.truncated ? `${said.text}\n[the daemon's full output is in ${this.daemonLogPath}]` : said.text));
   }
 
   /** Capture that arrived while no block was open, as text: a daemon that dies at startup leaves its
@@ -427,13 +494,23 @@ export class Channel {
     return Buffer.concat(this.loose).toString("utf8").trim();
   }
 
+  /** Has this channel produced capture that no cell asked for? See `writeToSink`. */
+  hasOutOfBandOutput(): boolean {
+    return this.outOfBandOutput;
+  }
+
   private flushLoose(): void {
     if (this.loose.length === 0) return;
     const trailing = Buffer.concat(this.loose);
-    this.loose = [];
-    // This is a cell's output arriving after the cell ended; the newest record keeps it.
     const last = [...this.execs.values()].at(-1);
-    if (last) last.write(trailing);
+    // A daemon that died before any cell ran has nothing to attach this to: leave the buffer so
+    // `startupOutput()` can still report what the interpreter said (R2-06).
+    if (!last) return;
+    this.loose = [];
+    this.looseBytes = 0;
+    // Late capture, so it goes in through the path that appends to a closed log and counts against its
+    // cap — `Exec.write` no-ops once the descriptor is gone, which used to drop these bytes (R2-06).
+    last.lateWrite(trailing);
   }
 
   private note(text: string): void {
@@ -655,7 +732,7 @@ export async function startChannel(start: ChannelStart): Promise<Channel> {
     start,
     spawn(
       start.env.python,
-      ["-m", "replmode", "--channel", start.name, "--log", join(DAEMON_LOG_DIR, `${safeChannelName(start.name)}.log`), "--cwd", start.cwd],
+      ["-m", "replmode", "--channel", start.name, "--log", join(DAEMON_LOG_DIR, `${channelFileStem(start.name)}.log`), "--cwd", start.cwd],
       {
         cwd: start.cwd,
         // Its own process group: Ctrl-C in the terminal belongs to pi, and closing a channel takes
@@ -666,7 +743,7 @@ export async function startChannel(start: ChannelStart): Promise<Channel> {
           ...process.env,
           PYTHONPATH: PYTHON_PACKAGE_DIR,
           PYTHONUNBUFFERED: "1",
-          IPYTHONDIR: join(IPYTHON_DIR, safeChannelName(start.name)),
+          IPYTHONDIR: join(IPYTHON_DIR, channelFileStem(start.name)),
           PYTHONWARNINGS: process.env.PYTHONWARNINGS ?? "default",
         },
       },
@@ -750,11 +827,6 @@ export function newExecId(taken: Map<string, Exec>): string {
     id = `repl-${suffix}`;
   } while (taken.has(id));
   return id;
-}
-
-/** Channel names come from the model and become file names. */
-export function safeChannelName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40) || "channel";
 }
 
 interface Sleeper {

@@ -13,6 +13,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { channelFileStem } from "../src/names.ts";
 import { type LoadedExtension, loadExtension, makeTempDir, text } from "./helpers/extension.ts";
 
 const agent = makeTempDir("replmode-names-");
@@ -47,6 +48,46 @@ describe("a channel whose name is not already a file name", () => {
 
     await ext.emit({ type: "session_shutdown", reason: "quit" });
     ext.dispose();
+  });
+});
+
+describe("the file names a channel name becomes", () => {
+  it("R2-04: is one-to-one, so two channel names never share a daemon log, history file or profile", () => {
+    const names = [
+      "main",
+      "a/b",
+      "a_b",
+      "a b",
+      "a.b",
+      "notes/live",
+      "notes_live",
+      "work-2",
+      "work 2",
+      "../../escape",
+      "...",
+      "x".repeat(60),
+      `${"x".repeat(60)}-two`,
+      "\u00e9clair",
+      "clair",
+    ];
+    const stems = names.map((name) => channelFileStem(name));
+    const collisions = stems.filter((stem, index) => stems.indexOf(stem) !== index);
+    expect(collisions, `these channel names collapse onto one file name: ${collisions.join(", ")}`).toEqual([]);
+
+    // …and none of them is a way out of the directory it is written into.
+    for (const [index, stem] of stems.entries()) {
+      expect(stem, `a stem for ${JSON.stringify(names[index])} is not a plain file name`).toMatch(/^[a-zA-Z0-9_-]+$/);
+      expect(stem.startsWith(".")).toBe(false);
+      expect(stem.length).toBeLessThanOrEqual(60);
+    }
+  });
+
+  it("keeps a name that is already a file name exactly as it is", () => {
+    // So the files for `main` — and the history files the tests and any user inspect by eye — stay
+    // readable and stable, instead of every channel getting a digest it never asked for.
+    for (const name of ["main", "data-loader", "t-hist", "a-b_C9"]) {
+      expect(channelFileStem(name)).toBe(name);
+    }
   });
 });
 

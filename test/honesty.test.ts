@@ -9,6 +9,7 @@
  * Tests whose comment names an issue id (R2-nn) document a defect from the pass-2 audit.
  */
 
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MAX_OUTPUT_CHARS } from "../src/format.ts";
 import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
@@ -35,10 +36,49 @@ describe("the 50 000 character limit covers the whole answer", () => {
     const result = await run("raise ValueError('unparseable: ' + 'x' * 300000)", { channel: "h-traceback" });
     expect(result.isError).toBe(true);
     const shown = text(result);
-    expect(shown, `the result is ${shown.length} characters: the traceback gets no share of the limit`).toBeLessThan(
+    // (`.length`, because `expect(string).toBeLessThan(number)` is a TypeError in vitest and this
+    // assertion therefore never ran at all — see "Pass 2 fixes" in docs/AUDIT.md. Same bound.)
+    expect(shown.length, `the result is ${shown.length} characters: the traceback gets no share of the limit`).toBeLessThan(
       MAX_OUTPUT_CHARS + 5_000,
     );
     expect(shown).toContain("ValueError");
+  });
+
+  it("R2-02: keeps the whole traceback somewhere the model can still read", async () => {
+    // Shortening a traceback is only honest if the whole thing is kept. The capture already has that
+    // deal — log file plus a global to slice — so the traceback has to get the same treatment.
+    const result = await run("raise ValueError('unparseable: ' + 'y' * 300000)", { channel: "h-traceback-reach" });
+    const shown = text(result);
+    expect(result.details.fullOutputPath, `no log path in a shortened result: ${shown.slice(-400)}`).toBeTruthy();
+    expect(shown, "the result does not say where the full traceback is").toContain("full traceback:");
+
+    const log = readFileSync(result.details.fullOutputPath!, "utf8");
+    expect(log, "the full traceback is not in the log the result points at").toContain("y".repeat(300000));
+
+    // The note has to describe the cut that was actually made: calling a head-and-tail cut "head only"
+    // is the R1-09/R2-01 mistake in a new place (the real-pi smoke found it).
+    const note = /traceback truncated: showing (\d+) of (\d+) characters at the start and (\d+) at the end/.exec(shown);
+    expect(note, `no head-and-tail traceback note in: ${shown.slice(-500)}`).not.toBeNull();
+    expect(Number(note![3]), "the traceback note leaves the reader with no tail").toBeGreaterThan(0);
+    expect(Number(note![1]) + Number(note![3]), "the note claims nothing was cut").toBeLessThan(Number(note![2]));
+
+    // And it is reachable from the next cell without re-running anything.
+    expect(result.details.varName, "no global bound for a shortened traceback").toMatch(/^_out_/);
+    const sliced = await run(`print('the log holds it all:', len(${result.details.varName}) > 300_000)`, {
+      channel: "h-traceback-reach",
+    });
+    expect(text(sliced), "the bound global does not hold the whole text").toContain("the log holds it all: True");
+  });
+
+  it("R2-02: gives the traceback whatever the output did not use", async () => {
+    // The share of the limit is a floor, not a ceiling. Cutting a traceback that fit comfortably is its
+    // own kind of dishonesty, and the cell that raises with a row in its message usually printed
+    // nothing else.
+    const result = await run("raise ValueError('the whole row: ' + 'z' * 30000)", { channel: "h-traceback-share" });
+    const shown = text(result);
+    expect(shown).toContain("zzz");
+    expect(shown, "the traceback was cut although the answer had room for it").not.toContain("traceback truncated");
+    expect(shown.length, `the answer is ${shown.length} characters`).toBeLessThan(MAX_OUTPUT_CHARS);
   });
 
   it("a long traceback from ordinary code still fits", async () => {

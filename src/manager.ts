@@ -26,6 +26,7 @@ import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { type Channel, ChannelBusyError, type Exec, type ExecOutcome, type ReadyFrame, readLog, startChannel } from "./channel.ts";
 import { ensureEnv } from "./env.ts";
 import { formatDuration, formatSize, MAX_OUTPUT_CHARS, MAX_READ_BYTES, nonceVarName, oneLine, truncateMiddle } from "./format.ts";
+import { channelFileStem } from "./names.ts";
 import { EXEC_LOG_DIR, ensureDirs, HISTORY_DIR } from "./paths.ts";
 
 const DEFAULT_TIMEOUT_SEC = 60;
@@ -43,10 +44,22 @@ const HISTORY_ROTATE_BYTES = 256 * 1024;
 const HISTORY_CODE_CHARS = 400;
 /** Listing limits, model-facing. */
 const LISTING_MAX_TASKS = 30;
+/** How much of the 50 000 a traceback may take before the capture is cut to make room (R2-02). */
+const TRACEBACK_SHARE = 0.25;
+/** How much of an exception's own message is worth repeating when the traceback already carries it. */
+const EVALUE_CHARS = 500;
 /** How long an interrupt is given before bg_stop reports the task as unresponsive. */
 const STOP_GRACE_MS = 5000;
 
 export type TaskStatus = "running" | "completed" | "failed" | "interrupted" | "dead";
+
+/** There is no room for another channel, and nothing idle to make room with. */
+export class ChannelCapacityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChannelCapacityError";
+  }
+}
 
 export interface TaskInfo {
   id: string;
@@ -158,17 +171,27 @@ export class ReplManager {
     return channel;
   }
 
-  /** The cap is about process count: an idle daemon costs about 45 MB. */
+  /**
+   * The cap is about process count: an idle daemon costs about 45 MB.
+   *
+   * A creation that is still in flight counts as live. `run` is registered parallel and the prompt
+   * recommends separate channels for independent work, so a whole set of new channels can be asked for
+   * in one tick, and every one of them would otherwise measure the cap against a map its own daemon has
+   * not reached yet — N daemons for a cap of 2 (R2-03).
+   */
   private async makeRoom(): Promise<void> {
     const live = [...this.channels.values()].filter((channel) => !channel.closed);
-    if (live.length < this.maxChannels) return;
+    // A name is counted once even in the moment between a daemon coming up and the creation promise
+    // being cleared out of `starting`.
+    const occupying = new Set([...this.starting.keys(), ...live.map((channel) => channel.name)]);
+    if (occupying.size < this.maxChannels) return;
 
     const idlest = live
       .filter((channel) => !channel.current?.running)
       .sort((a, b) => a.lastUsed - b.lastUsed)
       .at(0);
     if (!idlest) {
-      throw new Error(
+      throw new ChannelCapacityError(
         `all ${this.maxChannels} pi-replmode channels are busy and the cap (${this.maxChannels}, set with PI_REPLMODE_MAX_CHANNELS) is reached: ` +
           "let a background task finish, stop one with bg_stop, or free a channel with bg_stop {kill: true}",
       );
@@ -207,10 +230,14 @@ export class ReplManager {
       channel = await this.getChannel(channelName, cwd, onProgress);
     } catch (error) {
       const note = error instanceof Error ? error.message : String(error);
+      // A capacity refusal is not a channel that failed to start — nothing was started, and every
+      // other channel in the session is running. Say which of the two the model is being told.
+      const refused = error instanceof ChannelCapacityError;
+      const status: TaskStatus = refused ? "running" : "dead";
       return {
-        content: [{ type: "text", text: `channel "${channelName}" could not start: ${note}` }],
-        details: { channel: channelName, status: "dead" },
-        structuredContent: { status: "dead", channel: channelName, error: note },
+        content: [{ type: "text", text: refused ? note : `channel "${channelName}" could not start: ${note}` }],
+        details: { channel: channelName, status },
+        structuredContent: { status, channel: channelName, error: note },
         isError: true,
       };
     }
@@ -297,25 +324,40 @@ export class ReplManager {
    * The answer to a finished cell: its output, then the traceback if it raised, then a note about
    * what did not fit. Truncation never just drops text: the log file keeps the whole thing, and a
    * nonce global in the same channel holds it so the next cell can slice it.
+   *
+   * The limit covers the whole answer, not just the capture. A traceback is not capture — it arrives in
+   * the `exec_end` frame — so it has to be given a share of the budget explicitly, or a cell that raises
+   * with data in its message (`ValueError("unparseable: " + blob)`) returns a result of whatever size
+   * the data was (R2-02). The full traceback is appended to the exec log first, so shortening it in the
+   * result does not lose it.
    */
   private finishedResult(exec: Exec, banner: string[]): ReplResult {
     const read = readLog(exec.logPath);
     // A log read as a tail window is bigger than the text in hand, so the totals quoted to the model
     // come from the file itself rather than from the window.
     const totals = read.windowed ? countOutput(exec.logPath) : undefined;
-    const cut = truncateMiddle(read.text, MAX_OUTPUT_CHARS, 0.6, totals && { chars: totals.chars, lines: totals.lines });
-    exec.outputTruncated = cut.truncated;
-
     const frame = exec.frame;
+    const tracebackRaw = frame?.traceback?.trimEnd() ?? "";
+    // The traceback gets whatever the capture did not need, and never less than a quarter of the limit,
+    // so a cell that printed 8 MB and *then* raised still gets a readable traceback.
+    const tracebackBudget = Math.min(
+      tracebackRaw.length,
+      Math.max(Math.floor(MAX_OUTPUT_CHARS * TRACEBACK_SHARE), MAX_OUTPUT_CHARS - Math.min(read.text.length, MAX_OUTPUT_CHARS)),
+    );
+
+    const cut = truncateMiddle(read.text, MAX_OUTPUT_CHARS - tracebackBudget, 0.6, totals && { chars: totals.chars, lines: totals.lines });
+    const traceback = truncateMiddle(tracebackRaw, tracebackBudget, 0.65);
+    exec.outputTruncated = cut.truncated || traceback.truncated;
+
     const status = statusOf(exec);
     const gone = status === "dead" || Boolean(exec.deathNote) || exec.channel.closed;
     const blocks: string[] = [...banner];
 
     const shown = cut.text.replace(/\s+$/, "");
     if (shown.trim()) blocks.push(shown);
-    else if (!frame?.traceback?.trim()) blocks.push("(no output)");
+    else if (!tracebackRaw) blocks.push("(no output)");
 
-    if (frame?.traceback?.trim()) blocks.push(frame.traceback.trimEnd());
+    if (tracebackRaw) blocks.push(traceback.text.trimEnd());
 
     const notes: string[] = [];
     if (status === "interrupted") notes.push("cell interrupted; the channel and its variables are intact");
@@ -326,28 +368,49 @@ export class ReplManager {
       notes.push("the channel is gone and its variables are lost; the next run on it starts a fresh one");
     }
     if (read.windowed) notes.push(`the log is bigger than ${formatSize(MAX_READ_BYTES)}; showing its tail`);
+    if (exec.channel.hasOutOfBandOutput()) {
+      // Everything the channel's processes write goes into one stream. Bytes that arrive between two
+      // cells are attributed to the cell that left them running (see `channel.ts`); bytes that arrive
+      // while a cell is running are indistinguishable from that cell's own output, so the only honest
+      // thing left is to say that this channel has produced output no cell asked for (R2-07).
+      notes.push(
+        "this channel has output that arrived outside any cell's block, so some of the lines above may come from a process an earlier cell left running rather than from this cell",
+      );
+    }
 
     let varName: string | undefined;
-    if (cut.truncated) {
+    if (cut.truncated || traceback.truncated) {
       // `countOutput` stops counting in very large logs, so say when the total is a floor.
       const atLeast = totals?.partial ? "at least " : "";
-      notes.push(
-        `output truncated: showing ${cut.headChars} of ${atLeast}${cut.totalChars} characters at the start and ${cut.tailChars} at the end ` +
-          `(${cut.shownLines} of ${atLeast}${cut.totalLines} lines)`,
-      );
+      if (cut.truncated) {
+        notes.push(
+          `output truncated: showing ${cut.headChars} of ${atLeast}${cut.totalChars} characters at the start and ${cut.tailChars} at the end ` +
+            `(${cut.shownLines} of ${atLeast}${cut.totalLines} lines)`,
+        );
+      }
+      if (traceback.truncated) {
+        exec.appendNote(`\n[full traceback for this cell]\n${tracebackRaw}\n`);
+        // Head *and* tail, like the output note: the smoke test caught this one claiming only the head
+        // was shown when the tail was on the page too.
+        notes.push(
+          `traceback truncated: showing ${traceback.headChars} of ${tracebackRaw.length} characters at the start and ${traceback.tailChars} at the end`,
+        );
+      }
+      const what = cut.truncated && traceback.truncated ? "full output and traceback" : cut.truncated ? "full output" : "full traceback";
       if (!exec.channel.closed) {
         varName = nonceVarName();
         exec.channel.bindVar(varName, exec.logPath);
-        notes.push(`full output: ${exec.logPath}, also bound to the global ${varName} in channel "${exec.channelName}"`);
+        notes.push(`${what}: ${exec.logPath}, also bound to the global ${varName} in channel "${exec.channelName}"`);
       } else {
-        notes.push(`full output: ${exec.logPath}`);
+        notes.push(`${what}: ${exec.logPath}`);
       }
     }
     if (frame?.definitions?.length) notes.push(`defined by this cell: ${frame.definitions.join(", ")}`);
     if (notes.length > 0) blocks.push(notes.map((note) => `[${note}]`).join("\n"));
 
     const failed = status === "failed" || status === "interrupted" || status === "dead";
-    const kept = cut.truncated || read.windowed || exec.backgrounded;
+    const kept = cut.truncated || traceback.truncated || read.windowed || exec.backgrounded;
+    const evalue = frame?.evalue ? oneLine(frame.evalue, EVALUE_CHARS) : null;
 
     return {
       content: [{ type: "text", text: blocks.join("\n\n") }],
@@ -357,21 +420,21 @@ export class ReplManager {
         status,
         elapsed: round(exec.elapsed),
         pid: exec.channel.pid,
-        truncated: cut.truncated,
+        truncated: cut.truncated || traceback.truncated,
         ...(varName ? { varName } : {}),
         ...(kept ? { logPath: exec.logPath, fullOutputPath: exec.logPath } : {}),
         ...(frame?.definitions?.length ? { definitions: frame.definitions } : {}),
-        ...(frame?.ename ? { ename: frame.ename, evalue: frame.evalue ?? null } : {}),
+        ...(frame?.ename ? { ename: frame.ename, evalue } : {}),
       },
       structuredContent: {
         status,
         channel: exec.channelName,
         output: cut.text.slice(0, 1_048_576),
-        truncated: cut.truncated,
+        truncated: cut.truncated || traceback.truncated,
         ...(kept ? { full_output_path: exec.logPath } : {}),
         ...(varName ? { variable: varName } : {}),
         elapsed_seconds: round(exec.elapsed),
-        ...(frame?.ename ? { error: { ename: frame.ename, evalue: frame.evalue ?? "" } } : {}),
+        ...(frame?.ename ? { error: { ename: frame.ename, evalue: evalue ?? "" } } : {}),
       },
       ...(failed ? { isError: true } : {}),
     };
@@ -412,11 +475,15 @@ export class ReplManager {
 
   private deadResult(exec: Exec, banner: string[]): ReplResult {
     const { text } = readLog(exec.logPath, 1024 * 1024);
+    // A dead channel's result has to fit the same limit as any other: the capture it managed to
+    // stream can be megabytes, and there is no later cell to bind a global for.
+    const cut = truncateMiddle(text, Math.floor(MAX_OUTPUT_CHARS * 0.6), 0.6);
     const notes = exec.channel.notes().slice(-6);
     const blocks = [
       ...banner,
-      text.trim() || "(no output)",
+      cut.text.trim() || "(no output)",
       `[${exec.deathNote ?? "the channel's Python process ended"}]`,
+      ...(cut.truncated ? [`[output truncated: the whole capture is in ${exec.logPath}]`] : []),
       ...(notes.length > 0 ? [`daemon said:\n${notes.join("\n")}`] : []),
       "[the channel is gone and its variables are lost; the next run on it starts a fresh one]",
     ];
@@ -427,13 +494,16 @@ export class ReplManager {
         id: exec.id,
         status: "dead",
         elapsed: round(exec.elapsed),
+        truncated: cut.truncated,
         logPath: exec.logPath,
         fullOutputPath: exec.logPath,
       },
       structuredContent: {
         status: "dead",
         channel: exec.channelName,
-        output: text.slice(0, 1_048_576),
+        output: cut.text.slice(0, 1_048_576),
+        truncated: cut.truncated,
+        full_output_path: exec.logPath,
         elapsed_seconds: round(exec.elapsed),
       },
       isError: true,
@@ -562,7 +632,7 @@ export class ReplManager {
           bytes: counts.bytes,
           countsPartial: counts.partial,
           ename: exec.frame?.ename ?? null,
-          evalue: exec.frame?.evalue ?? null,
+          evalue: exec.frame?.evalue ? oneLine(exec.frame.evalue, EVALUE_CHARS) : null,
         };
       });
   }
@@ -675,7 +745,12 @@ export class ReplManager {
     }
   }
 
-  /** The last recorded cell per channel, from this and earlier processes. */
+  /** The last recorded cell per channel, from this and earlier processes.
+   *
+   * Keyed by the name the model used, which the record carries. The file name is a sanitised, digested
+   * form of it (see `names.ts`) and asking the live channel map with *that* would report a running
+   * channel as lost (R2-04).
+   */
   lastHistoryByChannel(): Map<string, HistoryRecord> {
     const latest = new Map<string, HistoryRecord>();
     let names: string[];
@@ -686,7 +761,7 @@ export class ReplManager {
     }
     for (const entry of names) {
       if (!entry.endsWith(".jsonl")) continue;
-      const channel = entry.slice(0, -".jsonl".length);
+      const stem = entry.slice(0, -".jsonl".length);
       try {
         const lines = readFileSync(join(HISTORY_DIR, entry), "utf8")
           .split("\n")
@@ -698,6 +773,7 @@ export class ReplManager {
           try {
             const parsed = JSON.parse(lines[index]!) as HistoryRecord;
             if (!parsed || typeof parsed !== "object") throw new Error("not a record");
+            const channel = typeof parsed.channel === "string" && parsed.channel ? parsed.channel : stem;
             latest.set(channel, { ...parsed, channel, ...(torn > 0 ? { torn } : {}) });
             break;
           } catch {
@@ -735,7 +811,7 @@ export class ReplManager {
       code: oneLine(exec.code, HISTORY_CODE_CHARS),
       ...(exec.frame?.definitions?.length ? { definitions: exec.frame.definitions.slice(0, 20) } : {}),
     };
-    const path = join(HISTORY_DIR, `${historyFileName(exec.channelName)}.jsonl`);
+    const path = join(HISTORY_DIR, `${channelFileStem(exec.channelName)}.jsonl`);
     try {
       ensureDirs();
       sealHistoryTail(path);
@@ -835,10 +911,6 @@ export function resolveTimeout(timeout: number | undefined): number {
     throw new Error(`invalid timeout: use a finite number of seconds between 0 and ${MAX_TIMEOUT_SEC}`);
   }
   return timeout;
-}
-
-function historyFileName(channel: string): string {
-  return channel.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40) || "channel";
 }
 
 function intEnv(name: string, fallback: number): number {

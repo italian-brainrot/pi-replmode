@@ -13,6 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { MAX_OUTPUT_CHARS } from "../src/format.ts";
 import { isPidAlive, type LoadedExtension, loadExtension, text, waitFor } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
@@ -152,6 +153,22 @@ sys.exit(1)
     );
   });
 
+  it("R2-06: keeps a very chatty broken interpreter inside the output limit", async () => {
+    // The explanation is worth showing, and the daemon's `loose` buffer holds up to 64 KB of it. Forward
+    // all of that into a tool result and the one promise the limit makes is broken by a failed start.
+    const script = `import sys
+sys.stderr.write("FLOOD " * 40000)
+sys.stderr.write("\\nImportError: the environment is broken at the end\\n")
+sys.exit(1)
+`;
+    const result = await withStub("loud-crash", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-loud" }));
+    expect(result.isError).toBe(true);
+    const shown = text(result);
+    expect(shown.length, `a failed start returned ${shown.length} characters`).toBeLessThan(MAX_OUTPUT_CHARS);
+    expect(shown, "the reason at the end of a long startup failure was cut away").toContain("the environment is broken at the end");
+    expect(shown, "the result does not say where the rest of it is").toContain("the daemon's full output is in");
+  });
+
   it("leaves nothing running when the ready timeout fires on an environment that is fine", async () => {
     // A one-millisecond ready timeout can only ever lose the race with a real interpreter; what matters
     // is that the attempt is reaped and the next call starts clean.
@@ -232,5 +249,39 @@ os._exit(9)
     const next = await ext.callTool("run", { code: "print(durable)", channel: "l-dfl" });
     expect(text(next)).toContain("[new channel");
     expect(next.isError).toBe(true);
+  });
+});
+
+describe("an interrupt that takes the daemon with it", () => {
+  it("R2-08: says an interrupt was in flight when the interrupt is what took the daemon down", async () => {
+    // The status is `dead` — death outranks everything, and that is R1-06. What a model needs on top is
+    // that the channel died *while being interrupted*: otherwise it reads a stopped task as a crashed
+    // one and goes looking for a bug that is not there. Pass 1 set a status for this case that pass 2
+    // found was unreachable, so the fact was silently gone (R2-08).
+    const script = `import os, signal, sys, time
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-intdeath")}\n`)})
+sys.stdout.flush()
+signal.signal(signal.SIGINT, lambda *_a: os._exit(7))
+sys.stdin.readline()
+time.sleep(60)
+`;
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 1200);
+    const result = await withStub("interrupt-takes-the-daemon", script, {}, () =>
+      ext.callTool(
+        "run",
+        { code: "import time\nwhile True:\n    time.sleep(0.1)", channel: "l-intdeath", timeout: 30 },
+        { signal: controller.signal },
+      ),
+    );
+
+    expect(result.details.status, "an interrupt is not a licence to report the call as interrupted").toBe("dead");
+    const shown = text(result);
+    expect(shown).toContain("exit code 7");
+    expect(shown, `the result hides that the cell was being interrupted: ${shown.slice(0, 400)}`).toMatch(/interrupt/);
+
+    const after = await ext.callTool("run", { code: "print('fresh channel after the interrupt')", channel: "l-intdeath" });
+    expect(text(after)).toContain("fresh channel after the interrupt");
   });
 });

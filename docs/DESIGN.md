@@ -55,7 +55,9 @@ pi process (Node 22)                                   one Python process per ch
   `SIG_IGN` or its own handler cannot disarm the channel for every later cell.
 - Idle daemons are cheap (≈43 MB RSS, 60 ms to import IPython), but they are not free: cap the
   number of live channels (default 4, env override), LRU-shutdown the idlest when at the cap, and
-  shut all of them down at `session_shutdown`.
+  shut all of them down at `session_shutdown`. A channel whose daemon is still starting occupies a slot
+  too — `run` is registered parallel and the prompt recommends separate channels for independent work,
+  so counting only daemons that have already answered would let one tick of five calls start five.
 
 ## Wire protocol
 
@@ -95,9 +97,23 @@ Exec boundaries in the capture pipe are marked with a sentinel
 positive needs a program to write that exact byte sequence to a text stream; the splitter hands the
 marker bytes to the boundary callback, and a marker whose id is not one of the channel's execs goes
 back into the byte stream as data — it neither opens nor closes a block, and the cell's output carries
-on where it left off. Bytes that arrive while no block is open belong to whatever the previous cell
-left running: they go to *that* exec's log under a header saying so, capped at 256 KB per exec; output
-from before the first cell ever ran is attached to the first block, capped at 64 KB.
+on where it left off.
+
+**What attribution guarantees, precisely** (audit pass 2, R2-07 — every channel's processes share one
+capture stream, so this is the honest boundary, not an implementation detail):
+
+- bytes that arrive **while no block is open** go to the log of the exec whose block closed last, under
+  a header that says whose log it is ("arrived after this cell ended: from something the channel left
+  running, not from a cell"), capped at 256 KB per exec;
+- output from before the first cell ever ran is attached to the first block, capped at 64 KB;
+- seeing such out-of-band bytes flags the channel, and every later result from it says the channel has
+  produced output no cell asked for, so some of its lines may not be from this cell;
+- bytes that arrive **while a block is open** are *not* attributable — at the descriptor level they are
+  indistinguishable from the running cell's own output, and nothing claims otherwise.
+
+A per-exec capture pipe would make the last case exact, and was rejected: the host cannot read a
+pipe the daemon made, and a daemon-side pump stalls (a cell that blocks in C stops the loop, the
+64 KB pipe fills, the cell blocks on write). See [AUDIT.md](AUDIT.md) "Pass 2 fixes".
 
 Sync `pi.*` calls from the cell write a `call` frame and then **pump stdin directly** (select +
 read frames) until their own `call_reply` arrives. Only one cell runs per channel at a time, so the
@@ -120,7 +136,11 @@ run(code, timeout = 60, channel = "main")
   `<agent-dir>/replmode/exec/<exec-id>.log`, **and** asks the daemon to bind the full text to a
   nonce global (`_out_7f3a2b`) so the next cell can slice it.
 - Error result: cell raised → `isError: true`, the traceback (IPython `colors="NoColor"`) goes in
-  `content`, partial output stays visible before it.
+  `content`, partial output stays visible before it. The 50 000-character limit covers the **whole
+  answer**: the traceback arrives in the frame, not the capture, so it is given whatever the capture did
+  not need (never less than a quarter of the limit) rather than riding on top of it, and when it is
+  shortened the whole thing is appended to the exec log and the same log-plus-global escape hatch
+  applies. The exception's own `evalue` is clipped to one line, because the traceback already carries it.
 - `timeout` expiry does **not** kill anything: the host detaches, returns
   `moved to background with ID: repl-<id>` plus the log path and the last ~4 KB, and keeps draining
   the capture pipe into that log. The `exec_end` frame arrives later and completes the task record.
@@ -138,11 +158,18 @@ run(code, timeout = 60, channel = "main")
   answers `shutdown` and goes promptly; its cells' children do not, and a dev server or training loop
   still running after "the channel was taken down" is a bug, not a loophole. This covers `kill: true`,
   the LRU eviction at the channel cap, a daemon that never became ready, and `session_shutdown` with
-  `reason: "quit"`.
+  `reason: "quit"`. One exception, stated wherever the promise is made: a child that left the process
+  group (`start_new_session=True`, `setsid`, a double fork) is outside `kill(-pid)`'s reach and survives
+  the channel. Closing the hole means walking a process tree, which is worse than the hole
+  (audit pass 2, R2-09; pinned by a test that asserts the escape).
 
 `details` carries the structured shape (`channel`, `exec_id`, `status`, `elapsed`, `truncated`,
 `log_path`, `images`, `definitions` added by the cell) so `renderCall`/`renderResult` and resumed
-sessions have something to work with; `outputSchema` + `structuredContent` mirror pi-bg-tasks.
+sessions have something to work with; `outputSchema` + `structuredContent` mirror pi-bg-tasks. pi does
+not validate `structuredContent` against `outputSchema`, so the schema has to be written against the
+answers the tool actually gives: `output`, `truncated` and `elapsed_seconds` are optional because a call
+that never reached a daemon — busy channel, empty code, invalid timeout, backgrounded start — genuinely
+has none, and every `status` in a result comes from the declared enum (R2-05).
 
 ## Rich display
 
@@ -185,15 +212,24 @@ a dead channel).
   re-adopts the live daemons and their pipes instead of orphaning them (pi's extension cache is
   cleared on reload, but `globalThis` survives — the mechanism pi-bg-tasks needs sidecar files for).
 - **Restart**: state is gone, by design. Write a per-channel history
-  (`<agent-dir>/replmode/history/<channel>.jsonl`: code, timestamp, status) so a fresh session can
+  (`<agent-dir>/replmode/history/<encoded-channel>.jsonl`: code, timestamp, status) so a fresh session can
   see what the lost channel held, and post a chat notification at `session_start` when history
-  exists for a channel that has no live daemon, per the spec.
+  exists for a channel that has no live daemon, per the spec. The channel name is used as three file
+  names — history, daemon log, IPython profile — so they all come from one function (`names.ts`): a name
+  that is already a file name keeps it, anything else gets a short digest of the real name appended, and
+  `a/b` and `a_b` no longer share a file (R2-04). The note is keyed by the *real* name the record
+  carries, never by the file stem, or a running channel gets announced as one that was lost.
 - Daemon death (user code segfaults, `os._exit`, OOM) → protocol EOF → mark channel dead, fail the
   in-flight call with what was captured, recreate on next use. EOF on the frame stream counts as death
   even if the process is still there: a daemon that closed its own protocol descriptor can never answer
   again, and the daemon now notices that itself (`send_frame` → `ProtocolGone`) and exits non-zero, so
   the host's death path reports the truth instead of timing out. An `exec_end` that arrived before the
   death does not make the call a success.
+- A channel that **never started** says why: the failure handed to `run` composes the exit reason, the
+  daemon's `fatal` frame and whatever the interpreter wrote to the capture stream before it died (read
+  before that buffer is emptied, and after the pipes have had a bounded moment to drain, since `exit` can
+  beat the last of stderr), cut to a few KB with a pointer to the daemon's log file (R2-06). A capacity
+  refusal is a separate case: it is not a start failure, and is reported as one of the cap.
 
 ## Prompt surface
 
@@ -290,10 +326,12 @@ a scripted fake would paper over.
    (SIGINT, escalation to a channel kill only when asked), channels with a per-channel mutex, the
    process cap, busy-channel errors, reload re-adoption, per-channel history and the restart
    notification.
-2b. **Hardening (audit pass 1)**: done. Every issue the first tester↔fixer pass found is fixed and
-   pinned by a test — interrupt delivery into waiting cells, signal-disposition hygiene, the frame loop
-   surviving anything, capture attribution under vandalism, group-kill on close, and the honest totals
-   in truncation notes. See [AUDIT.md](AUDIT.md) before changing any of it.
+2b. **Hardening (audit passes 1 and 2)**: done. Every issue the first two tester↔fixer passes found is
+   fixed and pinned by a test — interrupt delivery into waiting cells, signal-disposition hygiene, the
+   frame loop surviving anything, capture attribution under vandalism, group-kill on close, honest totals
+   in truncation notes, the tail of a windowed log, the channel cap under a parallel burst, channel-name
+   collisions, the output limit covering the traceback too, and what a failed channel start reports. See
+   [AUDIT.md](AUDIT.md) before changing any of it; a third pass is expected to attack these fixes.
 3. **M3 — round trips**: not started. The `display` frame is recognised and ignored, and the `call`
    pump is absent. What it needs: formatter selection with `include=(...)` per object (spike
    proves the call shape), `display` → image content in the `run` result, `pi.read_image`, sync
@@ -317,6 +355,13 @@ Settled with the user; implement these, do not re-open them.
 3. **Bare Python.** No `pi.sh` / `pi.read` / `pi.write`; the model writes its own functions.
 4. **`pi.ask` is sync** (returns `str`, implemented with the stdin pump, still interruptible) and
    always offers a manual answer choice.
+5. **Capture attribution stops at what the two pipes can see** (pass 2, R2-07). No per-exec capture
+   pipes: a daemon-side pump deadlocks against a cell that blocks in C, and the host cannot read a pipe
+   the daemon created. Between blocks attribute, flag the channel, say so in the result; during a block,
+   nothing is claimed. Reopen only with a cheap signal, never with a pump.
+6. **One encoder for every file name a channel name becomes** (`names.ts`). Not a constrained name
+   language — the model may name a channel `notes/live` — and not naive sanitisation, which collides.
+   A digest suffix appears only for names that are not already file names.
 
 ## Where the next session starts
 
