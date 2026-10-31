@@ -265,3 +265,87 @@ history file and asserts the lost-channel note still says something useful.
 - **Real `pi` smoke** (`/tmp/pi-smoke-agent`, `pi --no-builtin-tools -p …`): registration, the prompt
   section, two parallel `run` calls serialized on one channel, and cross-call state all work; the
   model reported 42.
+
+---
+
+## Pass 1 fixes — 2026-10-31
+
+The fixer's turn. R1-01 … R1-13 are all addressed; the tests that demonstrated them pass **unchanged**
+— none was weakened, skipped, or deleted, and none of the pre-existing tests changed either.
+
+Gate after the fixes: `tsc`, `biome`, **95 vitest**, **42 pytest**, green (was 87 / 35 with 11 of them
+red). Three pytest runs and two vitest runs back to back were checked for flakiness.
+
+What each fix is, in one line each, followed by what pass 2 should try to break:
+
+| id | fix | where |
+| --- | --- | --- |
+| R1-01 | the cell runs as a task the `Runner` holds; the loop hands the SIGINT it caught to that task | `Runner.cell_task`, `Runner.interrupt_cell` |
+| R1-02 | the SIGINT *disposition* is normalized at `_begin`, like the mask already was | `Runner._restore_interrupt_handler` |
+| R1-03 | every frame is dispatched inside `try/except BaseException`; a dead `serve` task sends `fatal` and exits 1 | `serve`, `main` |
+| R1-04 | `BaseException` around frame decoding, and `loop.set_exception_handler` → the daemon log | `Inbox._read`, `main` |
+| R1-05 | the daemon writes sentinels to its **own** dup of the capture pipe and repairs fd 1/2 per exec | `Runner.capture_fd`, `_capture`, `_restore_capture` |
+| R1-06 | a death outranks the frame: `finalize` and `Channel.wait` report `dead`, the result says so | `Exec.finalize`, `Channel.wait`, `finishedResult` |
+| R1-07 | a marker for an unknown exec is put back into the byte stream instead of closing a block | `CaptureSplitter.onBoundary(id, marker)`, `Channel.onBoundary` |
+| R1-08 | bytes that arrive after a block closed go to *that* exec's log, announced and capped (256 KB) | `Exec.lateWrite`, `Channel.writeToSink` |
+| R1-09 | truncation notes quote the file's real totals, from `countOutput` | `truncateMiddle(..., totals)`, `finishedResult` |
+| R1-10 | closing a channel always takes the process group down (SIGTERM, then SIGKILL) | `Channel.close`, `killGroup` |
+| R1-11 | `PI_REPLMODE_READY_TIMEOUT_MS` (capped at 600 s) makes the path testable | `readyTimeout()` |
+| R1-12 | `PI_REPLMODE_REQUIREMENTS` selects the pin file; `envDirFor` is exported | `requirementsFile()`, `envDirFor()` |
+| R1-13 | the newest *parseable* history record is used, the file is sealed before appending, `rotateHistory` exported | `lastHistoryByChannel`, `sealHistoryTail`, `rotateHistory` |
+
+Hardening the audit did not ask for, because the fixes exposed it:
+
+- **A daemon that cannot talk exits.** `send_frame` turns a failed protocol write into `ProtocolGone`,
+  which ends the process with a non-zero status. Before, a cell that closed the daemon's own
+  descriptors (`os.close(3)` — the saved protocol fd — or `os.closerange(3, 4096)`) left a process that
+  was alive, held the channel, and could never answer again: exactly the R1-03 shape, reached a
+  different way. Pinned by `test_a_cell_that_closes_the_daemons_own_descriptors_ends_the_channel_cleanly`.
+- **The host treats EOF on the protocol pipe as the channel being over** (`Channel.attach`), so even a
+  daemon that stays alive but mute cannot leave a channel busy forever. Pinned in
+  `test/lifecycle.test.ts` with a stub that closes its own stdout and sleeps.
+- **Each cell starts with a working capture stream.** `_begin` puts fd 1 and fd 2 back on the capture
+  pipe and rebuilds `sys.stdout`/`sys.stderr` if a cell closed the *objects* rather than the
+  descriptors; `_end` flushes into wherever the cell pointed them, then repairs, then writes the
+  closing marker so the block always closes. A redirect or a close is now contained to the cell that
+  did it. Covered by the two new pytest cases in that area.
+- **`Exec.deathNote` is set on every exec in a dead channel**, not only the in-flight one, so a result
+  built after the death cannot read the frame alone and call it a success.
+
+Deliberate choices pass 2 should know about, rather than rediscover:
+
+- **`asyncio.Task.throw` does not exist.** The audit's suggested shape is not implementable; the
+  interrupt is injected into the future the cell task is parked on (`_fut_waiter`, one private
+  attribute, descended through while it is itself a Task). If that future will not take the exception,
+  the *second* interrupt cancels the task, and the cell then legitimately sees `CancelledError`: the
+  frame reports `status: "interrupted"` with the real `ename`, and the daemon log says it was delivered
+  as a cancellation. Do not "fix" that into pretending it was a `KeyboardInterrupt`.
+- **A cell that changes the SIGINT disposition is not interruptible in its own cell.** It asked for
+  that. Only later cells are protected, which is what R1-02 asked for.
+- **`statusOf` still reports a finished task's own status after its channel is closed later** (an LRU
+  eviction should not rewrite history as `dead`). The disclosure for a death that happened *during* a
+  call lives in the call result instead.
+- **Late capture is attributed, not hidden**: it goes to the log of the exec that produced it, with a
+  header line, capped at 256 KB per exec with a "dropped" note. Startup noise (before any block has
+  ever opened) is still attached to the first block, capped at 64 KB.
+
+New tests written to try to defeat the fixes, all passing:
+
+- pytest: an interrupt the cell absorbs and goes back to sleep (escalation), an interrupt on
+  `asyncio.to_thread`, a custom SIGINT handler (not only `SIG_IGN`), `sys.stdout.close()` instead of
+  `os.close(2)`, a redirect that must not follow the next cell around, a SIGINT left pending across the
+  exec boundary, a cell that closes the daemon's own descriptors.
+- vitest `test/lifecycle.test.ts` (new file, stub interpreters on the real pipes): never-ready daemon
+  (R1-11) including its child process, `exec_end` then death without a closing sentinel (R1-06),
+  protocol-stream EOF.
+- vitest: the quit path's group kill (R1-10), an orphaned flood attributed and capped (R1-08), two pin
+  files → two environment directories (R1-12), a torn history record (R1-13).
+
+Docs updated with what changed: the sentinel false-positive sentence and the group-kill promise in
+`DESIGN.md`, the interrupt design and the new env vars, plus `DEV.md`'s layout and "things that bite".
+
+**Real-`pi` smoke after the fixes** (throwaway agent dir, `pi --no-builtin-tools -p …`, thinking left on
+for `qwen38-flash-next` per `AGENTS.md`): three calls, state across them, reported 42 — and after pi
+exited, neither the channel daemon nor the `subprocess.Popen(['bash','-c','sleep 45'])` the model had
+spawned was left running, which is the R1-10 promise end to end. Pass 2 should re-run it if it touches
+the daemon's startup, the capture path, or teardown.

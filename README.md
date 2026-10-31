@@ -66,7 +66,13 @@ room, and its variables go with it.
 
 A cell that passes its `timeout` keeps running: you get a task ID and a log path, and the channel is
 busy until it finishes. Aborting the call (Esc) sends one SIGINT — the cell ends as interrupted and
-the channel keeps everything. Only `bg_stop { kill: true }` destroys a channel.
+the channel keeps everything. Only `bg_stop { kill: true }` destroys a channel, and it takes down the
+process group with it: a dev server, a build or a training loop the cell started goes with the channel
+rather than being left behind holding a port.
+
+A cell that stops a signal, or sits in something CPython cannot interrupt (`os.system`, a C extension
+holding the GIL), will not stop for SIGINT. `bg_stop` says so rather than killing anything; `kill: true`
+is then the only way out, and it costs the channel's variables.
 
 ### Output over 50 000 characters
 
@@ -89,8 +95,11 @@ The first `run` creates a Python environment; you do not have to set anything up
 | variable | meaning |
 | --- | --- |
 | `PI_REPLMODE_ENV_DIR` | put the environment somewhere else |
+| `PI_REPLMODE_REQUIREMENTS` | build it from a different pin file (gets its own environment directory) |
 | `PI_REPLMODE_PYTHON` | which interpreter to build it from |
 | `PI_REPLMODE_MAX_CHANNELS` | live channels per pi process (default 4) |
+| `PI_REPLMODE_KEEP_RUNNING` | `0` shuts the channels down on every session boundary, not only on quit |
+| `PI_REPLMODE_READY_TIMEOUT_MS` | how long a daemon may take to report ready (default 120 000) |
 
 ## Logs
 

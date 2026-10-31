@@ -1,9 +1,11 @@
 # pi-replmode — design
 
-Status: **plan agreed, implementation not started**. `AGENTS.md` is the spec written by the user;
-this file is the implementation plan derived from it, plus the parts the spec leaves open. The
-decisions the spec left open are settled in [Decisions](#decisions-the-spec-left-open) — do not
-re-litigate them, and keep the two in sync if either changes.
+Status: **M1 and M2 built; M3 (rich display and the `call` round trip) not started.** `AGENTS.md` is
+the spec written by the user; this file is the implementation plan derived from it, plus the parts the
+spec leaves open. The decisions the spec left open are settled in
+[Decisions](#decisions-the-spec-left-open) — do not re-litigate them, and keep the two in sync if
+either changes. [AUDIT.md](AUDIT.md) records the tester↔fixer passes over the built parts and what each
+one changed; several paragraphs below exist because an audit found the code and this file disagreeing.
 
 ## What it is
 
@@ -40,8 +42,17 @@ pi process (Node 22)                                   one Python process per ch
 - **One daemon process per channel.** `channel` is an isolated REPL instance; the model picks the
   name, we create it on first use. Separate processes give real isolation, per-channel interrupt,
   and per-channel kill — a segfault in one channel cannot take the others down.
-- **Single-threaded daemon**, IPython on the main thread inside a raw asyncio loop. This is what
-  makes SIGINT-based interrupt work (see "Validated facts").
+- **Single-threaded daemon**, IPython on the main thread inside a raw asyncio loop, never
+  `asyncio.run()`. This is what makes SIGINT-based interrupt work (see "Validated facts"), and it has
+  two halves: a cell that is *running bytecode* takes the `KeyboardInterrupt` CPython raises there, and
+  a cell that is *parked on an `await`* has to be handed the interrupt by the daemon, because the signal
+  is raised in the thread driving the loop and would otherwise be caught and dropped there. Each cell
+  runs as a task the `Runner` holds; `Runner.interrupt_cell` puts a `KeyboardInterrupt` on the future
+  that task is waiting for — which raises it inside the cell, where IPython reports it properly — and
+  escalates to cancelling the task when that is not possible. A second interrupt always gets through.
+  At every exec boundary the signal **mask** is unblocked rather than restored to what it was, and the
+  SIGINT **disposition** is put back to what the daemon started with, so one cell that installs
+  `SIG_IGN` or its own handler cannot disarm the channel for every later cell.
 - Idle daemons are cheap (≈43 MB RSS, 60 ms to import IPython), but they are not free: cap the
   number of live channels (default 4, env override), LRU-shutdown the idlest when at the cap, and
   shut all of them down at `session_shutdown`.
@@ -49,10 +60,12 @@ pi process (Node 22)                                   one Python process per ch
 ## Wire protocol
 
 Line-delimited JSON on stdin/stdout. stderr is *not* protocol: the daemon's first act is
-`proto = dup(1); dup2(2, 1); dup2(2, 2)`, so protocol frames go only to the saved fd and every
-byte the user's code writes to fd 1 or 2 — Python `print`, IPython's `Out[n]:`, subprocesses, C
-libraries — lands in the capture pipe. The daemon's own diagnostics go to a log file, never to
-those fds. `PYTHONUNBUFFERED=1`.
+`proto = dup(1); dup2(2, 1); dup2(2, 2); capture = dup(2)`, so protocol frames go only to the saved fd
+and every byte the user's code writes to fd 1 or 2 — Python `print`, IPython's `Out[n]:`, subprocesses,
+C libraries — lands in the capture pipe. `capture` is the daemon's own reference to that pipe: fd 1 and
+fd 2 belong to the cell, which can close or redirect them, and the daemon neither loses its boundary
+markers nor lets one cell's vandalism blind the channel. The daemon's own diagnostics go to a log file
+and to `log` frames, never to those fds. `PYTHONUNBUFFERED=1`.
 
 Host → daemon:
 
@@ -79,8 +92,12 @@ Daemon → host:
 Exec boundaries in the capture pipe are marked with a sentinel
 (`b"\x00\x1ePIRB\x1e<exec-id>\n"`), so the host knows where one cell's output ends, where a
 `display` frame's text split goes, and can strip the sentinels when writing log files. A false
-positive would need a program to write that exact byte sequence to a text stream; the cost is a
-cosmetic block split.
+positive needs a program to write that exact byte sequence to a text stream; the splitter hands the
+marker bytes to the boundary callback, and a marker whose id is not one of the channel's execs goes
+back into the byte stream as data — it neither opens nor closes a block, and the cell's output carries
+on where it left off. Bytes that arrive while no block is open belong to whatever the previous cell
+left running: they go to *that* exec's log under a header saying so, capped at 256 KB per exec; output
+from before the first cell ever ran is attached to the first block, capped at 64 KB.
 
 Sync `pi.*` calls from the cell write a `call` frame and then **pump stdin directly** (select +
 read frames) until their own `call_reply` arrives. Only one cell runs per channel at a time, so the
@@ -117,6 +134,11 @@ run(code, timeout = 60, channel = "main")
   a documented `bg_stop` escalation), which loses that channel's variables. We do not kill silently.
 - Escape/abort during a foreground call → send `interrupt` first (the cell dies, state survives),
   and only escalate if the daemon ignores it.
+- **Closing a channel always takes the process group down** (`SIGTERM`, then `SIGKILL`). The daemon
+  answers `shutdown` and goes promptly; its cells' children do not, and a dev server or training loop
+  still running after "the channel was taken down" is a bug, not a loophole. This covers `kill: true`,
+  the LRU eviction at the channel cap, a daemon that never became ready, and `session_shutdown` with
+  `reason: "quit"`.
 
 `details` carries the structured shape (`channel`, `exec_id`, `status`, `elapsed`, `truncated`,
 `log_path`, `images`, `definitions` added by the cell) so `renderCall`/`renderResult` and resumed
@@ -167,7 +189,11 @@ a dead channel).
   see what the lost channel held, and post a chat notification at `session_start` when history
   exists for a channel that has no live daemon, per the spec.
 - Daemon death (user code segfaults, `os._exit`, OOM) → protocol EOF → mark channel dead, fail the
-  in-flight call with what was captured, recreate on next use.
+  in-flight call with what was captured, recreate on next use. EOF on the frame stream counts as death
+  even if the process is still there: a daemon that closed its own protocol descriptor can never answer
+  again, and the daemon now notices that itself (`send_frame` → `ProtocolGone`) and exits non-zero, so
+  the host's death path reports the truth instead of timing out. An `exec_end` that arrived before the
+  death does not make the call a success.
 
 ## Prompt surface
 
@@ -208,6 +234,10 @@ a scripted fake would paper over.
   there, so tests keep covering the real path) and then runs real daemons: capture attribution,
   truncation and the nonce global, busy channels, `bg_wait`/`bg_stop`, daemon death and
   recreation, reload re-adoption, the channel cap, the environment build, the prompt surface.
+- **Stub interpreters** (`test/lifecycle.test.ts`) cover the paths a real daemon never takes: never
+  becoming ready, answering a cell and then dying, closing its own protocol stream. Point
+  `PI_REPLMODE_ENV_DIR` at a directory whose `bin/python` is a script and the host talks to it over
+  real pipes with no change to `src/`. It is a fake *peer*, never a fake *host*.
 - **`npm run dev`** watches `src/`, `test/` and `python/` and re-runs the suite the change belongs
   to; `npm run dev -- --all` is the whole gate (typecheck, biome, vitest, pytest) and is what CI
   runs (`.github/workflows/ci.yml`).
@@ -226,6 +256,17 @@ a scripted fake would paper over.
   `new_event_loop()`/`run_until_complete` leaves CPython's default handler in place, SIGINT raises
   `KeyboardInterrupt` inside the executing cell, IPython reports it, and the shell recovers for the
   next cell. This is the whole interrupt design.
+- **`asyncio.Task` has no `throw()`.** An interrupt for a cell parked on an `await` has to be put on
+  the future the task is waiting for: `await coro` yields its leaf future up to the task, so
+  `task._fut_waiter` is usually exactly the object the cell is sleeping on, and
+  `set_exception(KeyboardInterrupt())` raises inside the cell where IPython formats it properly
+  (verified for `sleep`, `to_thread`, `gather`, `Event.wait`, `Queue.get`, and
+  `create_subprocess_exec(...).wait()`). `task.cancel()` is the fallback, and then the cell genuinely
+  sees `CancelledError` — reported as interrupted, logged as such, not dressed up.
+- **A cell can wreck the daemon's own file descriptors** (`os.close(3)` is the saved protocol fd;
+  `os.closerange(3, 4096)` takes everything). Holding a private `dup` of the capture pipe is what keeps
+  the *capture* honest; nothing can keep the *protocol* honest, so the daemon notices the write failing
+  and exits rather than sitting on a channel that can never answer again.
 - fd-level capture works and catches subprocess output; IPython's own `Out[n]:` and tracebacks flow
   through it in the right order. `colors="NoColor"` removes ANSI from tracebacks.
 - `display_formatter.format(obj, include=(...))` returns `(data, meta)` with `image/png` base64 for
@@ -249,6 +290,10 @@ a scripted fake would paper over.
    (SIGINT, escalation to a channel kill only when asked), channels with a per-channel mutex, the
    process cap, busy-channel errors, reload re-adoption, per-channel history and the restart
    notification.
+2b. **Hardening (audit pass 1)**: done. Every issue the first tester↔fixer pass found is fixed and
+   pinned by a test — interrupt delivery into waiting cells, signal-disposition hygiene, the frame loop
+   surviving anything, capture attribution under vandalism, group-kill on close, and the honest totals
+   in truncation notes. See [AUDIT.md](AUDIT.md) before changing any of it.
 3. **M3 — round trips**: not started. The `display` frame is recognised and ignored, and the `call`
    pump is absent. What it needs: formatter selection with `include=(...)` per object (spike
    proves the call shape), `display` → image content in the `run` result, `pi.read_image`, sync
@@ -277,8 +322,11 @@ Settled with the user; implement these, do not re-open them.
 
 M3, in the order above: `read_image` and the display pipeline first, then the `call` pump for
 `pi.ask` and `pi.run_subagent`. The parts everything else stands on — daemon, protocol, capture,
-interrupt semantics — are built and covered by real-process tests, so the risk in M3 is concentrated
-in the display formatters and in a synchronous round trip that stays interruptible.
+interrupt semantics — are built, audited once, and covered by real-process tests, so the risk in M3 is
+concentrated in the display formatters and in a synchronous round trip that stays interruptible. Note
+for the `call` pump: it pumps stdin inside a cell, which is exactly where the interrupt design gets
+tested again — the pump must stay interruptible the same way `Runner.interrupt_cell` does, and
+`Inbox` was built on the loop's reader precisely so its buffer can be drained synchronously.
 
 `README.md`, `AGENTS.md` and this file are the three things to keep honest; `docs/DEV.md` carries the
 operational detail. The spikes in `spikes/` are worth re-running before touching formatters: they
