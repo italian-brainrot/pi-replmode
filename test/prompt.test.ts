@@ -13,7 +13,7 @@
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LoadedExtension, loadExtension } from "./helpers/extension.ts";
+import { type LoadedExtension, loadExtension, repoRoot, text as text2 } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
 
@@ -215,5 +215,46 @@ describe("lost channels", () => {
         .split("\n")
         .every((line) => line.startsWith("{")),
     ).toBe(true);
+  });
+});
+
+describe("the rule a channel name has to obey", () => {
+  it("R4-07: tells the model the rule where it picks the name, not only when it breaks it", () => {
+    // F3-02 added a refusal for names over 200 characters. It is a fair refusal, but the only place the
+    // rule exists is the error message and a comment: the `channel` parameter description — what the
+    // model is choosing against — says nothing about length, and neither does the section. A rule that
+    // only exists when it fails is a rule the model trips over once per session.
+    const parameters = ext.tools.get("run")!.parameters as { properties: { channel?: { description?: string } } };
+    const description = parameters.properties?.channel?.description ?? "";
+    expect(description, "the channel parameter says nothing about the name rules").toContain("channel");
+    expect(description, "the channel parameter does not mention the length limit that makes a call fail").toMatch(/200|length|characters/);
+  });
+
+  it("R4-07: and states the boundary the refusal actually enforces", async () => {
+    // The code accepts exactly 200 and refuses 201; the message says "Keep it under 200". The shape of
+    // the sentence is free, but it must not forbid the length the tool accepts, and it has to name the
+    // number that is really in force.
+    const accepted = await ext.callTool("run", { code: "print('a name of exactly the limit')", channel: `n${"y".repeat(199)}` });
+    expect(accepted.isError, `a 200-character channel name was refused: ${text2(accepted)}`).toBeUndefined();
+
+    const refused = await ext.callTool("run", { code: "print(1)", channel: "n".repeat(201) });
+    expect(refused.isError).toBe(true);
+    const shown = text2(refused);
+    expect(shown, "the refusal does not say which limit it is enforcing").toMatch(/200/);
+    expect(shown, `the refusal forbids a length the tool accepts: ${shown}`).not.toMatch(/under 200/);
+  });
+});
+
+describe("what the README promises about the output limit", () => {
+  it("R4-08: does not claim the whole answer fits inside the limit", () => {
+    // The suite has always allowed a `run` answer to ride a few thousand characters over 50 000, because
+    // the banner, the truncation notes and the death notes are extra text around the cut (the `+5_000`
+    // slack in limits.test.ts encodes that). The pass-3 bounding of those notes made them closer to true
+    // and still not true — they are ~3 KB now — while the README says the limit "covers the whole answer,
+    // the traceback included". Either make the answer actually fit, or say what the limit covers.
+    const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
+    expect(readme, "the README promises an answer no bigger than the limit, which no test holds").not.toMatch(
+      /limit covers the whole answer/i,
+    );
   });
 });

@@ -86,6 +86,60 @@ describe("the channel cap", () => {
     const kept = await ext.callTool("run", { code: "print('now there is room')", channel: "k-new", timeout: 10 });
     expect(text(kept)).toContain("now there is room");
   });
+  it("R2-03: and five parallel calls on the same new name start exactly one daemon", async () => {
+    // The cap counts names, and `getChannel` dedupes an in-flight creation by name. Both halves matter:
+    // without the dedupe the burst below would start five interpreters for one channel and the cap would
+    // refuse four of them; without the cap counting `starting`, a burst on five *different* names walks
+    // past it (the other test). The calls then queue on the channel's lock, which is the documented
+    // behaviour for one channel.
+    const saved = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "2";
+    try {
+      const started = await Promise.all(
+        [1, 2, 3, 4, 5].map((n) => ext.callTool("run", { code: `print(${n})`, channel: "k-same", timeout: 30 })),
+      );
+      const pids = started.map((result) => result.details.pid).filter((pid) => pid !== undefined) as number[];
+      expect(pids, "a call did not get a channel").toHaveLength(5);
+      expect(new Set(pids).size, `five calls on one channel name started ${new Set(pids).size} interpreters`).toBe(1);
+      for (const result of started) expect(result.isError, "a call on a shared channel was refused").toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = saved;
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+    }
+  });
+
+  it("R4-05: does not blame the cap on an env var whose value it threw away", async () => {
+    // `intEnv` falls back to the default for a value it cannot use, which is reasonable — but the only
+    // place the cap is ever *reported* is the refusal, and the refusal says "the cap (4, set with
+    // PI_REPLMODE_MAX_CHANNELS)". With `PI_REPLMODE_MAX_CHANNELS=0` the model and the user are told a
+    // number the variable did not ask for, and a reasonable way to turn the feature off reads like a
+    // working setting. Either honour it, or say that the configured value was not usable.
+    const saved = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "0";
+    try {
+      const busy = await Promise.all(
+        [1, 2, 3, 4].map((n) =>
+          ext.callTool("run", { code: `import time\ntime.sleep(4) # k-zero${n}`, channel: `k-zero${n}`, timeout: 0 }),
+        ),
+      );
+      for (const started of busy) expect(started.details.status, "a channel was refused before the cap was reached").toBe("running");
+
+      const refused = await ext.callTool("run", { code: "print('need a channel')", channel: "k-zero5", timeout: 10 });
+      expect(refused.isError, "a fifth channel was given with the cap set to 0").toBe(true);
+      const shown = text(refused);
+      expect(shown, `the refusal does not name the cap it applied: ${shown}`).toContain("PI_REPLMODE_MAX_CHANNELS");
+      expect(shown, `the refusal attributes a cap of 4 to PI_REPLMODE_MAX_CHANNELS=0: ${shown}`).toMatch(
+        /default|ignored|not a valid|cannot be used|usable/,
+      );
+
+      await ext.callTool("bg_wait", { timeout: 30 });
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = saved;
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+    }
+  });
 });
 
 describe("retention at session_start", () => {

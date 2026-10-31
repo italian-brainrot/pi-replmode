@@ -100,6 +100,86 @@ describe("killing a channel", () => {
     expect(text(after)).toContain("[new channel");
   });
 
+  it("R4-04: a stop for a task whose channel died after it finished still says the channel went", async () => {
+    // The branch R3-05 never looked at: `bgStop` returns early for a task that had already settled,
+    // before `stoppedResult` and before anything reads a death note. A background cell that finished and
+    // then took the channel down with it (a segfault in the epilogue, a daemon killed on the way out, a
+    // cell that closed the descriptors the daemon needs) is reported as an ordinary finished task, and
+    // the model — told nothing about the channel — reaches for variables that went with it. The status
+    // here is right; only the sentence about the channel is missing.
+    const task = await run("kept = 'kept'\nprint('done')", { channel: "r-stopgone", timeout: 0 });
+    const finished = await bgWait(20);
+    expect(text(finished), "the background cell never finished, so this test is not testing what it means to").toContain(task.details.id);
+
+    process.kill(task.details.pid!, "SIGKILL");
+    await waitFor(() => !isPidAlive(task.details.pid!), 10_000, "the channel to go away behind its finished task");
+
+    const stopped = await bgStop(task.details.id);
+    const shown = text(stopped);
+    expect(stopped.details.status, "a task whose channel died is reported as a live one").not.toBe("running");
+    expect(shown, `a stop for a task whose channel is gone says nothing about the channel: ${shown}`).toMatch(
+      /channel[^\n]*(gone|ended|died|dead)/,
+    );
+    expect(shown, `the stop does not mention the variables that went with the channel: ${shown}`).toMatch(/variables/);
+
+    const after = await run("print(kept)", { channel: "r-stopgone" });
+    expect(text(after), "the variables the model was left believing in are still there, so the note is noise").toContain("[new channel");
+  });
+
+  it("R3-05: and a kill for a task whose channel is already gone says so without contradicting itself", async () => {
+    // The escalation branch, probed at the edge R3-05's fix sits next to: the channel died on its own
+    // first, and the model asks for `kill: true` afterwards. The answer must not pretend it took
+    // something down, and must not promise the variables survived.
+    const task = await run("import time\nprint('about to die')\ntime.sleep(30)", { channel: "r-killgone", timeout: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    process.kill(task.details.pid!, "SIGKILL");
+    await waitFor(() => !isPidAlive(task.details.pid!), 10_000, "the channel to die on its own");
+
+    const killed = await bgStop(task.details.id, { kill: true, reason: "the channel is already gone" });
+    const shown = text(killed);
+    expect(killed.details.status).toBe("dead");
+    expect(shown, `a kill for a channel that was already gone pretends it killed something: ${shown}`).toMatch(/already gone/);
+    expect(shown, `the kill answer promises variables that are gone: ${shown}`).toContain("variables are gone");
+  });
+
+  it("R4-09: a killed channel still leaves its cell findable, by id or by log", async () => {
+    // Closing a channel drops its tasks from the session registry, and `bg_stop {kill: true}`'s own
+    // answer is the only thing the model gets about what it just destroyed — which names no log path,
+    // unlike the plain stop right below it. So the cell's output disappears from the tool surface at the
+    // moment the model is most likely to want it: the kill it just asked for, of a cell that had been
+    // running for minutes. Either the answer names the log, or the listing still carries the task.
+    const task = await run("import time\nprint('something worth reading')\ntime.sleep(30)", { channel: "r-killtrace", timeout: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const killed = await bgStop(task.details.id, { kill: true, reason: "test" });
+    const shown = text(killed);
+    const listed = text(await bgWait(5));
+    const tasks = (await bgWait(5)).details?.tasks ?? [];
+
+    const findable =
+      shown.includes(task.details.logPath) ||
+      listed.includes(task.details.id) ||
+      tasks.some((entry: { id: string; logPath?: string }) => entry.id === task.details.id && entry.logPath);
+    expect(findable, `after killing channel "r-killtrace" nothing in the tool surface still points at the cell it ran: ${shown}`).toBe(
+      true,
+    );
+  });
+
+  it("R4-09: and a stop for a task the kill removed does not blame the retention window", async () => {
+    // The same deletion, from the other side: the task id the model is holding now resolves to nothing,
+    // and the error it gets says tasks "are pruned after 3 days" — a reason that is not what happened.
+    // The id was dropped minutes ago, by the kill the model itself asked for.
+    const task = await run("import time\ntime.sleep(30)", { channel: "r-killunknown", timeout: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await bgStop(task.details.id, { kill: true });
+
+    const again = await bgStop(task.details.id);
+    const shown = text(again);
+    expect(again.isError, `a stop for a task its channel's kill removed was not an error: ${shown}`).toBe(true);
+    expect(shown, `the answer blames a deletion the kill just made on the 3-day retention window: ${shown}`).not.toMatch(/pruned after/);
+    expect(shown, `the answer does not say what happened to the task: ${shown}`).toMatch(/channel|closed|kill|gone/);
+  });
+
   it("R1-10: takes the processes that its cell started down with it", async () => {
     // The escalation the model is offered when a task will not stop: `kill: true` says it ends
     // every cell in the channel. The daemon exits on the shutdown frame, so the group-kill

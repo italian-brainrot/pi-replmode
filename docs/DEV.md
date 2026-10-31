@@ -57,6 +57,10 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   stdout (stdout is the protocol) or stderr (stderr is the capture stream).
 - Talk to a daemon by hand with a scratch script: `npx tsx scratch.ts` (tsx is a devDependency).
   `src/index.ts` is importable, but usually you want `manager.ts`'s `ReplmodeManager` directly.
+  **Set `PI_CODING_AGENT_DIR` (and `PI_REPLMODE_ENV_DIR` etc.) in the environment, not at the top of the
+  script**: ESM imports are hoisted, so `paths.ts` has already resolved `getAgentDir()` by the time the
+  first line of your script runs, and a scratch script that means to use a temp dir will quietly write
+  channels into the real `~/.pi/agent/replmode/` instead. `PI_CODING_AGENT_DIR=/tmp/x npx tsx scratch.ts`.
 - Reproduce a protocol question in Python alone:
   `python -m replmode --channel debug --log /tmp/debug.log` inside the env from `npm run py:env`,
   then write frame JSON lines to its stdin.

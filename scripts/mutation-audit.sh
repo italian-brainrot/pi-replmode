@@ -191,5 +191,48 @@ run_mutation "F3-02 a channel name of any length is accepted" src/manager.ts '  
 ---MUTATE---
     if (false && channelName.length > MAX_CHANNEL_NAME_CHARS) {' "test/names.test.ts"
 
+# ── pass 4's re-pins of pass 3's fixes (the tests exist to make these die) ────
+
+run_mutation "R3-03 the digest is no longer the shape the digested-looking rule matches" src/names.ts '  return createHash("sha256").update(name).digest("hex").slice(0, DIGEST_CHARS);
+---MUTATE---
+  return createHash("sha256").update(name).digest("hex").toUpperCase().slice(0, DIGEST_CHARS);' "test/names.test.ts"
+
+run_mutation "R3-10 capture between two cells is parked in the later cell's log as startup output" src/channel.ts '    if (this.lastClosed) {
+      this.outOfBandOutput = true;
+      this.lastClosed.lateWrite(chunk);
+      return;
+    }
+---MUTATE---
+    if (false && this.lastClosed) {
+      this.outOfBandOutput = true;
+      this.lastClosed.lateWrite(chunk);
+      return;
+    }' "test/lifecycle.test.ts"
+
+run_mutation "R3-07 a second failed start truncates the file the first one pointed at" src/channel.ts '      appendFileSync(
+        this.daemonLogPath,
+        `\n[pi-replmode: output from the channel "${this.name}" process that failed to start (pid ${this.pid})]\n${parts.join("")}${capture}\n`,
+        "utf8",
+      );
+---MUTATE---
+      {
+        const fd = openSync(this.daemonLogPath, "w");
+        try {
+          writeSync(
+            fd,
+            Buffer.from(
+              `\n[pi-replmode: output from the channel "${this.name}" process that failed to start (pid ${this.pid})]\n${parts.join("")}${capture}\n`,
+              "utf8",
+            ),
+          );
+        } finally {
+          closeSync(fd);
+        }
+      }' "test/lifecycle.test.ts"
+
+run_mutation "R3-09 the line total comes from the cut rather than from the file" src/manager.ts '      const totalLines = Math.max(file.lines, cut.totalLines);
+---MUTATE---
+      const totalLines = cut.totalLines;' "test/limits.test.ts"
+
 echo "=================================================="
 git status --short

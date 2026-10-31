@@ -179,6 +179,72 @@ describe("text the daemon chooses", () => {
     );
     expect(readdirSync(dir), "the hand-written history file was rewritten by the way").toContain("h-hintq.jsonl");
   });
+
+  it("R4-01: and the section bounds the channel *name* it quotes from a history file", async () => {
+    // F3-04 clipped the remembered *definitions* on the read path, because a history file may have been
+    // written by a build that did not clip. The channel name is the other field of that same record, and
+    // it is bounded only on the write side (F3-02's refusal, added in the same pass): `lostChannelsLines`
+    // pastes `note.channel` raw. A file written before that refusal — or by anything else, which F3-04
+    // already assumes — still sizes the prompt of every later session and the session_start notification
+    // that lists the same names.
+    const measure = async () => {
+      const sections: Record<string, string> = {};
+      await ext.emit({ type: "session_start", sessionId: `r4-01-${Date.now()}-${Math.random()}` }, { hasUI: true });
+      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
+      return { section: sections.replmode ?? "", notes: ext.notified.map((note) => note.message).join("\n") };
+    };
+
+    const before = await measure();
+    const dir = join(ext.agentDir, "replmode", "history");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "h-longname.jsonl"),
+      `${JSON.stringify({
+        ts: new Date(Date.now() + 60_000).toISOString(),
+        id: "repl-longnm00",
+        channel: `h-longname${"z".repeat(3000)}`,
+        status: "completed",
+        elapsed: 1,
+        code: "answer = 42",
+      })}\n`,
+      "utf8",
+    );
+
+    const after = await measure();
+    expect(after.section, "a remembered channel is no longer reported as lost").toContain("answer = 42");
+    expect(after.section, "a 3000-character remembered channel name is quoted whole in the prompt section").not.toContain("z".repeat(300));
+    expect(
+      after.section.length,
+      `the prompt section grew from ${before.section.length} to ${after.section.length} characters over one remembered name`,
+    ).toBeLessThan(before.section.length + 1_000);
+    expect(after.notes, "the restart notification quotes the whole remembered name as well").not.toContain("z".repeat(300));
+  });
+
+  it("R4-01: and a legal channel name cannot reshape the section it is quoted into", async () => {
+    // The other half of the same missing clip, reachable today with no foreign file involved: a channel
+    // name may contain a newline (`run` only refuses names over 200 characters), the history record keeps
+    // it whole, and the section is a list of one-line notes that the name is pasted into raw. One cell
+    // can put a line of its own choosing into the system prompt of every later session.
+    const measure = async () => {
+      const sections: Record<string, string> = {};
+      await ext.emit({ type: "session_start", sessionId: `r4-01b-${Date.now()}-${Math.random()}` }, { hasUI: true });
+      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
+      return sections.replmode ?? "";
+    };
+
+    // A channel that is gone by the next session boundary, so its last cell is the one that gets quoted.
+    const started = await run("INJECTED_MARKER = 1", { channel: "h-inject\n- and a line the model wrote", timeout: 0 });
+    await ext.callTool("bg_wait", { timeout: 20 });
+    await ext.callTool("bg_stop", { task_id: started.details.id, kill: true });
+
+    const shown = await measure();
+    expect(shown, "the lost channel is no longer reported at all").toContain("INJECTED_MARKER");
+    expect(shown, `a channel name put a second line into the section:\n${shown.split("\n").slice(-6).join("\n")}`).not.toContain(
+      "- and a line the model wrote",
+    );
+    const notes = shown.split("\n").filter((line) => line.includes("last cell"));
+    expect(notes.length, `the section carries ${notes.length} note lines where one lost channel can add only one`).toBe(1);
+  });
 });
 
 describe("the traceback budget, at its seams", () => {
@@ -237,6 +303,29 @@ describe("the traceback budget, at its seams", () => {
       claimed,
       `the note says the log holds ${claimed} characters; the file it sends the model to holds ${onDisk}`,
     ).toBeGreaterThanOrEqual(onDisk);
+  });
+
+  it("R3-09: and the line count it quotes comes from the same count as the character count", async () => {
+    // R3-09 recounted the file after the traceback was appended, but only the character half of the note
+    // was pinned. The line half is computed by the same call, and a note that says "1812 of 4873 lines"
+    // for a file with different numbers is the same mistake in the other unit — with the extra wrinkle
+    // that the host's own header line ("[full traceback for this cell]") is in the count.
+    const result = await run("for i in range(3000): print('l' * 60)\nraise ValueError('unparseable: ' + 'x' * 300_000)", {
+      channel: "l-linecounts",
+    });
+    const shown = text(result);
+    const note = /output truncated: showing (\d+) of (\d+) characters at the start and (\d+) at the end \((\d+) of (\d+) lines\)/.exec(
+      shown,
+    );
+    expect(note, `no output truncation note with both units in: ${shown.slice(-500)}`).not.toBeNull();
+
+    const log = readFileSync(result.details.fullOutputPath!, "utf8");
+    const fileLines = log.split("\n").length - (log.endsWith("\n") ? 1 : 0);
+    const fileChars = log.length;
+    expect(Number(note![2]), `the note counts ${note![2]} characters in a log that holds ${fileChars}`).toBeGreaterThanOrEqual(fileChars);
+    expect(Number(note![5]), `the note counts ${note![5]} lines in a log that holds ${fileLines}`).toBeGreaterThanOrEqual(fileLines);
+    // The traceback append is what makes the second count differ from the first, and it is in the file.
+    expect(log, "the full traceback was not appended to the log the note counts").toContain("x".repeat(300_000));
   });
 
   it("R2-02: reserves nothing for a traceback that already fits", async () => {

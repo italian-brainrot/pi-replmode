@@ -96,6 +96,73 @@ time.sleep(600)
   });
 });
 
+describe("a channel that never comes up, and what it says about itself", () => {
+  it("R4-03: a daemon that never becomes ready still has to say why, or point at its output", async () => {
+    // R3-07's fix writes the interpreter's complaint into the daemon's log path and points the failed
+    // start at it — but it hangs off `reportStartFailure`, which only ever runs when the process exits,
+    // and then only writes a file when the explanation was long enough to cut. A daemon that is alive
+    // and never ready is answered by the ready timeout instead: the call is refused while the complaint
+    // sits in the host's `loose` buffer, and the daemon is only group-killed afterwards. Observed at
+    // HEAD: the answer is the bare timeout, nothing is written for a short complaint, and for a long
+    // one the log file appears about half a second after the answer — a file no one names. The one
+    // start failure the model can least do something about is the one that says nothing about why.
+    const script = `import sys, time
+sys.stderr.write("ImportError: the IPython history database is locked by another process\\n")
+sys.stderr.flush()
+time.sleep(600)
+`;
+    const result = await withStub("wedged-and-talking", script, { PI_REPLMODE_READY_TIMEOUT_MS: "1500" }, () =>
+      ext.callTool("run", { code: "print(1)", channel: "l-wedge-says-why" }),
+    );
+    expect(result.isError).toBe(true);
+    const shown = text(result);
+    expect(shown).toContain("did not report ready");
+
+    // The bytes are not necessarily lost (a complaint over the 3 000-character cut does end up in the
+    // daemon's log path, about half a second after the answer was given) — so this is only about
+    // whether the model is told. Either the reason is in the answer, or the answer names a file that
+    // holds it.
+    expect(shown, `a wedged daemon that explained itself is reported as a bare timeout: ${shown}`).toContain("history database is locked");
+  });
+
+  it("R3-07: and two failed starts on one name both leave their complaint in the file they point at", async () => {
+    // The pointer has to be true for the *second* failure too. The host appends (it does not truncate),
+    // so the file the second answer names holds both attempts — nothing is lost, and the newest
+    // complaint is in it. Pinned here because a future "cleanup" that truncates would throw away the
+    // first failure, and one that writes per-attempt files would break the pointer the answer gives.
+    const counter = join(ext.agentDir, "twice-failed.count");
+    // Long enough that each answer has to be cut and has to point at a file: a short complaint fits in
+    // the answer whole and needs no pointer (the other branch, pinned by the R2-06 tests above).
+    const script = `import os, sys
+path = ${JSON.stringify(counter)}
+attempt = 0
+if os.path.exists(path):
+    with open(path) as handle:
+        attempt = int(handle.read())
+with open(path, "w") as handle:
+    handle.write(str(attempt + 1))
+sys.stderr.write(("FAIL-%d-MARKER" % (attempt + 1)) + ("x" * 4000) + "\\n")
+sys.stderr.flush()
+sys.exit(1)
+`;
+    const pointers: string[] = [];
+    for (const marker of ["FAIL-1-MARKER", "FAIL-2-MARKER"]) {
+      const result = await withStub("twice-failed", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-twice" }));
+      expect(result.isError, `the ${marker} attempt did not fail`).toBe(true);
+      const shown = text(result);
+      expect(shown, `the ${marker} answer does not point at a file: ${shown.slice(-300)}`).toContain("full output is in");
+      const pointer = /full output is in ([^\]]+)\]/.exec(shown)?.[1];
+      expect(pointer, `the ${marker} answer names no file: ${shown.slice(-300)}`).toBeTruthy();
+      pointers.push(pointer!);
+      expect(readFileSync(pointer!, "utf8"), `the file named by the ${marker} answer does not hold ${marker}`).toContain(marker);
+    }
+    expect(pointers[1], "the two failed starts on one channel name wrote different files").toBe(pointers[0]);
+    const saved = readFileSync(pointers[0]!, "utf8");
+    expect(saved, "the second failed start overwrote the first one's complaint in the file it points at").toContain("FAIL-1-MARKER");
+    expect(saved, "the second failed start did not leave its own complaint in the file it points at").toContain("FAIL-2-MARKER");
+  });
+});
+
 describe("a daemon that answers a cell and then dies", () => {
   it("R1-06: is never reported as an ordinary completed call", async () => {
     // The `exec_end` frame and the process's death arrive on different channels with no ordering. A
@@ -367,6 +434,85 @@ time.sleep(600)
   });
 });
 
+describe("an aborted call whose channel is still starting", () => {
+  it("R4-06: gives the slot and the daemon back instead of holding them for the whole ready timeout", async () => {
+    // R3-04's refusal tells the model to "wait for the call that is starting to finish", and says the
+    // wedged creation cannot be freed. Half of that is true: `run` never looks at its AbortSignal until
+    // after `getChannel` resolves, so pressing Esc on a call that is stuck starting changes nothing —
+    // the creation keeps its slot (R2-03) and its half-spawned daemon for the entire ready timeout,
+    // and every later call is refused because of a call the model already cancelled.
+    const pidFile = join(ext.agentDir, "aborted-start.pid");
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    const savedCap = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "1";
+    try {
+      const controller = new AbortController();
+      let wedged: Promise<any> | undefined;
+      await withStub("aborted-start", script, { PI_REPLMODE_READY_TIMEOUT_MS: "7000" }, async () => {
+        wedged = ext.callTool(
+          "run",
+          { code: "print('the call that was cancelled')", channel: "l-abortstart" },
+          { signal: controller.signal },
+        );
+        await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
+        controller.abort();
+      });
+
+      // The stub is out of the way again, so this call gets the real interpreter if there is room.
+      const retry = await ext.callTool("run", { code: "print('room after an aborted start')", channel: "l-abortretry" });
+
+      // Settle everything before asserting, so a red run cannot leave a wedged creation behind.
+      const cancelled = await wedged!;
+      const stubPid = Number(readFileSync(pidFile, "utf8"));
+      await waitFor(() => !isPidAlive(stubPid), 20_000, "the aborted call's daemon to be taken down");
+
+      expect(cancelled.isError, "the aborted call somehow succeeded").toBe(true);
+      expect(text(retry), `a call aborted while starting held the only slot for its whole ready timeout: ${text(retry)}`).toContain(
+        "room after an aborted start",
+      );
+    } finally {
+      if (savedCap === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = savedCap;
+    }
+  });
+
+  it("R4-06: and does not send its cell to a channel that came up after the call was aborted", async () => {
+    // The other half of the same missed abort: if the channel does come up (a slow environment build,
+    // a cold import), the abandoned call walks straight into `runLocked`, sends its cell, and only then
+    // notices the signal. The user pressed Esc, the tool result says it was aborted, and the cell ran
+    // anyway — with whatever side effects a cell has by its first line.
+    const framesFile = join(ext.agentDir, "aborted-frames.log");
+    const script = `import json, os, sys, time
+open(${JSON.stringify(framesFile)}, "w").write("")
+time.sleep(2.0)
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-abortlate")}\n`)})
+sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    with open(${JSON.stringify(framesFile)}, "a") as handle:
+        handle.write(line)
+`;
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 800);
+    const result = await withStub("aborted-then-ready", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, () =>
+      ext.callTool(
+        "run",
+        { code: "open('/tmp/should-not-exist-r406','w').write('ran')", channel: "l-abortlate", timeout: 30 },
+        { signal: controller.signal },
+      ),
+    );
+    expect(result.isError, "a call aborted during startup was reported as a success").toBe(true);
+
+    const frames = existsSync(framesFile) ? readFileSync(framesFile, "utf8") : "";
+    expect(frames, `the aborted call sent its cell to a daemon that came up late: ${frames}`).not.toContain("execute");
+  });
+});
+
 describe("a daemon that dies before its first output boundary", () => {
   it("does not lose the few bytes the interpreter had already written", async () => {
     // The startup complaint and the first cell's output share one stream, and the host only attaches
@@ -410,6 +556,51 @@ os._exit(6)
     expect(shown, `the startup complaint is not in the answer at all: ${shown}`).toContain("STARTUP-NOISE-BEFORE-ANY-CELL");
     expect(shown, `the startup complaint is described as late output of a cell that never ran: ${shown}`).not.toMatch(
       /after this cell ended|after this cell/,
+    );
+  });
+
+  it("R3-10: and once a block has opened, the startup header is never used again", async () => {
+    // The claim behind R3-10's wording is that `loose` can only ever hold bytes from before the *first*
+    // boundary of the channel: after any block closes, `lastClosed` routes capture to that exec's log
+    // instead. Cell 2 here dies without ever opening a block, and the bytes between the cells belong to
+    // cell 1 — under the header that says so. If this ever regressed, cell 2's log would carry a
+    // "before any cell's output block opened" header for a channel that had already run a cell.
+    const sentinels = `S = lambda i: "\\x00\\x1ePIRB\\x1e" + i + "\\n"`;
+    const script = `import json, os, sys
+${sentinels}
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-latecell")}\n`)})
+sys.stdout.flush()
+frame = json.loads(sys.stdin.readline())
+sys.stderr.write(S(frame["id"]) + "cell one output\\n" + S(frame["id"]))
+sys.stderr.flush()
+sys.stdout.write(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}) + "\\n")
+sys.stdout.flush()
+sys.stdin.readline()
+sys.stderr.write("NOISE-BETWEEN-CELLS\\n")
+sys.stderr.flush()
+os._exit(6)
+`;
+
+    let first: any;
+    let second: any;
+    await withStub("late-bytes-to-the-first-cell", script, {}, async () => {
+      first = await ext.callTool("run", { code: "print('cell one')", channel: "l-latecell", timeout: 20 });
+      second = await ext.callTool("run", { code: "print('cell two')", channel: "l-latecell", timeout: 20 });
+    });
+
+    expect(first.details.status, "the first cell was not reported as completed").toBe("completed");
+    expect(second.details.status, "the second cell was not reported as dead").toBe("dead");
+    expect(text(second)).toContain("exit code 6");
+
+    const logFor = (result: any) => readFileSync(join(ext.agentDir, "replmode", "exec", `${result.details.id}.log`), "utf8");
+    const firstLog = logFor(first);
+    expect(firstLog, "the bytes between the cells were not attributed to the cell that ended last").toContain("NOISE-BETWEEN-CELLS");
+    expect(firstLog, "the late bytes lost the header that says they came after that cell ended").toContain("after this cell ended");
+
+    const secondLog = logFor(second);
+    expect(secondLog, "the bytes between two cells were also written into the later cell's log").not.toContain("NOISE-BETWEEN-CELLS");
+    expect(secondLog, "a channel that already ran a cell got the startup label for its bytes").not.toContain(
+      "before any cell's output block opened",
     );
   });
 });

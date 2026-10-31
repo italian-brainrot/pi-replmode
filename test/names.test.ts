@@ -184,6 +184,127 @@ describe("a channel name that looks like a command-line option", () => {
     await ext.emit({ type: "session_shutdown", reason: "quit" });
     ext.dispose();
   });
+
+  it("R3-03: keeps a 41-character name off the verbatim path, and a digested-looking one off it too", () => {
+    // The verbatim rule has two conditions, and both need pinning at their boundary. A name that is
+    // already a usable file name keeps it only while it is also short enough to survive the 40-character
+    // readable part, and only while it does not look like a digest this function appended.
+    const fortyOne = "a".repeat(41);
+    expect(channelFileStem("a".repeat(40))).toBe("a".repeat(40));
+    const digested = channelFileStem(fortyOne);
+    expect(digested, "a 41-character name kept itself, so its files are named after a truncated form of it").not.toBe(fortyOne);
+    expect(digested.startsWith("a".repeat(40))).toBe(true);
+    expect(digested.length, `a stem for a long name is ${digested.length} characters`).toBeLessThanOrEqual(60);
+    expect(channelFileStem("build-deadbeef00")).not.toBe("build-deadbeef00");
+    // The regex only has to catch what this function can *emit*, not every string that looks digested:
+    // eleven hex digits are not a digest this code appends, so that name may keep itself.
+    expect(channelFileStem("x-00000000000")).toBe("x-00000000000");
+  });
+
+  it("R3-03: and every stem it appends a digest to is itself a name it refuses to keep verbatim", () => {
+    // This is the whole injectivity argument in one property: every stem this function produces by the
+    // digest branch matches `LOOKS_DIGESTED`, so it can never be a name that maps to itself — a fixed
+    // point is unreachable by construction, not merely unlikely. Chained three deep (a stem of a stem of
+    // a stem, which is what a model that copies file names out of results can build), no two links meet.
+    // A name that keeps itself is the other branch, and chaining that is degenerate by design.
+    const names = [
+      "main",
+      "a/b",
+      "a_b",
+      "éclair",
+      "x".repeat(40),
+      "x".repeat(41),
+      "build-deadbeef00",
+      "x-0000000000",
+      "x-00000000000",
+      "x-ABCDEF0123",
+      "-r3-dash",
+      "--help",
+      "",
+      "!!!",
+      "a\0b",
+    ];
+    let digestBranches = 0;
+    for (const name of names) {
+      const first = channelFileStem(name);
+      expect(first, `a stem is not a plain file name: ${first}`).toMatch(/^[a-zA-Z0-9_-]+$/);
+      expect(first.length, `a stem is longer than the 60 characters any stem must fit in: ${first}`).toBeLessThanOrEqual(60);
+      if (first === name) continue;
+
+      digestBranches += 1;
+      // Anything the digest branch emitted has to look digested: that is what makes the next step of the
+      // chain refuse to keep it, and what stops two names meeting on one file.
+      expect(first, `a stem this function appended a digest to does not look digested: ${first}`).toMatch(/-[0-9a-f]{10}$/);
+      const chain = [name, first];
+      for (let depth = 0; depth < 3; depth++) {
+        const next = channelFileStem(chain[chain.length - 1]!);
+        expect(next, `a stem maps to itself: ${chain.join(" -> ")}`).not.toBe(chain[chain.length - 1]);
+        chain.push(next);
+      }
+      expect(new Set(chain).size, `two links of ${chain.join(" -> ")} name the same file`).toBe(chain.length);
+    }
+    expect(digestBranches, "none of these names went through the digest branch, so the test checks nothing").toBeGreaterThan(4);
+  });
+
+  it("R3-02: keeps a name that contains an option, a dash or an `=` whole, right through to `pi.channel`", async () => {
+    // The name now travels as one argv token (`--channel=<name>`), which is what the file names and the
+    // daemon's own copy of the name are derived from. Names that are themselves options, or that contain
+    // `=`, are the ones argparse can mis-split: the daemon must record exactly what the model asked for,
+    // because `pi.channel` and the `ready` frame are how the model sees the channel it is in.
+    const ext = await fresh();
+    for (const name of ["--", "--channel=x", "=", "-x=y", "a--b"]) {
+      const result = await ext.callTool("run", { code: "import pi\nprint('NAME IS [' + pi.channel + ']')", channel: name });
+      const shown = text(result);
+      expect(result.isError, `a channel named ${JSON.stringify(name)} could not be created: ${shown}`).toBeUndefined();
+      expect(shown, `the daemon recorded a different name than ${JSON.stringify(name)}: ${shown}`).toContain(`NAME IS [${name}]`);
+    }
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    ext.dispose();
+  });
+
+  it("R4-02: does not report a live channel as lost because a record in its own file lost its name", async () => {
+    // `lastHistoryByChannel` falls back to the *file stem* when a record has no usable `channel` field,
+    // and `lostChannelNotes` then asks the live channel map with that stem. A stem is not a channel name
+    // — that is exactly why R2-04 keyed the note by the record's own name — so a record that has lost its
+    // name (hand-edited, truncated, or written by something that is not this program, all of which F3-04
+    // already treats as possible) reports a running channel as gone, under a name it never had. And the
+    // name it invents is a digested stem, which `run` now turns into a *third* channel if the model types
+    // it back in (R3-03), so the note misleads twice.
+    const name = "r4-stem/live";
+    const stem = channelFileStem(name);
+    const dir = join(agent.path, "replmode/history");
+    mkdirSync(dir, { recursive: true });
+
+    const ext = await fresh();
+    const started = await ext.callTool("run", { code: "still_here = 1", channel: name });
+    expect(text(started), "the channel did not start").toContain("[new channel");
+
+    // The newest record in the channel's own history file, with its `channel` field missing.
+    writeFileSync(
+      join(dir, `${stem}.jsonl`),
+      `${JSON.stringify({
+        ts: new Date(Date.now() + 5 * 60_000).toISOString(),
+        id: "repl-r4stem00",
+        status: "completed",
+        elapsed: 1,
+        code: "r4_stem_marker = 1",
+      })}\n`,
+      "utf8",
+    );
+
+    await ext.emit({ type: "session_start", sessionId: "r4-stem" }, { hasUI: true });
+    const shown = await section(ext);
+    expect(shown, `a live channel was reported lost under its file stem:\n${shown.split("\n").slice(-6).join("\n")}`).not.toContain(stem);
+    expect(ext.notified.map((note) => note.message).join("\n"), "the notification named a channel that is running").not.toContain(stem);
+
+    // And the channel really is live with its variables, which is what the note tells the model is untrue.
+    const again = await ext.callTool("run", { code: "print(still_here)", channel: name });
+    expect(text(again), "the channel the note called lost is still there").not.toContain("[new channel");
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    ext.dispose();
+  });
 });
 
 describe("a channel name that is not a sane length", () => {
