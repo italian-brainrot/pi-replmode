@@ -7,7 +7,8 @@
  * `PI_REPLMODE_ENV_DIR` at a directory whose `bin/python` is a script. The host side is unchanged —
  * it is still `src/` talking over pipes — only the thing on the other end is simpler and untrustworthy.
  *
- * Tests whose comment names an issue id (R1-nn) document a defect from the audit of that pass.
+ * Tests whose comment names an issue id (R1-nn) document a defect from the audit of that pass. The
+ * pass-3 audit of the pass-2 fixes uses the same stub-interpreter trick; its ids are R3-nn.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -186,6 +187,189 @@ sys.exit(1)
     const retry = await ext.callTool("run", { code: "print('the channel is fine after a lost race')", channel: "l-fastready" });
     expect(text(retry)).toContain("the channel is fine after a lost race");
     void result;
+  });
+});
+
+describe("a channel that could not start, and what it promises about the rest", () => {
+  it("R3-07: does not send the model to a daemon log that does not hold the daemon's output", async () => {
+    // A cut-off explanation has to point somewhere that actually has the rest. The daemon's log file is
+    // opened by the daemon itself, and the complaint that reaches the host arrived on the *capture*
+    // stream, which is never written to that log: for an interpreter that dies before the daemon module
+    // runs, the file the answer promises does not exist, and the middle of the complaint — dropped by
+    // the 64 KB loose buffer — is nowhere at all.
+    const script = `import sys
+for i in range(600):
+    sys.stderr.write("noise-%d " % i)
+    if i == 300:
+        sys.stderr.write("THE-MIDDLE-OF-THE-COMPLAINT ")
+sys.stderr.write("\\nImportError: broken at the end\\n")
+sys.stderr.flush()
+sys.exit(1)
+`;
+    const result = await withStub("loud-and-pointless", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-pointer" }));
+    expect(result.isError).toBe(true);
+    const shown = text(result);
+    expect(shown.length, `a failed start returned ${shown.length} characters`).toBeLessThan(MAX_OUTPUT_CHARS);
+    expect(shown, "the reason at the end of the complaint was cut away").toContain("ImportError: broken at the end");
+
+    const pointer = /full output is in ([^\]]+)\]/.exec(shown)?.[1];
+    expect(pointer, `the explanation was cut and nothing says where the rest is: ${shown.slice(-300)}`).toBeTruthy();
+    expect(existsSync(pointer!), `the answer says the whole thing is in ${pointer}, which does not exist`).toBe(true);
+    expect(readFileSync(pointer!, "utf8"), `the file the answer points at does not hold the middle of the complaint`).toContain(
+      "THE-MIDDLE-OF-THE-COMPLAINT",
+    );
+  });
+
+  it("R2-06: keeps the exit code when the complaint comes late, from something the daemon left behind", async () => {
+    // `exit` can beat the last of the pipes, and a process the daemon spawned keeps the capture stream
+    // open after the daemon is gone. The report is bounded by `STDIO_DRAIN_MS` on purpose; what must
+    // never be lost is the exit status, and what must never happen is the call waiting on that pipe.
+    const childFile = join(ext.agentDir, "late-complaint-child.pid");
+    const script = `import os, subprocess, sys
+subprocess.Popen(["bash", "-c", "sleep 3; echo 'the real reason is in the child' 1>&2"], stdin=subprocess.DEVNULL)
+open(${JSON.stringify(childFile)}, "w").write(str(os.getpid()))
+sys.stderr.flush()
+os._exit(4)
+`;
+    const started = Date.now();
+    const result = await withStub("late-complaint", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-late" }));
+    expect(Date.now() - started, "the start failure waited for a pipe a leftover process was holding open").toBeLessThan(2_000);
+    expect(result.isError).toBe(true);
+    const shown = text(result);
+    expect(shown, `a late writer cost the answer its exit code: ${shown}`).toContain("exit code 4");
+
+    const stubPid = Number(readFileSync(childFile, "utf8"));
+    await waitFor(() => !isPidAlive(stubPid), 10_000, "the stub to be reaped after the failed start");
+  });
+
+  it("R2-06: a fatal frame followed by a real ready does not make the channel look broken", async () => {
+    // `fatalNote` is kept for the start-failure report. A daemon that sends one and then comes up anyway
+    // must not have that text served to the model as the reason for a call that worked.
+    const script = `import json, sys
+sys.stdout.write(${JSON.stringify('{"t":"fatal","error":"a spurious complaint from an early attempt"}')} + "\\n")
+sys.stdout.flush()
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-latefatal")}\n`)})
+sys.stdout.flush()
+while True:
+    frame = json.loads(sys.stdin.readline())
+    if frame.get("t") != "execute":
+        break
+    sys.stdout.write(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}) + "\\n")
+    sys.stdout.flush()
+`;
+    const result = await withStub("fatal-then-ready", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-latefatal" }));
+    expect(result.isError, `a channel that answered was reported as broken: ${text(result)}`).not.toBe(true);
+    expect(text(result), "a stale fatal frame was pasted into a call that worked").not.toContain("spurious complaint");
+
+    const again = await ext.callTool("run", { code: "print('the channel is still usable')", channel: "l-latefatal" });
+    expect(again.isError, `the channel stopped answering after its fatal frame: ${text(again)}`).not.toBe(true);
+    expect(again.details.status).toBe("completed");
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+  });
+
+  it("R2-03: a channel whose daemon dies on the way up gives its slot straight back", async () => {
+    // The cap counts creations that have not finished. If a failed one did not release its slot, the
+    // next channel would be refused for the rest of the session by a process that no longer exists.
+    const script = `import sys
+sys.stdout.write(${JSON.stringify('{"t":"fatal","error":"cannot import IPython"}')} + "\\n")
+sys.stdout.flush()
+sys.exit(1)
+`;
+    const saved = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "1";
+    try {
+      const failed = await withStub("slot-back", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-slotfail" }));
+      expect(failed.isError).toBe(true);
+      const retry = await ext.callTool("run", { code: "print('room after a failed start')", channel: "l-slotok" });
+      expect(text(retry), `a dead failed daemon still occupies the only slot: ${text(retry)}`).toContain("room after a failed start");
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = saved;
+    }
+  });
+});
+
+describe("the channel cap while a channel is still starting", () => {
+  it("R3-04: a session with nothing running does not claim all its channels are busy", async () => {
+    // A creation occupies a slot (R2-03), which is right, but the refusal it produces reads as though
+    // the session had cells in flight: "all 1 channels are busy … stop one with bg_stop". There is no
+    // task to stop — `bg_stop` has no id to take — and the thing that is actually happening is that a
+    // daemon has not come up yet, which the model's own options are "wait" or "kill that channel".
+    const pidFile = join(ext.agentDir, "starting-occupier.pid");
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    const saved = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "1";
+    try {
+      await withStub("starting-occupier", script, { PI_REPLMODE_READY_TIMEOUT_MS: "4000" }, async () => {
+        const occupier = ext.callTool("run", { code: "print(1)", channel: "l-occupier" });
+        await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
+
+        const refused = await ext.callTool("run", { code: "print(2)", channel: "l-refused" });
+        // Settle the wedged call before asserting anything, so a red run cannot leave it behind.
+        const failed = await occupier;
+        const occupierPid = Number(readFileSync(pidFile, "utf8"));
+        await waitFor(() => !isPidAlive(occupierPid), 15_000, "the daemon that never became ready to be reaped");
+
+        expect(refused.isError).toBe(true);
+        expect(failed.isError).toBe(true);
+        const shown = text(refused);
+        expect(shown, `the refusal blames busy channels when the only occupier is still starting: ${shown}`).toMatch(/starting|coming up/);
+        expect(shown).toContain("PI_REPLMODE_MAX_CHANNELS");
+      });
+    } finally {
+      if (saved === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = saved;
+    }
+  });
+});
+
+describe("a daemon that dies before its first output boundary", () => {
+  it("does not lose the few bytes the interpreter had already written", async () => {
+    // The startup complaint and the first cell's output share one stream, and the host only attaches
+    // bytes captured before any block opened to the block that follows them. A daemon that dies between
+    // receiving a cell and writing its opening marker has no block at all, and the exec it leaves behind
+    // is the only place those bytes can go.
+    const script = `import os, sys
+sys.stderr.write("STARTUP-NOISE-BEFORE-ANY-CELL\\n")
+sys.stderr.flush()
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-noboundary")}\n`)})
+sys.stdout.flush()
+sys.stdin.readline()
+os._exit(6)
+`;
+    const result = await withStub("die-before-boundary", script, {}, () =>
+      ext.callTool("run", { code: "print(1)", channel: "l-noboundary", timeout: 20 }),
+    );
+    expect(result.details.status).toBe("dead");
+    const shown = text(result);
+    expect(shown, `what the interpreter wrote before its first cell was dropped: ${shown}`).toContain("STARTUP-NOISE-BEFORE-ANY-CELL");
+  });
+
+  it("R3-10: and does not label those bytes as a cell's late output", async () => {
+    // The bytes are parked in the last exec's log through `Exec.lateWrite`, which is the right call — it
+    // survives a closed fd and caps the volume — but it narrates them as "output that arrived after this
+    // cell ended … not from a cell". Here no cell ever ended: this is the interpreter's own startup
+    // complaint, arriving before any cell ran. R2-07's rule for that header was that it must not claim
+    // more than the host knows.
+    const script = `import os, sys
+sys.stderr.write("STARTUP-NOISE-BEFORE-ANY-CELL\\n")
+sys.stderr.flush()
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-label")}\n`)})
+sys.stdout.flush()
+sys.stdin.readline()
+os._exit(6)
+`;
+    const result = await withStub("label-the-startup", script, {}, () =>
+      ext.callTool("run", { code: "print(1)", channel: "l-label", timeout: 20 }),
+    );
+    const shown = text(result);
+    expect(shown, `the startup complaint is not in the answer at all: ${shown}`).toContain("STARTUP-NOISE-BEFORE-ANY-CELL");
+    expect(shown, `the startup complaint is described as late output of a cell that never ran: ${shown}`).not.toMatch(
+      /after this cell ended|after this cell/,
+    );
   });
 });
 

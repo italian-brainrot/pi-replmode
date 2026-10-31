@@ -843,3 +843,343 @@ that was touched, and it strengthens rather than loosens the assertion (it now a
 - `structuredContent.output` holding the capture but not the traceback (see R2-02).
 - The nonce global now also holds the appended full traceback when one was shortened. A cell slicing it
   gets capture + traceback; harmless, and the alternative is a second file per exec.
+---
+
+## Pass 3 — 2026-11-01 (tester)
+
+Gate at the start: green — `tsc`, `biome`, 123 vitest, 47 pytest; re-run before starting, identical.
+Gate at the end: `tsc` and `biome` green, **153 vitest (139 pass, 14 fail)**, **47 pytest green**. Every
+vitest failure is a test this pass wrote to hold a finding below (`limits` 4, `names` 4, `lifecycle` 3,
+`prompt` 2, `resilience` 1); two full runs back to back produced the same 14 failures and the same pass
+count, no flake. `src/` and `python/` are untouched by this pass, so
+no real-`pi` smoke was owed (the pass-2 fixes' smoke is the current evidence).
+
+New file `test/limits.test.ts`; new tests in `test/names.test.ts`, `test/lifecycle.test.ts`,
+`test/prompt.test.ts`, `test/resilience.test.ts`, `test/cap.test.ts`, `test/capture.test.ts`,
+`test/format.test.ts`, `test/honesty.test.ts`, `test/reload.test.ts`. New tool:
+`scripts/mutation-audit.sh` — it breaks one already-fixed defect at a time and runs the file that should
+notice (the "is this fix actually pinned?" check; run it after your fixes and add a line for each one). Nothing was deleted or weakened; the only removed
+lines in the diff are two header comments and one import, each replaced by a wider version of itself.
+
+Ten findings: **one BUG, nine PAPERCUTs.** No BLOCKER. Seven of the ten are in the pass-2 fixes
+themselves (R3-01 sits where R2-02 sits, R3-03/R3-08 in R2-04, R3-04 in R2-03, R3-05 in R2-08, R3-07 and
+R3-10 in R2-06/R2-07, R3-09 in R2-02).
+
+### R3-01 — BUG — three fields the host pastes into an answer are not bounded by anything
+
+The 50 000-character promise was extended to the traceback by R2-02, and that part holds (see the
+re-check table). But the answer is not only capture plus traceback, and two of the remaining pieces are
+text whose size a cell controls:
+
+1. **the daemon's note ring.** Every `log` frame the daemon sends is stored verbatim in `Channel.note()`,
+   a ring capped at 40 *entries*, and `deadResult` pastes the last six under "daemon said:". A cell can
+   put an arbitrary string into one frame — the SIGINT-disposition warning quotes whatever the cell's own
+   handler is called, and `disposition_name` returns its `__name__`:
+
+   ```python
+   f = lambda *a: None
+   f.__name__ = 'x' * 300_000
+   signal.signal(signal.SIGINT, f)     # the next cell logs "a cell left SIGINT on xxxxx…; restored …"
+   ```
+
+   `test/limits.test.ts::R3-01` — the dead-channel result is **300 240 characters**. Four such frames
+   also park ~1.2 MB of strings in the host for the life of the channel: the same "capped by count, not
+   by bytes" shape R1-08 found in `loose`.
+
+2. **`definitions`.** The daemon caps the *list* at 100 names (`sorted(...)[:100]`) but a Python
+   identifier may be 4095 characters, and the names go into the answer's "defined by this cell:" note and
+   into `details.definitions`. Thirty 3001-character names — `exec(n + " = 1")` in a loop, which is what
+   generated code does — make the answer **90 262 characters** (`R3-01: and cannot do it with the names a
+   cell bound`). Nothing downstream catches it, exactly as in R2-02.
+
+3. the same names reach the **history file** (`definitions.slice(0, 20)`, unbounded each) and from there
+   the **prompt section** of every later session (`definitionHint` quotes six of them): one cell took the
+   section from **2 037 to 17 450 characters** (`R3-01: and those names do not end up in the prompt the
+   next session starts with`; `registration.test.ts` counts *lines*, so it does not see it). That text is
+   sent with every request of every later session, so it is the copy that costs the most.
+
+Suggested fix: one place that bounds model-facing quoting. `oneLine(name, 60)` per definition plus
+"…and 97 more"; each note entry clipped (`oneLine(text, 500)`) with the daemon's own log named as the
+place for the full text; keep `details.definitions` as the raw list (a program reading it is not the
+answer's size problem) or clip it too — the tests only require that the answer still *says* what the cell
+defined (`"defined by this cell"` in the result, `"defined:"` in the section).
+
+### R3-02 — PAPERCUT — a channel name that begins with a dash cannot start a channel at all
+
+The daemon is spawned as `-m replmode --channel <name> --log <path>`, and argparse refuses to take a
+value that starts with `-`:
+
+```
+channel "-r3-dash" could not start: the Python process behind channel "-r3-dash" ended (exit code 2)
+usage: replmode-daemon [-h] [--channel CHANNEL] --log LOG [--cwd CWD]
+replmode-daemon: error: argument --channel: expected one argument
+```
+
+`test/names.test.ts::R3-02` runs one cell on a channel named `-r3-dash` and gets that. The model sees a
+usage dump and a start failure for a channel it named legitimately; `--help` as a name is worse (the
+daemon prints its help onto the *protocol* fd and exits 0). The file-name side is safe —
+`channelFileStem` never emits a leading dash — so this is purely argument passing.
+
+Suggested fix: pass the name as one token: `"--channel=" + start.name`. (A name whose *first* character
+is a dash is otherwise legal here: `-` alone already works, because argparse treats a bare `-` as a
+value.) A test that runs a cell on `"-x"` and `"--help"` is the pin.
+
+### R3-03 — PAPERCUT — `channelFileStem` is not one-to-one: a digested stem is itself a usable name
+
+`names.ts` keeps a name verbatim when it is already a usable file name, and appends `-<10 hex>` otherwise.
+`-` is a usable character, so the digested stem of one name is itself a name that is kept verbatim, and
+the two channels land on the same three files:
+
+```
+channelFileStem("r3-dig/x")            →  "r3-dig_x-f395bbcba5"
+channelFileStem("r3-dig_x-f395bbcba5") →  "r3-dig_x-f395bbcba5"
+```
+
+No brute force is needed — the collision is by construction, and the trigger is a model that copies a
+file name it saw (the daemon log path is quoted in results; the stem appears in `IPYTHONDIR`) back into
+`channel`. Then two live daemons write one daemon log, one `history.sqlite` has two writers, and — the
+observable half — they append to one history file, and `lastHistoryByChannel` reads one record per file,
+so one of the two channels is never reported as lost.
+
+Repro: `test/names.test.ts::R3-03` (the fixed-point property, phrased so it fails only while the hole is
+open) and `R3-03: keeps the history of two such channels apart` (channels `r3-own/x` and
+`r3-own_x-b0122655c9` leave one history file behind and only one note).
+
+Suggested fix, any of these keeps the existing `^[a-zA-Z0-9_-]+$` / ≤ 60-character assertions: append the
+digest to a verbatim name that *looks* digested (`/-.{10}$/` of hex); use a separator that a usable name
+can never contain (`.` is unsafe, so it cannot appear in a verbatim name — would need the regex
+assertion widened); or always append a digest. The header comment's claim that the digest "makes the
+mapping one-to-one" should then say *how*.
+
+### R3-04 — PAPERCUT — the capacity refusal blames busy channels when the occupiers are still starting
+
+R2-03's fix made an in-flight creation occupy a slot, which is right, but the refusal it produces is the
+old text: with `PI_REPLMODE_MAX_CHANNELS=1` and a daemon that has not reported `ready` yet (a wedged
+environment build — the R1-11 case, up to 120 s), a second call is told
+
+```
+all 1 pi-replmode channels are busy and the cap (1, set with PI_REPLMODE_MAX_CHANNELS) is reached:
+let a background task finish, stop one with bg_stop, or free a channel with bg_stop {kill: true}
+```
+
+Nothing is running, there is no task id to hand to `bg_stop`, and the truth — a channel is still coming
+up — is the one thing the model could act on (wait, or kill that channel by name).
+`test/lifecycle.test.ts::R3-04` holds the wording.
+
+Suggested fix: `makeRoom` knows which names are starting; say which (`channel "x" is still starting and
+the cap (1, …) is reached: wait for it, or free a channel with bg_stop {kill: true}`), and keep the
+"all N are busy" sentence for the case where they really are.
+
+### R3-05 — PAPERCUT — `bg_stop` reports "stopped (dead)" and never says the channel went with the cell
+
+R2-08 put "…, shortly after an interrupt was requested for this cell" into the death note of a
+*foreground* call. The background path never reads `exec.deathNote` at all: when the interrupt is what
+took the daemon down — a cell that installs `signal.signal(SIGINT, lambda *a: os._exit(7))`, an extension
+that dies on the signal — the answer is
+
+```
+task repl-gjpfzfi7 stopped (dead).
+Log: /tmp/…/repl-gjpfzfi7.log
+```
+
+which reads as an ordinary stop of an ordinary task, while `bg_stop`'s whole promise is "the cell dies and
+the channel and its variables stay intact". The model reaches for its variables against a fresh daemon.
+Repro: `test/resilience.test.ts::R3-05` — the next call is `[new channel]` plus a `NameError`, and the
+stop answer mentions neither the channel nor the interrupt.
+
+Suggested fix: in `bgStop`'s settled-after-interrupt branch, append `exec.deathNote` (and the "variables
+are lost" line) whenever `exec.deathNote ?? exec.channel.closed` says the channel went. One line, and the
+task listing already says `dead`.
+
+### R3-06 — PAPERCUT — the prompt surface still promises the group kill reaches everything
+
+R2-09 wrote the exception down in `channel.ts`, `DESIGN.md`, the `kill` parameter description and the
+README. R2-10 then *added* two more copies of the promise, without the exception:
+
+- `SECTION_LINES`: "`bg_stop` with `kill: true` takes the whole channel down instead — that also ends the
+  servers, builds and subprocesses its cells started, and loses every variable in it."
+- `promptGuidelines` for `run`: "…`bg_stop {kill: true}` takes the channel down and ends the processes
+  its cells started."
+
+The section and the guidelines are what a model reads every session; the parameter description is what it
+reads at the moment of the call and is the one place that is honest. `test/prompt.test.ts::R3-06` holds
+both, and its own existing assertion (`/servers, builds and subprocesses/`) means the wording has to keep
+that phrase — e.g. "…its cells started (except any that moved into a process group of their own, which the
+kill cannot reach)".
+
+### R3-07 — PAPERCUT — a failed start sends the model to a daemon log that does not have the daemon's output
+
+`reportStartFailure` cuts the explanation at 3 000 characters and, when it does, appends "the daemon's
+full output is in `<daemon log>`". That pointer is wrong twice:
+
+- the daemon opens its own log file, and an interpreter that dies before `python -m replmode` runs never
+  opens it — the file does not exist (`test/lifecycle.test.ts::R3-07` asserts the named path exists and
+  gets `false`);
+- even when it exists, the log holds `log` frames, never the capture stream, which is where the
+  interpreter's traceback arrived. The middle of the complaint is held only in the host's 64 KB `loose`
+  buffer, and the bytes past that are dropped with `looseDropped` counted but never mentioned here.
+
+Adjacent, and worth fixing in the same pass: `writeToSink`'s cap loop (`while (looseBytes > cap &&
+loose.length > 0) loose.shift()`) removes the *only* element when one chunk is bigger than the cap, so a
+bursty interpreter can lose nearly all of its own complaint. That is not deterministic in a test (node
+hands the pipe over in ≤ 64 KB reads), but it is visible in practice: five runs of the same stub gave
+results of 2 268, 1 333 and 2 268 characters for a 360 KB complaint, only one of which had the pointer.
+
+Suggested fix: when a channel fails to start, the host *writes* what it received into
+`this.daemonLogPath` (it has the bytes) and points at that; if the pointer is kept conditional, it must
+also say how much was dropped. The cheap honest shape is one file the model can `open()` and read.
+
+### R3-08 — PAPERCUT — two history files can remember one channel, and the stale one can win
+
+R2-04's claim that an old history file "is still read correctly because the record inside it carries the
+real name" is true — `test/names.test.ts` pins it green — but it means a channel can now have two files:
+`a_b.jsonl` from before the naming change and `a_b-<digest>.jsonl` after. `lastHistoryByChannel` sets a
+record per file with no tie-break, so whichever entry `readdirSync` happens to return last wins, and the
+note can quote a cell from before the upgrade instead of the newest one. Repro:
+`R3-08: and when two files remember the same channel` — two rounds with the file names swapped, so one of
+them is guaranteed to put the stale record last; it loses to it (`expected 'stale_cell_marker = 1' to
+contain 'newest_cell_marker'`).
+
+Suggested fix: keep the newest record by `ts` when a channel appears in more than one file (the files are
+few and the records are dated).
+
+### R3-09 — PAPERCUT — the truncation note's totals go stale the moment the traceback is appended
+
+R2-02's escape hatch writes the full traceback into the exec log. That is the one truncation in this code
+that changes the file the notes point at, and `countOutput` ran *before* it: for a 9 MB capture and a
+300 KB traceback, the answer says `output truncated: showing 29 940 of 9 045 120 characters` while the
+file it sends the model to (`full output and traceback: <path>`) holds 9 345 400. The model is told one
+number for a file of another size — the R1-09 complaint, at the scale of the traceback.
+Repro: `test/limits.test.ts::R3-09`.
+
+Suggested fix: take the totals after appending (or add the appended length to them — `appendNote` returns
+nothing today; it could). The note's arithmetic ("N characters not shown") is unaffected.
+
+### R3-10 — PAPERCUT — the startup complaint is labelled as a cell's late output
+
+The bytes an interpreter writes before its first block opens are held in `loose` and, if the daemon dies
+before any block opened, dropped into the last exec's log by `flushLoose` — through `Exec.lateWrite`,
+which is the right call for the *writing* (it appends by path, so it survives a closed fd, and it caps the
+volume) and the wrong one for the *words*, because `lateWrite` narrates:
+
+```
+[new channel "l-label": python 3.14.0, ipython 9.0.0, cwd /, pid 0, started in 1ms]
+
+[output that arrived after this cell ended: from something the channel left running, not from a cell]
+STARTUP-NOISE-BEFORE-ANY-CELL
+
+[the Python process behind channel "l-label" ended (exit code 6)]
+```
+
+No cell ended; no cell ran. And the bytes are the interpreter's own startup complaint, so "from something
+the channel left running, not from a cell" is not merely unproven here — it is the wrong story, and the
+model is handed a phantom background process to go looking for. This is exactly the caution R2-07 wrote
+into DEV.md about that header, violated at its one other call site.
+Repro: `test/lifecycle.test.ts::R3-10` (the same stub as the passing test above it, which pins that the
+bytes themselves are not lost).
+
+Suggested fix: let `Exec.lateWrite` take the header (or add a sibling), and have `flushLoose` label these
+bytes as what they are — output from before the first cell ran. The cap and the append-by-path stay.
+
+### Re-checking pass 2's fixes, at the fix
+
+| fix | what pass 3 tried | result |
+| --- | --- | --- |
+| R2-01 | a windowed log whose **last line is 3 MB** (end-to-end and unit); a window that is one oversized line with the file's `totals`; the single-line fallback in window coordinates; `countOutput`'s "at least" floor next to a windowed read | **held** — three new passing tests, and all three catch the mutation that puts the tail cut back into file coordinates |
+| R2-02 | recursion *plus* a 200 000-character message (with `sys.setrecursionlimit`); 9 MB of capture and a 300 000-character traceback in one answer (both cuts live, both notes, both reachable from the log and the global); a traceback that fits (not cut, capture keeps the rest); the boundary where the capture eats the floor | **held**, except R3-09 (the note's totals go stale) and the fact that the *evalue* clipping was unpinned (see the mutation table) — now pinned by a new passing test over `details.evalue`, `structuredContent.error.evalue` and the task listing |
+| R2-03 | a burst at a cap of **1**; a creation that *fails* and whether the slot comes back (`R2-03: a channel whose daemon dies on the way up gives its slot straight back`, passing); the refusal's status in both views; a burst where every refused answer must not say "could not start" | **held** — the arithmetic is right at 1 and after failures; the wording is R3-04 |
+| R2-04 | a name that *is* another channel's digested stem; unicode (`éclair`), empty, 60-character and dash-containing names; the old-naming history file being read after the upgrade; traversal via the daemon's `--log` argument | **held** for the upgrade path, the profile/log/path naming and liveness; **broken** by construction (R3-03) and at the *argument* level (R3-02) |
+| R2-05 | every path's `details.status` against its `structuredContent.status` (new passing test); the declared optionality | **held** |
+| R2-06 | a complaint that arrives **3 s late** from a process the daemon left behind, with the capture pipe held open; a `fatal` frame followed by a real `ready`; a daemon that dies before its first boundary marker (the `flushLoose` path with an exec) | **held** — the exit code survives, the call does not wait on the pipe, a stale `fatal` is not pasted into a call that worked, the startup bytes are not lost — but the pointer it emits is R3-07 and the header those bytes get is R3-10 |
+| R2-07 | the sticky note surviving a `/reload` (new passing test); whether anything benign sets it (the daemon writes nothing to the capture stream between cells, so only a real second writer does); the accepted during-a-block limit | **held**, still honest, still over-disclosing only where it says so. Cheap signal for the accepted hole, argued below |
+| R2-08 | the ordinary interrupt (no death note, `interrupted`) and the interrupt-that-kills-the-daemon through `bg_stop` rather than an abort | **held** for the foreground; the background path lost the fact (R3-05) |
+| R2-09 | `start_new_session=True` still escapes (its own test still pins it); every *other* place the promise is made | **held**; README and `channel.ts` carry the exception, the prompt surface does not (R3-06) |
+| R2-10 | the section's bytes across creating and killing a channel; the cap facts in the section and guidelines | **held** — byte-stable inside a session; only `session_start` touches it |
+
+**Mutation check** (`scripts/mutation-audit.sh` — break the fix, see who notices). Every line but two were
+caught by pass 2's own tests:
+
+| mutation | caught by |
+| --- | --- |
+| `channelFileStem` never appends a digest | `names.test.ts` R2-04 ×2 |
+| `makeRoom` ignores `starting` | `cap.test.ts` R2-03 (and the new cap-1 test) |
+| `tracebackBudget = 0` | `honesty.test.ts` R2-02 ×2 |
+| `flushLoose` empties `loose` when no exec ever ran | `lifecycle.test.ts` R2-06 ×2 |
+| the `fatal` frame is not kept in `fatalNote` | `lifecycle.test.ts` R2-06 |
+| the lost-channel note keyed by the file stem again | `names.test.ts` R2-04, and the new old-naming test |
+| the death note stops mentioning an in-flight interrupt | `lifecycle.test.ts` R2-08 |
+| `truncateMiddle`'s tail cut back into file coordinates | `format.test.ts` R2-01 ×3 |
+| `RUN_OUTPUT` makes `output`/`truncated` required again | `honesty.test.ts` R2-05 |
+| **`oneLine(evalue, 500)` removed — survived pass 2's own suite** | nothing of pass 2's; now caught by a new passing test over `details.evalue`, `structuredContent.error.evalue` and the task listing |
+| **`Exec.lateWrite` in `flushLoose` back to `Exec.write` — survived, and legitimately so** | nothing can catch it: the only reachable case is a daemon that dies before its first boundary marker, where the exec's log fd is still open (`flushLoose` runs before `finalize`), so both calls append. What `lateWrite` changes there is the cap, the header, and safety-if-the-order-ever-changes — and its header is wrong in that case, which is R3-10 |
+| `failure()`'s status chosen differently — survived | nothing; see "left alone" — the enum has no value for "your arguments were invalid" |
+
+Pass 2's "one test changed": **accepted**. I reproduced the claim directly — `expect("abc").toBeLessThan(5)`
+raises `TypeError: actual value must be number or bigint, received "string"` in vitest 5, so that
+assertion never compared anything, and `.length` is the same bound, now actually evaluated. The general
+form of that bug is self-revealing in a green gate (a type error fails the test), which is why the search
+here went through mutations instead. One vacuity worth noting, not filed: `cap.test.ts`'s R2-03 counts
+live *pids*, so it passes vacuously if no `details.pid` is reported; the new cap-1 test asserts at least
+one refusal and that every pid is gone afterwards, and the same guard could be added to pass 2's.
+
+### Probed and left alone
+
+- **A cheap signal for R2-07's accepted hole.** The pump is still wrong (the deadlock argument holds).
+  But there is a disclosure that costs nothing and attributes nothing: at `_end` (or from the host, which
+  knows the daemon's pid) read `/proc/<pid>/task/*/children`; if the list is not empty when a cell
+  finishes, the channel has live descendants, and that can be said in the *next* results — "this cell
+  left processes running; their output can appear in any later cell's". It is a different claim from
+  attribution, Linux-only, and heuristic, but it closes the disclosure gap in the case the audit's repro
+  is in (an orphan that writes only during a later block), without touching the capture.
+- The note ring is not pasted into a *finished* result, only a dead one, so R3-01's first half cannot
+  contaminate a normal call.
+- `truncated: true` when only the traceback was cut, with `structuredContent.output` complete: still the
+  accepted asymmetry ("`structuredContent.output` is the capture"). A wrapper that wants to know which
+  piece was cut has the notes.
+- The banner and the notes ride ~500 characters above 50 000 (the cut budgets reserve only 100 for the
+  note inside the text). The suite's `+5_000` slack encodes that deliberately; making the answer
+  *exactly* bounded would mean reserving room for the notes, which would cut output for nothing.
+- A windowed cut whose last line is oversized may return as little as 40 % of the tail budget — the
+  cutter's floor, not a bug; the note reports the numbers that were really shown.
+- `status: "dead"` for an empty `code` or an invalid `timeout` (the `failure()` path) is not a *channel*
+  claim so much as the enum lacking a "rejected" value. Pass 2 settled the enum; not re-opened.
+- Housekeeping, not filed: `Channel.readOutput`, `Exec.outputTruncated`, `ReplManager.liveChannelNames`
+  and `format.ts`'s `STRUCTURED_OUTPUT_MAX_BYTES` are dead (the constant's comment claims it caps
+  `structuredContent.output`, which uses a literal instead — and that `slice(0, 1_048_576)` is a no-op
+  because the text it is applied to is already ≤ 50 000). R2-08's lesson: either use it or delete it.
+- The accepted limits this pass was told not to re-file, re-checked and still accepted: per-exec capture
+  pipes (deadlock), the sticky out-of-band note (over-disclosure is the cheaper side),
+  `structuredContent.output` excluding the traceback, and the 64 MB `MAX_FRAME_BYTES` `_overlong` hole.
+
+### Handoff to the fixer
+
+Order of work that keeps the tree comprehensible: R3-02 and R3-03 first (both are `names.ts`/argv, one
+test file, and R3-03 changes stems, so do it before anything that reads history file names); then R3-08 in
+the same file; then the R3-01 bounding (one helper, three call sites, and it must not remove the
+"defined by this cell" note or the "defined:" line in the section — those are asserted by these tests and
+by `registration.test.ts`); then the two wording findings (R3-06, R3-04) and R3-05, which is one line in
+`bgStop`; R3-07 and R3-10 last, because they touch the start-failure path where R2-06's tests live.
+
+What each fix must not break:
+
+- R3-03: `names.test.ts` pins that stems match `^[a-zA-Z0-9_-]+$` and stay ≤ 60 characters, that `main`
+  keeps the readable name `main`, and that unicode names get the digest. A fix that always appends a
+  digest breaks the second of those; a fix that widens the safe-character set breaks the first — the
+  AUDIT's first suggestion (digest names that already look digested) keeps all three.
+- R3-01: `honesty.test.ts` requires the answer to keep saying what it shortened and where the rest is; a
+  fix that answers "the definitions are too long to show" without a pointer is a new finding.
+- R3-06: `prompt.test.ts` asserts `/servers, builds and subprocesses/` survives in the section, and
+  `kill` 's parameter description must keep `/process group/`. Adding the exception to the section makes
+  its bytes change once — that is fine (the section is allowed to differ across sessions), but the new
+  "byte-stable while channels come and go" test pins that nothing *runtime* moves it.
+- R3-07: `lifecycle.test.ts`'s R2-06 tests pin the exit code, the 3 000-character bound and that a late
+  complaint does not hang the call. Writing the captured bytes into the daemon log path must not steal the
+  daemon's own file from a daemon that *did* start — the R3-07 stub never started, which is the case in
+  question.
+- R3-09/R3-10: both touch how an exec log is written; `capture.test.ts` and `format.test.ts` pin the
+  numbers the notes quote and the windowed totals.
+
+Then: `npm run check`, re-run `bash scripts/mutation-audit.sh` (add a line for each fix — a fix with no
+mutation that dies is a fix with no test), and the real-`pi` smoke in DEV.md, since R3-02 and R3-07 touch
+daemon startup and R3-01/R3-09 touch what a result carries. Afterwards, confirm no `python -m replmode`
+process and no cell-spawned `sleep`/`bash` is left running.

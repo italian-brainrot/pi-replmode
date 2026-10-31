@@ -74,6 +74,38 @@ describe("reload", () => {
     agent.dispose();
   });
 
+  it("keeps a channel's out-of-band warning across a reload", async () => {
+    // The flag that says "this channel has produced output no cell asked for" belongs to the channel,
+    // not to the module that read it: the process that wrote those bytes is still running underneath,
+    // and a reload must not silence the warning that says so.
+    const agent = makeTempDir("replmode-agent-");
+    const env = { PI_REPLMODE_MAX_CHANNELS: "12" };
+    const first = await loadExtension({ agentDir: agent.path, env });
+
+    await first.callTool("run", {
+      code: "import subprocess\nsubprocess.Popen(['bash','-c','for i in $(seq 1 30); do echo STRAY-$i; sleep 0.1; done'])\nprint('spawned a talkative child')",
+      channel: "x-stray",
+    });
+    // Its bytes arrive while no block is open: attributed, capped, and they flag the channel.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const before = text(await first.callTool("run", { code: "print('cell two')", channel: "x-stray" }));
+    expect(before, `the warning never appeared: ${before.slice(0, 400)}`).toMatch(/outside any cell|not from this cell|earlier cell/);
+
+    await first.emit({ type: "session_shutdown", reason: "reload" });
+    first.dispose();
+    vi.resetModules();
+
+    const second = await loadExtension({ agentDir: agent.path, env });
+    const after = text(await second.callTool("run", { code: "print('cell three')", channel: "x-stray" }));
+    expect(after, `the new runtime forgot that this channel has a second writer: ${after.slice(0, 400)}`).toMatch(
+      /outside any cell|not from this cell|earlier cell/,
+    );
+
+    await second.emit({ type: "session_shutdown", reason: "quit" });
+    second.dispose();
+    agent.dispose();
+  });
+
   it("keeps channels alive across a session replacement, and shuts them down on quit", async () => {
     const agent = makeTempDir("replmode-agent-");
     const first = await loadExtension({ agentDir: agent.path, env: { PI_REPLMODE_MAX_CHANNELS: "12" } });

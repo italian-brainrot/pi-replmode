@@ -64,6 +64,31 @@ describe("truncateMiddle", () => {
     expect(cut.windowed).toBe(true);
   });
 
+  it("R2-01: keeps a tail when the final line is bigger than the tail budget", () => {
+    // The tail cut has to land *inside* an oversized last line. Asking for a line boundary there finds
+    // no line start in the range, and a cutter that gives up returns nothing from the end at all.
+    const text = `${longText(2000, 8)}${"x".repeat(200_000)}END\n`;
+    const totals = { chars: text.length + 4_000_000, lines: 300_000 };
+    const cut = truncateMiddle(text, 5_000, 0.6, totals);
+    // The cut cannot land on a line boundary, so the tail may shrink to the cutter's minimum — but not
+    // to nothing, and not past the end of the log.
+    expect(cut.tailChars, "an oversized final line cost the whole tail").toBeGreaterThanOrEqual(700);
+    expect(cut.text).toContain("END");
+    expect(cut.headChars).toBeGreaterThan(1_000);
+    expect(cut.text.length).toBeLessThanOrEqual(5_000);
+  });
+
+  it("R2-01: keeps a tail when the text is one oversized line and the totals are the file's", () => {
+    // The single-line fallback had the same windowed-coordinate bug as the normal cut.
+    const text = "x".repeat(10_000);
+    const cut = truncateMiddle(text, 1_000, 0.6, { chars: 5_000_000, lines: 900_000 });
+    expect(cut.truncated).toBe(true);
+    expect(cut.headChars).toBeGreaterThan(0);
+    expect(cut.tailChars, "the fallback still measures from the file, not the window").toBeGreaterThan(0);
+    expect(cut.text.length).toBeLessThanOrEqual(1_000);
+    expect(cut.totalChars).toBe(5_000_000);
+  });
+
   it("counts lines the way a reader would", () => {
     expect(truncateMiddle("a\nb\nc", 100).totalLines).toBe(3);
     expect(truncateMiddle("a\nb\nc\n", 100).totalLines).toBe(3);

@@ -69,6 +69,41 @@ describe("what the model is told about stopping a task and about the channel cap
     expect(description).toContain("servers");
     expect(description, "the kill is promised to reach things it cannot reach").toMatch(/process group/);
   });
+
+  it("R3-06: the model-facing section carries that exception too", async () => {
+    // The parameter description is the one place R2-09 wrote the exception down, and it is the place a
+    // model is least likely to re-read at the moment it decides. The section is what it reads every
+    // session, and its `kill: true` line still promises the unqualified version.
+    const shown = await section();
+    const killLine = shown
+      .split("\n")
+      .filter((line) => /kill|servers|subprocesses/.test(line))
+      .join("\n");
+    expect(killLine, "the section never mentions the kill escalation").toContain("kill: true");
+    expect(killLine, `the section promises the kill reaches things it cannot reach: ${killLine}`).toMatch(/process group/);
+  });
+
+  it("R3-06: and so do the run guidelines, which repeat the promise in their own words", () => {
+    const guidelines = ext.tools.get("run")!.promptGuidelines ?? [];
+    const killGuideline = guidelines.find((line) => line.includes("kill: true")) ?? "";
+    expect(killGuideline, "no guideline mentions the kill").toContain("channel");
+    expect(killGuideline, `the guideline promises more than a group kill can deliver: ${killGuideline}`).toMatch(/process group/);
+  });
+
+  it("R2-10: the section stays byte-stable while channels come and go", async () => {
+    // The only thing allowed to change it is a session boundary: pi diffs prompt sections against the
+    // system message it is replaying, so a section that changes mid-session is written into the
+    // transcript again and breaks the provider's prompt cache from there down.
+    const before = await section();
+    const task = await ext.callTool("run", { code: "import time\ntime.sleep(5)", channel: "p-stable", timeout: 0 });
+    const during = await section();
+    await ext.callTool("bg_stop", { task_id: task.details.id, kill: true });
+    await ext.callTool("run", { code: "print(1)", channel: "p-stable-2" });
+    const after = await section();
+
+    expect(during, "creating a channel changed the section").toBe(before);
+    expect(after, "killing a channel changed the section").toBe(before);
+  });
 });
 
 describe("lost channels", () => {

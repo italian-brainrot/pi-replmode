@@ -181,6 +181,19 @@ describe("a log bigger than the read window", () => {
     expect(shown, `the end of the log is missing from the result: ${shown.slice(-400)}`).toContain("THE VERY LAST LINE");
   });
 
+  it("R2-01: keeps the end of a log whose last line is bigger than the whole tail budget", async () => {
+    // A progress bar, a one-line JSON blob, a parquet header dumped to stdout: the last line of a long
+    // run can be megabytes. The tail cut cannot land on a line boundary there, and it must still land
+    // inside that line rather than after it.
+    const result = await run("for i in range(90): print('L' * 100_000)\nprint('!' * 3_000_000 + ' THE VERY LAST LINE')", {
+      channel: "c-gianttail",
+      timeout: 180,
+    });
+    const shown = text(result);
+    expect(result.details.truncated, "the log was not truncated after all").toBe(true);
+    expect(shown, `the end of a megabyte final line is missing: ${shown.slice(-300)}`).toContain("THE VERY LAST LINE");
+  });
+
   it("says what it gave up on counting once the log passes the scan limit", async () => {
     // `countOutput` stops at 16 MB, so the totals quoted for a bigger log are a floor, and the note
     // has to read like one.

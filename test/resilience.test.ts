@@ -74,6 +74,30 @@ describe("interrupting a cell that is waiting", () => {
 });
 
 describe("killing a channel", () => {
+  it("R3-05: a stop that took the channel down with the cell says the channel went too", async () => {
+    // `bg_stop`'s promise is that the cell dies and the channel and its variables survive. A cell can
+    // arrange otherwise — a SIGINT handler that exits, a C library that dies on the signal — and then
+    // the answer is just "stopped (dead)", with no hint that the channel went with it. The next call
+    // starts a fresh one and the model loses variables it was told were kept. Pass 2 put this exact
+    // fact into the death note of a *foreground* call (R2-08); the background stop path never reads it.
+    const task = await run("import signal, os, time\nsignal.signal(signal.SIGINT, lambda *a: os._exit(7))\nkept = 'kept'\ntime.sleep(30)", {
+      channel: "r-stopdead",
+      timeout: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    const stopped = await bgStop(task.details.id);
+    const shown = text(stopped);
+    expect(stopped.details.status).toBe("dead");
+    expect(shown, `the stop answer hides that the channel died: ${shown}`).toMatch(/channel[^\n]*(gone|ended|died|dead)/);
+    expect(shown, `the stop answer does not mention the interrupt that did it: ${shown}`).toMatch(/interrupt|SIGINT/);
+
+    // The variables really are gone, which is the thing the model has to be told before it reaches for
+    // them rather than after.
+    const after = await run("print(kept)", { channel: "r-stopdead" });
+    expect(text(after)).toContain("[new channel");
+  });
+
   it("R1-10: takes the processes that its cell started down with it", async () => {
     // The escalation the model is offered when a task will not stop: `kill: true` says it ends
     // every cell in the channel. The daemon exits on the shutdown frame, so the group-kill

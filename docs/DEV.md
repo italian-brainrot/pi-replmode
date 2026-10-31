@@ -41,6 +41,8 @@ docs/AUDIT.md      the tester↔fixer log. Every failing test that documents a d
 scripts/dev.mjs    the watch loop
 scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so there is one
                    definition of where the environment lives)
+scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
+                   "is this fix actually pinned?" check, run it after a pass's fixes
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
 ```
 
@@ -59,6 +61,11 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   closes its own descriptors): point `PI_REPLMODE_ENV_DIR` at a directory holding `.complete` and an
   executable `bin/python` script, and the host spawns that instead. `test/lifecycle.test.ts` does it —
   the host code under test is completely real, only the peer is a stub.
+- **Is a fix actually pinned?** `bash scripts/mutation-audit.sh` applies one deliberate break to a fixed
+  defect at a time, runs the test file that should notice, and reverts with `git checkout`. A mutation
+  that changes nothing means the fix has no test behind it — pass 3 found two that way (the `evalue`
+  clipping, and `flushLoose` going through `Exec.lateWrite`). Add the mutation to the script when you fix
+  something, and keep the list short enough to run in under a minute.
 - **Real pi smoke**, which catches what neither suite does (registration, prompt section, real
   harness): use a throwaway agent dir so the user's settings are untouched.
 
@@ -105,7 +112,16 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   they must come from `names.ts`, the one place that keeps the mapping one-to-one. Naive sanitising puts
   `a/b` and `a_b` in one log, one history file and one sqlite profile; keying the "these channels are
   gone" note by the *file stem* instead of the record's real name tells the model a running channel
-  died (R2-04).
+  died (R2-04). Two holes to keep in mind while it is verbatim-or-digest: a digested stem is itself a legal
+  name, so the mapping has fixed points unless the digest is applied to names that already look digested
+  (R3-03), and the name also travels as a daemon argument, where a leading `-` is read as an option
+  (R3-02 — pass it as `--channel=<name>`).
+- **Anything the host pastes into an answer is part of the size of the answer.** The 50 000 budget covers
+  the capture and the traceback, but `deadResult` also pastes the daemon's note ring and the result pastes
+  `definitions`, and both were bounded by *count* rather than by bytes, which a cell controls: a `signal`
+  handler's `__name__` reaches a note, and Python identifiers may be 4095 characters (R3-01). Bound such
+  fields with `oneLine` where they are quoted, and remember that `definitions` also lands in the history
+  file and from there in the prompt section of every later session.
 - **The 50 000-character limit covers the whole answer, not just the capture.** The traceback arrives in
   the `exec_end` frame and is appended after the capture, so it needs its own share of the budget or a
   cell that raises with a row of data in its message returns a result of unbounded size (R2-02). If you

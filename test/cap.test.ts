@@ -43,6 +43,33 @@ describe("the channel cap", () => {
     }
   });
 
+  it("R2-03: at a cap of one, a burst leaves exactly one daemon and refusals that are not start failures", async () => {
+    // The cap of 1 is the tightest arithmetic the manager has: the first call occupies the only slot
+    // while it is still starting, and the other two have no idle channel to evict. They must be refused
+    // as a capacity problem (nothing died, nothing failed to start), and nothing may be left running.
+    const started = await Promise.all(
+      [1, 2, 3].map((n) => ext.callTool("run", { code: `print(${n})`, channel: `k-one${n}`, timeout: 30 })),
+    );
+    const pids = started.map((result) => result.details.pid).filter((pid) => pid !== undefined) as number[];
+    const live = pids.filter((pid) => isPidAlive(pid));
+    expect(live.length, `${live.length} daemons alive with a cap of 1: ${pids.join(", ")}`).toBeLessThanOrEqual(1);
+
+    const refused = started.filter((result) => result.isError);
+    expect(refused.length, "every parallel call got a channel, which the cap forbids").toBeGreaterThan(0);
+    for (const result of refused) {
+      const shown = text(result);
+      expect(shown, `a capacity refusal is dressed as a channel that failed to start: ${shown}`).not.toContain("could not start");
+      expect(result.structuredContent?.status, `a refusal that killed nothing reports status ${result.structuredContent?.status}`).toBe(
+        "running",
+      );
+    }
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    for (const pid of pids) {
+      expect(isPidAlive(pid), `channel daemon ${pid} outlived the session`).toBe(false);
+    }
+  });
+
   it("refuses a new channel when every existing one is busy, and says how to free one", async () => {
     const busy = await ext.callTool("run", { code: "import time\ntime.sleep(5)", channel: "k-busy", timeout: 0 });
     expect(busy.details.status).toBe("running");

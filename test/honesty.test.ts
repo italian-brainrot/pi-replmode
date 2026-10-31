@@ -133,6 +133,63 @@ describe("structuredContent against the schema the tool declares", () => {
 
     await ext.callTool("bg_wait", { timeout: 20 });
   });
+
+  it("R2-05: and `details.status` never contradicts `structuredContent.status`", async () => {
+    // The pass-2 defect was one view saying `error` while the other said `dead`. Membership in the
+    // declared union is not enough to hold that: a status can be legal in both views and still differ.
+    const answers: Array<[string, any]> = [
+      ["completed", await run("print('fine')", { channel: "h-agree1" })],
+      ["failed", await run("1 / 0", { channel: "h-agree1" })],
+      ["dead", await run("import os\nos._exit(4)", { channel: "h-agree2" })],
+      ["background (timeout: 0)", await run("import time\ntime.sleep(2)", { channel: "h-agree3", timeout: 0 })],
+      ["busy channel", await run("print('blocked')", { channel: "h-agree3" })],
+      ["empty code", await run("   ", { channel: "h-agree4" })],
+      ["impossible timeout", await run("print(1)", { channel: "h-agree4", timeout: Number.NaN })],
+    ];
+
+    const schema = ext.tools.get("run")!.outputSchema as { properties: { status?: { anyOf?: Array<{ const: unknown }> } } };
+    const allowed = schema.properties?.status?.anyOf?.map((entry) => entry.const) ?? [];
+    expect(allowed.length, "this test cannot see the declared statuses; it would pass over an empty union").toBeGreaterThan(0);
+
+    const disagree: string[] = [];
+    for (const [name, result] of answers) {
+      const details = result.details?.status;
+      const structured = result.structuredContent?.status;
+      if (details !== structured)
+        disagree.push(`${name}: details ${JSON.stringify(details)} vs structuredContent ${JSON.stringify(structured)}`);
+      if (structured !== undefined && !allowed.includes(structured))
+        disagree.push(`${name}: status ${JSON.stringify(structured)} is not declared`);
+    }
+    expect(disagree, `the two views of the answer disagree about what happened:\n${disagree.join("\n")}`).toEqual([]);
+
+    await ext.callTool("bg_wait", { timeout: 20 });
+  });
+
+  it("R2-02: the exception's own message is clipped wherever it is quoted", async () => {
+    // `details.evalue` and `structuredContent.error.evalue` repeat what the traceback already carries, in
+    // a field a wrapper program is likely to print on its own. The task listing quotes it too. A cell
+    // that raises with a row of data in its message must not be able to make those fields huge — the
+    // content text staying under the limit does not cover them.
+    const code = "raise ValueError('unparseable: ' + 'w' * 100_000)";
+    const failed = await run(code, { channel: "h-evalue" });
+    for (const [where, value] of [
+      ["details.evalue", failed.details.evalue],
+      ["structuredContent.error.evalue", failed.structuredContent?.error?.evalue],
+    ] as const) {
+      expect(typeof value, `${where} is missing from a failed call`).toBe("string");
+      expect(value.length, `${where} quotes the whole ${String(value).length}-character message`).toBeLessThanOrEqual(1_000);
+      expect(value, `${where} is not one line`).not.toContain("\n");
+      expect(value).toContain("unparseable");
+    }
+
+    // The same field in the background listing, where the traceback never reaches the model at all.
+    const background = await run(code, { channel: "h-evalue-bg", timeout: 0 });
+    const waited = await ext.callTool("bg_wait", { timeout: 20 });
+    const task = (waited.details.tasks ?? []).find((entry: { id: string }) => entry.id === background.details.id);
+    expect(task, "the backgrounded cell is not in the listing").toBeTruthy();
+    expect(String(task.evalue).length, `the listing quotes a ${String(task.evalue).length}-character evalue`).toBeLessThanOrEqual(1_000);
+    expect(text(waited), "the task listing pastes the whole message into the table").not.toContain("w".repeat(1_000));
+  });
 });
 
 function abortAfter(ms: number): AbortSignal {
