@@ -13,6 +13,12 @@
  * `exec_end` frame and its closing sentinel have arrived. Every byte of a cell's output is streamed
  * to a log file as it arrives, which is what makes a cell that runs past its timeout safe to
  * detach: the log is already where the output is, wherever the host happens to be looking.
+ *
+ * Capture from before the first block opens is held in its own 64 KB buffer (trimmed inside its
+ * oldest chunk, never dropped whole) and belongs to whichever block opens next. If the channel never
+ * became ready, that buffer — the interpreter's own complaint — is worth more to the model than the
+ * daemon's log file would be, so the host writes it into that path and points the failed start at it
+ * (R3-07); a channel that *did* run keeps that file for itself.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";

@@ -174,6 +174,10 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   real signal delivery is timing-sensitive; prefer `waitFor` over fixed sleeps, and never assert on
   *where* a racy interrupt landed (a SIGINT left pending across an exec boundary may be reported as the
   cell or as the loop, and both are correct).
+- **Temp litter**: a full vitest run leaves a few dozen `/tmp/replmode-agent-*` and `/tmp/replmode-cwd-*`
+  directories behind (a few MB in total) — `loadExtension` removes the agent dir it created itself, but
+  `names.test.ts` shares one across its tests via `makeTempDir` and no file removes that one, and the cwd
+  dirs are never removed. Nothing depends on them; `rm -rf /tmp/replmode-*` between runs if it bothers you.
 - **Env variables the suites use**: `PI_REPLMODE_MAX_CHANNELS`, `PI_REPLMODE_READY_TIMEOUT_MS`
   (makes the never-ready daemon testable), `PI_REPLMODE_REQUIREMENTS` and `PI_REPLMODE_ENV_DIR` (make
   "changed pins, new environment" testable), `PI_REPLMODE_KEEP_RUNNING`. All are read per use, not at

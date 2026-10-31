@@ -1190,10 +1190,11 @@ Gate at the start: `tsc`/`biome` green, **153 vitest (139 pass, 14 fail)**, 47 p
 failures are pass 3's holding tests. Gate at the end: **green — `tsc`, `biome`, 164 vitest, 47 pytest**,
 two full runs with the same result. All ten findings are fixed; the fourteen holding tests went green
 untouched except one assertion that could not be satisfied by any working code, argued under
-"One test changed (pass 3 fixes)". Nine tests were *added* to pin the fixes themselves: the whole-option
-channel names and the "no stem is a fixed point" property (`names` ×2), the startup-buffer arithmetic at
-the wire level (`lifecycle` ×1), the same arithmetic as pure functions (new `test/buffers.test.ts`, ×4),
-and three copies of the definitions bound (`limits`: `ename`, the history file, the prompt section).
+"One test changed (pass 3 fixes)". Eleven tests were *added* to pin the fixes themselves: the
+whole-option channel names, the "no stem is a fixed point" property and the channel-name length cap
+(`names` ×3), the startup buffer at the wire level (`lifecycle` ×1), the same arithmetic as pure functions
+(new `test/buffers.test.ts`, ×4), and three more copies of the size bound (`limits`: `ename`, the history
+file, the prompt section).
 
 Real-`pi` smoke re-run (throwaway agent dir, thinking on for `qwen38-flash-next`): the DEV.md two-call
 prompt answers 42; a channel named `-smoke-dash` starts and keeps state and its result still ends with
@@ -1207,18 +1208,18 @@ the Python process behind channel "smoke-stop" ended (exit code 7), shortly afte
 
 Afterwards no `python -m replmode` daemon and no cell-spawned child was left running.
 
-Mutation testing, and the honest part of it: `scripts/mutation-audit.sh` grew from 12 lines to 29 and
+Mutation testing, and the honest part of it: `scripts/mutation-audit.sh` grew from 12 lines to 32 and
 gained a label filter (`bash scripts/mutation-audit.sh R3-0`), because a full pass is now 3m20s. The
 **first full run showed three of my own fixes were not pinned**: the R3-04 wording (the *other* refusal
 branch also mentions "starting", so the test was satisfied either way), R3-05 (the test never required
 the word "variables"), and the two copies of the R3-01 definitions bound, which masked each other — with
 either one clipped, the prompt-section test was happy. Fixed by adding assertions (`not.toMatch(/are
 busy/)` and `toContain("l-occupier")` to R3-04, `/variables/` to R3-05) and two new tests (F3-03 pins the
-history file, F3-04 pins the section quoting a file written by anything), then re-run: every pass-3 line
-dies. The two survivors left are the two pass 3 itself recorded as legitimate:
-`flushLoose`'s `Exec.lateWrite` → `Exec.write` (both append in the only reachable case; what matters there
-is the header, which is now a separate mutation that does die) and `failure()`'s choice of status (the
-enum has no "your arguments were invalid" value — accepted, not re-opened).
+history file, F3-04 pins the section quoting a file written by anything). Full re-run on the committed
+tree: **30 of the 32 mutations die.** The two that survive are the two pass 3 itself recorded as
+legitimate — `flushLoose`'s `Exec.lateWrite` → `Exec.write` (both append in the only reachable case;
+what matters there is the header, which is now a separate mutation that does die) and `failure()`'s choice
+of status (the enum has no "your arguments were invalid" value — accepted, not re-opened).
 
 ### R3-01 — every copy of a cell-chosen string is bounded where it is quoted
 
