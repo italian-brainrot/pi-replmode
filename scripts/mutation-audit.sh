@@ -259,7 +259,6 @@ run_mutation "R3-10 capture between two cells is parked in the later cell's log 
 ---MUTATE---
     if (this.lastClosed && false) {
       this.outOfBandOutput = true;
-      this.lastClosed.lateWrite(chunk);
       return;
     }' "test/lifecycle.test.ts"
 
