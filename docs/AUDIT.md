@@ -111,9 +111,9 @@ Repro: `python/tests/test_hardening.py::test_a_cell_that_closes_the_capture_stre
 
 Suggested fix: make `_capture`/`flush_streams` failure non-fatal (log a warning once per exec, note in
 `exec_end` that the capture stream broke, and let the host's sentinel grace window do its job). Fixing
-R1-03's dispatch guard alone would also downgrade this to "channel survives, output incomplete".
-Note that a *redirect* of fd 2 (as opposed to a close) is already handled well — see "probed and
-solid" below.
+R1-03's dispatch guard alone would also downgrade this to "channel survives, output incomplete", which
+is what the test accepts. Note that a *redirect* of fd 2 (as opposed to a close) is already handled
+well — see "probed and solid" below.
 
 ### R1-06 — BUG — a call whose channel died is reported as `completed`
 
@@ -128,7 +128,9 @@ are gone, and gets a `NameError` it cannot explain.
 Repro: `test/capture.test.ts::R1-06` — result is `status: "completed"`, output
 `printed before closing fd 2 / and after`, and the next call on the channel cannot see `durable`.
 (`os._exit` in the *body* is already handled correctly by the existing `t-dying` test, because there
-the frame never arrives.)
+the frame never arrives.) The test accepts either shape of fix: the channel genuinely keeping its
+state, or a result that says the channel ended. What it must not do is claim an ordinary success and
+lose the state.
 
 Suggested fix: a settled exec whose channel closed (`exec.deathNote` set / `channel.closed`) is
 `"dead"` regardless of the frame — or at minimum keep `completed` but append the death note and the

@@ -39,12 +39,13 @@ describe("a cell that damages the capture stream", () => {
 
     const shown = text(result);
     expect(shown).toContain("printed before closing fd 2");
-    expect(result.details.status === "completed", `a dead channel reported success: ${shown.slice(0, 300)}`).toBe(false);
-    expect(shown).toMatch(/ended|dead|gone/);
 
-    // Whatever the model does next must not pretend the channel is the same one.
+    // Either the channel really survived having its capture stream destroyed, or the result says so.
+    // Today it does neither: it comes back `completed`, and the state is gone by the next call.
     const next = await run("print(durable)", { channel: "c-fd2" });
-    expect(text(next)).not.toContain("kept");
+    const survived = text(next).includes("kept") && !text(next).includes("[new channel");
+    const disclosed = /(ended|dead|gone|capture)/i.test(shown);
+    expect(survived || disclosed, `a dead channel reported success: ${shown.slice(0, 300)}`).toBe(true);
   });
 
   it("still answers promptly and keeps the traceback when the capture stream is redirected", async () => {
