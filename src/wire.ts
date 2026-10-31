@@ -82,14 +82,16 @@ export function sentinelFor(id: string): Buffer {
  * Sentinels can straddle any chunk boundary, so a possible partial prefix is held back between
  * calls. Everything that is not part of a sentinel is handed to `onBytes` in order; each complete
  * sentinel (open or close of a block — the daemon writes the same marker before a cell and after
- * it) goes to `onBoundary`.
+ * it) goes to `onBoundary`, together with the bytes it matched, so the receiver can put a marker it
+ * does not own back where it came from: the id alone cannot say whether the marker is a boundary or
+ * just data the program printed.
  */
 export class CaptureSplitter {
   private pending = Buffer.alloc(0);
 
   constructor(
     private readonly onBytes: (chunk: Buffer) => void,
-    private readonly onBoundary: (id: string) => void,
+    private readonly onBoundary: (id: string, marker: Buffer) => void,
   ) {}
 
   push(chunk: Buffer): void {
@@ -123,8 +125,9 @@ export class CaptureSplitter {
         return;
       }
 
-      const id = buf.subarray(at + SENTINEL_PREFIX.length, newline).toString("latin1");
-      this.onBoundary(isExecId(id) ? id : "");
+      const marker = buf.subarray(at, newline + 1);
+      const id = marker.subarray(SENTINEL_PREFIX.length, marker.length - 1).toString("latin1");
+      this.onBoundary(isExecId(id) ? id : "", marker);
       offset = newline + 1;
     }
   }

@@ -4,10 +4,10 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ensureEnv } from "../src/env.ts";
+import { ensureEnv, envDirFor } from "../src/env.ts";
 import { makeTempDir, repoRoot } from "./helpers/extension.ts";
 
 describe("ensureEnv", () => {
@@ -79,6 +79,55 @@ describe("ensureEnv", () => {
     } finally {
       if (withOverride !== undefined) process.env.PI_REPLMODE_ENV_DIR = withOverride;
     }
+  });
+
+  it("R1-12: gives a different pin file its own environment directory", async () => {
+    // The property the whole upgrade story leans on: changed pins mean a fresh environment, not a
+    // half-upgraded one. The repo's own pin file is a constant, so the test brings two others.
+    const temp = makeTempDir("replmode-pins-");
+    const cache = join(temp.path, "cache");
+    const pinsA = join(temp.path, "a.txt");
+    const pinsB = join(temp.path, "b.txt");
+    writeFileSync(pinsA, "pi-replmode-does-not-exist-000 == 1.0.0\n", "utf8");
+    writeFileSync(pinsB, "pi-replmode-does-not-exist-000 == 2.0.0\n", "utf8");
+
+    const saved = {
+      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+      PI_REPLMODE_REQUIREMENTS: process.env.PI_REPLMODE_REQUIREMENTS,
+      PI_REPLMODE_ENV_DIR: process.env.PI_REPLMODE_ENV_DIR,
+    };
+    const progress: string[] = [];
+    try {
+      process.env.XDG_CACHE_HOME = cache;
+      delete process.env.PI_REPLMODE_ENV_DIR;
+
+      // Two pin files, two directories. The installs themselves are expected to fail.
+      for (const pins of [pinsA, pinsB]) {
+        process.env.PI_REPLMODE_REQUIREMENTS = pins;
+        await ensureEnv((message) => progress.push(message)).catch(() => undefined);
+      }
+
+      const dirs = progress
+        .map((message) => /environment in (\S+) \(/.exec(message)?.[1])
+        .filter((dir): dir is string => dir !== undefined);
+      expect(dirs).toHaveLength(2);
+      expect(dirs[0]).toMatch(/py-env-[0-9a-f]{12}$/);
+      expect(dirs[0]).toContain(cache);
+      expect(dirs[0]).not.toBe(dirs[1]);
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      temp.dispose();
+    }
+  }, 300_000);
+
+  it("names the environment after the interpreter and the pins, not after the folder", () => {
+    const same = envDirFor("/usr/bin/python3", "3.14.0", "ipython==9.18.0\n");
+    expect(same).toMatch(/py-env-[0-9a-f]{12}$/);
+    expect(envDirFor("/usr/bin/python3", "3.14.0", "ipython==9.17.0\n"), "a changed pin must mean a new directory").not.toBe(same);
+    expect(envDirFor("/usr/bin/python3", "3.15.0", "ipython==9.18.0\n"), "a new interpreter must mean a new directory").not.toBe(same);
   });
 
   it("fails loudly when PI_REPLMODE_PYTHON points at nothing", async () => {

@@ -8,7 +8,18 @@
  * up whatever this process already has.
  */
 
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
@@ -92,6 +103,8 @@ interface HistoryRecord {
   elapsed: number;
   code: string;
   definitions?: string[];
+  /** Records after the one reported that could not be read — a torn append after a crash. */
+  torn?: number;
 }
 
 /** What a channel held before this pi process started. */
@@ -242,7 +255,9 @@ export class ReplManager {
       case "abandoned":
         return this.backgroundResult(exec, "did not stop after an interrupt and is still running", true);
       case "dead":
-        return this.deadResult(exec, banner);
+        // A cell that got its `exec_end` out before the process went away still has output and a
+        // traceback worth showing; `deadResult` is for the ones that never got a frame at all.
+        return exec.frame ? this.finishedResult(exec, banner) : this.deadResult(exec, banner);
       default:
         return this.finishedResult(exec, banner);
     }
@@ -285,11 +300,15 @@ export class ReplManager {
    */
   private finishedResult(exec: Exec, banner: string[]): ReplResult {
     const read = readLog(exec.logPath);
-    const cut = truncateMiddle(read.text, MAX_OUTPUT_CHARS);
+    // A log read as a tail window is bigger than the text in hand, so the totals quoted to the model
+    // come from the file itself rather than from the window.
+    const totals = read.windowed ? countOutput(exec.logPath) : undefined;
+    const cut = truncateMiddle(read.text, MAX_OUTPUT_CHARS, 0.6, totals && { chars: totals.chars, lines: totals.lines });
     exec.outputTruncated = cut.truncated;
 
     const frame = exec.frame;
     const status = statusOf(exec);
+    const gone = status === "dead" || Boolean(exec.deathNote) || exec.channel.closed;
     const blocks: string[] = [...banner];
 
     const shown = cut.text.replace(/\s+$/, "");
@@ -300,14 +319,21 @@ export class ReplManager {
 
     const notes: string[] = [];
     if (status === "interrupted") notes.push("cell interrupted; the channel and its variables are intact");
-    if (status === "dead") notes.push(exec.deathNote ?? "the channel's Python process ended");
+    if (gone) {
+      // The frame said the cell finished, and the process underneath it is gone: say both rather
+      // than letting the next cell discover the loss as a NameError.
+      notes.push(exec.deathNote ?? exec.channel.deathNote ?? "the channel's Python process ended");
+      notes.push("the channel is gone and its variables are lost; the next run on it starts a fresh one");
+    }
     if (read.windowed) notes.push(`the log is bigger than ${formatSize(MAX_READ_BYTES)}; showing its tail`);
 
     let varName: string | undefined;
     if (cut.truncated) {
+      // `countOutput` stops counting in very large logs, so say when the total is a floor.
+      const atLeast = totals?.partial ? "at least " : "";
       notes.push(
-        `output truncated: showing ${cut.headChars} of ${cut.totalChars} characters at the start and ${cut.tailChars} at the end ` +
-          `(${cut.shownLines} of ${cut.totalLines} lines)`,
+        `output truncated: showing ${cut.headChars} of ${atLeast}${cut.totalChars} characters at the start and ${cut.tailChars} at the end ` +
+          `(${cut.shownLines} of ${atLeast}${cut.totalLines} lines)`,
       );
       if (!exec.channel.closed) {
         varName = nonceVarName();
@@ -662,9 +688,22 @@ export class ReplManager {
       if (!entry.endsWith(".jsonl")) continue;
       const channel = entry.slice(0, -".jsonl".length);
       try {
-        const lines = readFileSync(join(HISTORY_DIR, entry), "utf8").split("\n").filter(Boolean);
-        const last = lines.at(-1);
-        if (last) latest.set(channel, JSON.parse(last) as HistoryRecord);
+        const lines = readFileSync(join(HISTORY_DIR, entry), "utf8")
+          .split("\n")
+          .filter((line) => line.trim());
+        // A crash mid-append leaves a torn record at the end. Reading only the last line would drop
+        // the channel from the note entirely; the newest record that parses still says what it held.
+        let torn = 0;
+        for (let index = lines.length - 1; index >= 0; index--) {
+          try {
+            const parsed = JSON.parse(lines[index]!) as HistoryRecord;
+            if (!parsed || typeof parsed !== "object") throw new Error("not a record");
+            latest.set(channel, { ...parsed, channel, ...(torn > 0 ? { torn } : {}) });
+            break;
+          } catch {
+            torn++;
+          }
+        }
       } catch {
         // A corrupt history file is not worth an error.
       }
@@ -699,11 +738,9 @@ export class ReplManager {
     const path = join(HISTORY_DIR, `${historyFileName(exec.channelName)}.jsonl`);
     try {
       ensureDirs();
+      sealHistoryTail(path);
       appendLine(path, `${JSON.stringify(record)}\n`);
-      if (statSync(path).size > HISTORY_ROTATE_BYTES) {
-        const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
-        writeFileSync(path, `${lines.slice(-HISTORY_MAX_LINES).join("\n")}\n`, "utf8");
-      }
+      rotateHistory(path);
     } catch {
       // History is a convenience; losing it must not affect the call.
     }
@@ -842,6 +879,53 @@ function appendLine(path: string, line: string): void {
     writeFileSync(fd, line, "utf8");
   } finally {
     closeSync(fd);
+  }
+}
+
+/**
+ * Keep a channel's history file inside its budget: the newest records, still valid JSONL.
+ *
+ * Exported because it is the only place in the manager that rewrites a file the user can see, and
+ * reaching it through `run` would mean running a few hundred cells.
+ */
+export function rotateHistory(path: string, maxBytes = HISTORY_ROTATE_BYTES, maxLines = HISTORY_MAX_LINES): boolean {
+  if (statSync(path).size <= maxBytes) return false;
+  const lines = readFileSync(path, "utf8")
+    .split("\n")
+    .filter((line) => line.trim());
+  writeFileSync(path, `${lines.slice(-maxLines).join("\n")}\n`, "utf8");
+  return true;
+}
+
+/**
+ * Close a record that was cut off by a crash.
+ *
+ * An append that never finished leaves the file without its trailing newline, and the next record
+ * would be glued onto the torn one, making the newest entry unreadable too.
+ */
+function sealHistoryTail(path: string): void {
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return;
+  }
+  if (size === 0) return;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r+");
+    const last = Buffer.alloc(1);
+    if (readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a) writeSync(fd, Buffer.from("\n"), 0, 1, size);
+  } catch {
+    // Read-only or vanished; the append will fail too and the caller swallows it.
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Already gone.
+      }
+    }
   }
 }
 

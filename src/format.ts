@@ -30,21 +30,33 @@ export interface Truncation {
   windowed: boolean;
 }
 
-/** Keep `headRatio` of the budget at the start and the rest at the end, both cut at a line break. */
-export function truncateMiddle(text: string, maxChars = MAX_OUTPUT_CHARS, headRatio = 0.6): Truncation {
-  const totalChars = text.length;
-  const totalLines = countLines(text);
+/**
+ * Keep `headRatio` of the budget at the start and the rest at the end, both cut at a line break.
+ *
+ * `totals` is what the whole log holds, when `text` is only a window into it (see `readLog`). Without
+ * it the notes would quote the window: "1 000 of 8 388 588 characters" for a 15 MB log, numbers that
+ * match nothing the model can go and look at.
+ */
+export function truncateMiddle(
+  text: string,
+  maxChars = MAX_OUTPUT_CHARS,
+  headRatio = 0.6,
+  totals?: { chars: number; lines: number },
+): Truncation {
+  const totalChars = totals?.chars ?? text.length;
+  const totalLines = totals?.lines ?? countLines(text);
+  const windowed = totals !== undefined && totals.chars !== text.length;
 
-  if (totalChars <= maxChars) {
+  if (text.length <= maxChars) {
     return {
       text,
       truncated: false,
       totalChars,
-      headChars: totalChars,
+      headChars: text.length,
       tailChars: 0,
       totalLines,
-      shownLines: totalLines,
-      windowed: false,
+      shownLines: countLines(text),
+      windowed,
     };
   }
 
@@ -65,14 +77,14 @@ export function truncateMiddle(text: string, maxChars = MAX_OUTPUT_CHARS, headRa
   const tail = text.slice(tailStart);
 
   return {
-    text: `${head}\n\n[... ${totalChars - head.length - tail.length} characters and ${Math.max(0, totalLines - countLines(head) - countLines(tail))} lines not shown ...]\n\n${tail}`,
+    text: `${head}\n\n[... ${Math.max(0, totalChars - head.length - tail.length)} characters and ${Math.max(0, totalLines - countLines(head) - countLines(tail))} lines not shown ...]\n\n${tail}`,
     truncated: true,
     totalChars,
     headChars: head.length,
     tailChars: tail.length,
     totalLines,
     shownLines: countLines(head) + countLines(tail),
-    windowed: false,
+    windowed,
   };
 }
 

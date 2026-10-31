@@ -18,8 +18,11 @@ export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..
 /** Put on the daemon's PYTHONPATH. */
 export const PYTHON_PACKAGE_DIR = join(PACKAGE_ROOT, "python");
 
-/** The dependency pin that names the Python environment. */
-export const REQUIREMENTS_FILE = join(PACKAGE_ROOT, "requirements.txt");
+/** The dependency pin that names the Python environment; override it with `PI_REPLMODE_REQUIREMENTS`. */
+export function requirementsFile(): string {
+  const configured = process.env.PI_REPLMODE_REQUIREMENTS?.trim();
+  return configured ? resolve(configured) : join(PACKAGE_ROOT, "requirements.txt");
+}
 
 function isSourceCheckout(root: string): boolean {
   return existsSync(join(root, "package.json")) && existsSync(join(root, "python", "replmode", "daemon.py"));

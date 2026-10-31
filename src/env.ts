@@ -5,7 +5,8 @@
  * `${XDG_CACHE_HOME:-~/.cache}/pi-replmode/py-env-<hash>`, where `<hash>` covers the interpreter and
  * the pinned requirements, so a changed pin or a new Python gets a fresh environment instead of a
  * half-upgraded one, and wiping the cache costs a re-sync and nothing else. `PI_REPLMODE_ENV_DIR`
- * points it somewhere else.
+ * points the environment somewhere else; `PI_REPLMODE_REQUIREMENTS` names a different pin file, which
+ * by the same rule gets its own environment.
  *
  * Nothing is ever installed into the repository, the project folder, or the user's system Python.
  * With no `uv` and no usable `python -m venv`, the tool fails with the exact command to fix it
@@ -17,7 +18,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { REQUIREMENTS_FILE } from "./paths.ts";
+import { requirementsFile } from "./paths.ts";
 
 const BUILD_TIMEOUT_MS = 15 * 60 * 1000;
 const MARKER = ".complete";
@@ -50,10 +51,18 @@ async function buildEnv(onProgress: (message: string) => void): Promise<PythonEn
   const started = Date.now();
   const base = await baseInterpreter();
   const version = await interpreterVersion(base);
-  const requirements = readFileSync(REQUIREMENTS_FILE, "utf8");
-  const hash = createHash("sha256").update(`${base}\n${version}\n${requirements}`).digest("hex").slice(0, 12);
-
-  const dir = process.env.PI_REPLMODE_ENV_DIR?.trim() || join(cacheRoot(), `py-env-${hash}`);
+  const requirementsPath = requirementsFile();
+  let requirements: string;
+  try {
+    requirements = readFileSync(requirementsPath, "utf8");
+  } catch {
+    throw new Error(
+      `cannot read the requirements file ${requirementsPath}${process.env.PI_REPLMODE_REQUIREMENTS ? " (PI_REPLMODE_REQUIREMENTS)" : ""}. ` +
+        "Restore it, or point PI_REPLMODE_REQUIREMENTS at one that exists.",
+    );
+  }
+  const dir = process.env.PI_REPLMODE_ENV_DIR?.trim() || envDirFor(base, version, requirements);
+  const hash = hashOf(base, version, requirements);
   const python = join(dir, "bin", "python");
   const marker = join(dir, MARKER);
 
@@ -66,8 +75,8 @@ async function buildEnv(onProgress: (message: string) => void): Promise<PythonEn
   if (!uv && !(await venvWorks(base))) {
     throw new Error(
       `cannot create the pi-replmode Python environment: no uv found and \`${base} -m venv\` does not work.\n` +
-        `Fix it with one of:\n  uv venv ${dir} --python ${base} && uv pip install --python ${python} -r ${REQUIREMENTS_FILE}\n` +
-        `  ${base} -m venv ${dir} && ${python} -m pip install -r ${REQUIREMENTS_FILE}\n` +
+        `Fix it with one of:\n  uv venv ${dir} --python ${base} && uv pip install --python ${python} -r ${requirementsPath}\n` +
+        `  ${base} -m venv ${dir} && ${python} -m pip install -r ${requirementsPath}\n` +
         "or point PI_REPLMODE_PYTHON at an interpreter that already has ipython installed.",
     );
   }
@@ -82,10 +91,10 @@ async function buildEnv(onProgress: (message: string) => void): Promise<PythonEn
     onProgress(`creating the pi-replmode Python environment in ${dir} (${backend})`);
     if (uv) {
       await run(uv, ["venv", dir, "--python", base], `uv venv failed for ${dir}`);
-      await run(uv, ["pip", "install", "--python", python, "-r", REQUIREMENTS_FILE], `uv pip install -r ${REQUIREMENTS_FILE} failed`);
+      await run(uv, ["pip", "install", "--python", python, "-r", requirementsPath], `uv pip install -r ${requirementsPath} failed`);
     } else {
       await run(base, ["-m", "venv", dir], `${base} -m venv ${dir} failed`);
-      await run(python, ["-m", "pip", "install", "-r", REQUIREMENTS_FILE], `${python} -m pip install -r ${REQUIREMENTS_FILE} failed`);
+      await run(python, ["-m", "pip", "install", "-r", requirementsPath], `${python} -m pip install -r ${requirementsPath} failed`);
     }
 
     // A marker with the pin it was built from, so a hand-edited env is detectable.
@@ -101,6 +110,21 @@ async function buildEnv(onProgress: (message: string) => void): Promise<PythonEn
 function cacheRoot(): string {
   const xdg = process.env.XDG_CACHE_HOME?.trim();
   return join(xdg || join(homedir(), ".cache"), "pi-replmode");
+}
+
+/**
+ * The environment directory for an interpreter and a pin set.
+ *
+ * Naming the directory after both is the whole upgrade story: changed pins or a new interpreter mean
+ * a fresh environment rather than a half-upgraded one, and a wiped cache costs a re-sync and nothing
+ * else. Exported so a test can assert that property without editing the repo's pin file.
+ */
+export function envDirFor(interpreter: string, version: string, requirements: string): string {
+  return join(cacheRoot(), `py-env-${hashOf(interpreter, version, requirements)}`);
+}
+
+function hashOf(interpreter: string, version: string, requirements: string): string {
+  return createHash("sha256").update(`${interpreter}\n${version}\n${requirements}`).digest("hex").slice(0, 12);
 }
 
 /** `python3` on PATH unless PI_REPLMODE_PYTHON names one. */

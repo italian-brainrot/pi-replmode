@@ -195,3 +195,130 @@ def test_the_frame_reader_keeps_its_place_after_junk_between_frames(daemon: Daem
     _, out = daemon.execute("print(kept)", exec_id="repl-junk02")
     assert "yes" in out
     assert daemon.proc.poll() is None
+
+
+# ── Holding the fixes down ───────────────────────────────────────────────────
+#
+# Each of these is an attempt to defeat a fix made after the pass-1 audit: an interrupt that has to
+# survive a cell that absorbs it, a capture stream damaged in a way the first fix did not imagine,
+# and the daemon's own descriptors, which user code can reach.
+
+
+def test_an_interrupt_the_cell_absorbs_escalates_to_stopping_the_cell(daemon: Daemon) -> None:
+    """A second SIGINT has to reach a cell that caught the first one and went back to waiting."""
+    daemon.send(
+        {
+            "t": "execute",
+            "id": "repl-absorb",
+            "code": "import asyncio\nfor _ in range(3):\n    try:\n        await asyncio.sleep(20)\n    except KeyboardInterrupt:\n        print('caught, waiting again')\nprint('finished')",
+        }
+    )
+    time.sleep(0.8)
+    daemon.interrupt()
+    time.sleep(0.4)
+    daemon.interrupt()
+
+    frame = daemon.wait_frame("exec_end", "repl-absorb", timeout=10)
+    assert frame["status"] == "interrupted", f"the cell was never stopped: {frame}"
+    assert daemon.proc.poll() is None
+    _, out = daemon.execute("print('usable')", exec_id="repl-absorb2")
+    assert "usable" in out
+    # Reaching an await the second time means cancelling, which is reported honestly in the log.
+    assert "CancelledError" in daemon.log_path.read_text()
+
+
+def test_interrupt_reaches_a_cell_parked_on_a_thread_pool_call(daemon: Daemon) -> None:
+    """`await asyncio.to_thread(...)` parks the cell on a future the daemon can put an interrupt on."""
+    daemon.send(
+        {"t": "execute", "id": "repl-tothr1", "code": "import asyncio, time\nawait asyncio.to_thread(time.sleep, 20)\nprint('finished')"}
+    )
+    time.sleep(1.0)
+    daemon.interrupt()
+
+    frame = daemon.wait_frame("exec_end", "repl-tothr1", timeout=10)
+    assert frame["status"] == "interrupted", f"the cell was not interrupted: {frame}"
+    assert frame["ename"] == "KeyboardInterrupt"
+    _, out = daemon.execute("print('usable')", exec_id="repl-tothr2")
+    assert "usable" in out
+
+
+def test_a_cell_that_installs_a_custom_sigint_handler_does_not_disable_interrupts(daemon: Daemon) -> None:
+    """R1-02 again, with a handler that returns instead of `SIG_IGN`."""
+    _, out = daemon.execute(
+        "import signal\nsignal.signal(signal.SIGINT, lambda *args: None)\nprint('handler installed')",
+        exec_id="repl-hand01",
+    )
+    assert "handler installed" in out
+
+    daemon.send({"t": "execute", "id": "repl-hand02", "code": "import time\nwhile True:\n    time.sleep(0.05)"})
+    time.sleep(0.8)
+    daemon.interrupt()
+    frame = daemon.wait_frame("exec_end", "repl-hand02", timeout=10)
+    assert frame["status"] == "interrupted", "a custom handler survived into the next cell"
+    assert "restored" in daemon.log_path.read_text()
+
+
+def test_a_cell_that_closes_its_python_streams_does_not_blind_the_channel(daemon: Daemon) -> None:
+    """`sys.stdout.close()` is not the same wound as `os.close(2)`: the stream object is gone too."""
+    daemon.execute("import sys\nsys.stdout.close()\nsys.stderr.close()", exec_id="repl-strm01")
+
+    _, out = daemon.execute("print('the channel can see output again')", exec_id="repl-strm02")
+    assert "output again" in out
+    assert daemon.proc.poll() is None
+
+
+def test_a_cell_that_redirects_its_streams_does_not_take_the_next_cells_output_with_it(daemon: Daemon) -> None:
+    """A redirect belongs to the cell that made it; the next cell starts with working streams."""
+    _, first = daemon.execute(
+        "import os\nnull = os.open('/dev/null', os.O_WRONLY)\nos.dup2(null, 1)\nos.dup2(null, 2)\nprint('sent to the void')",
+        exec_id="repl-redirect1",
+    )
+    assert "sent to the void" not in first
+
+    _, out = daemon.execute("print('back to the pipe')", exec_id="repl-redirect2")
+    assert "back to the pipe" in out
+
+
+def test_a_cell_that_leaves_sigint_pending_across_the_boundary_does_not_deafen_the_channel(
+    daemon: Daemon,
+) -> None:
+    """The racy variant of R1-03: the signal outlives the cell that raised it.
+
+    Blocking SIGINT and killing the process from inside a cell leaves it pending; it is delivered as
+    soon as the daemon unblocks it at the exec boundary, somewhere in the epilogue rather than in the
+    cell. Before the dispatch guard that ended the `serve` task and left the daemon alive and mute.
+    """
+    daemon.send(
+        {
+            "t": "execute",
+            "id": "repl-pend01",
+            "code": "import signal, os\nsignal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})\nos.kill(os.getpid(), signal.SIGINT)\nprint('raised while blocked')",
+        }
+    )
+    time.sleep(0.8)
+    assert daemon.proc.poll() is None, "a pending SIGINT killed the daemon"
+
+    # Where the interrupt lands depends on when the pending signal is delivered: in the epilogue, which
+    # reports the cell interrupted, or just after it, which the loop catches and carries on from.
+    frame = daemon.wait_frame("exec_end", "repl-pend01", timeout=10)
+    assert frame["status"] in ("ok", "interrupted"), frame
+    _, out = daemon.execute("print('answered after a pending SIGINT')", exec_id="repl-pend02")
+    assert "answered" in out
+
+
+def test_a_cell_that_closes_the_daemons_own_descriptors_ends_the_channel_cleanly(daemon: Daemon) -> None:
+    """The protocol and capture descriptors are only safe from user code up to a point.
+
+    A cell can close everything the daemon holds. What it must not be able to do is leave a process
+    that is alive, holds the channel, and can never answer again: the daemon notices it cannot talk
+    and exits, so the host's death path reports the truth instead of waiting out a timeout.
+    """
+    daemon.send(
+        {
+            "t": "execute",
+            "id": "repl-closefd",
+            "code": "import os\nfor fd in [int(x) for x in os.listdir('/proc/self/fd') if int(x) > 2]:\n    try:\n        os.close(fd)\n    except OSError:\n        pass\nprint('everything else is gone')",
+        }
+    )
+    code = daemon.wait_exit(timeout=20)
+    assert code is not None and code != 0, f"a daemon that cannot talk should exit, not hang (got {code})"

@@ -12,6 +12,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
 
@@ -99,6 +100,28 @@ describe("a process that outlives its cell", () => {
 
     const third = await run("print('CELL-THREE')", { channel: "c-orphan" });
     expect(text(third)).not.toContain("ORPHAN-");
+  });
+
+  it("R1-08: puts a flood from an orphan in the log of the cell that spawned it, and caps it", async () => {
+    // The same defect at volume: a process that streams forever must not grow host memory or a log
+    // without limit, and its bytes must not wander into whatever cell happens to run next.
+    const first = await run("import subprocess\nsubprocess.Popen(['bash', '-c', 'seq 1 100000'])\nprint('spawned a flood')", {
+      channel: "c-flood",
+    });
+    expect(text(first)).toContain("spawned a flood");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const logPath = join(ext.agentDir, "replmode", "exec", `${first.details.id}.log`);
+    const log = readFileSync(logPath, "utf8");
+    expect(log).toContain("\n20000\n");
+    expect(log, "the orphan's output is not attributed").toContain("after this cell ended");
+    expect(log.length, "the late output is not capped").toBeLessThan(512 * 1024);
+    expect(log).toContain("dropped");
+
+    const next = await run("print('CELL-TWO')", { channel: "c-flood" });
+    const shown = text(next);
+    expect(shown).toContain("CELL-TWO");
+    expect(shown, "the flood leaked into the next cell").not.toContain("99999");
   });
 });
 

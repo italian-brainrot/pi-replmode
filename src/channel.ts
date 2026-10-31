@@ -2,8 +2,9 @@
  * A channel: one daemon process, its two output streams, and the cells running on it.
  *
  * The host never kills a channel to end a cell — it sends SIGINT, which IPython turns into a
- * KeyboardInterrupt inside the cell and recovers from. Killing happens only when the whole channel
- * is being closed, and then it is a group kill, so anything the cell started dies with it.
+ * KeyboardInterrupt inside the cell and recovers from. Killing happens only when the whole channel is
+ * being closed, and then it always takes the process group down: a dev server, a build or a training
+ * loop started by a cell must not outlive the channel that made it.
  *
  * Output handling is the subtle part. Frame delivery (stdout) and output capture (stderr) are
  * separate pipes with no ordering between them, so an exec is finished only when *both* its
@@ -24,7 +25,7 @@ import { CaptureSplitter, type DaemonFrame, type ExecStatus, type HostFrame, par
 const ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
 /** Frame buffer ceiling: a runaway or desynced daemon must not exhaust the host's memory. */
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const READY_TIMEOUT_MS = 120_000;
+const DEFAULT_READY_TIMEOUT_MS = 120_000;
 /** How long a missing closing sentinel is tolerated before the exec is called finished anyway. */
 const SENTINEL_GRACE_MS = 750;
 /** How long an interrupt is given before an aborted call gives up and backgrounds the cell. */
@@ -35,6 +36,10 @@ const PARTIAL_PREVIEW_BYTES = 4096;
 const EXEC_RECORD_LIMIT = 100;
 /** Daemon `log` frames kept for context on a failed call. */
 const DAEMON_NOTE_LIMIT = 40;
+/** Capture seen before the first exec ever opened a block (daemon startup noise). */
+const LOOSE_MAX_BYTES = 64 * 1024;
+/** Capture attributed to an exec that had already ended: a thread or child that outlived the cell. */
+const LATE_MAX_BYTES = 256 * 1024;
 
 export type ReadyFrame = Extract<DaemonFrame, { t: "ready" }>;
 export type ExecEndFrame = Extract<DaemonFrame, { t: "exec_end" }>;
@@ -62,6 +67,10 @@ export class Exec {
   /** Set when the channel's process died underneath this exec. */
   deathNote?: string;
   outputTruncated = false;
+  /** Capture that arrived after this exec's block closed, and what was given up on. */
+  private lateBytes = 0;
+  private lateAnnounced = false;
+  private lateDropped = 0;
 
   readonly done: Promise<void>;
   private settle: (() => void) | undefined;
@@ -90,6 +99,54 @@ export class Exec {
       writeSync(this.logFd, chunk);
     } catch {
       // A full disk or a deleted log must not cost the cell its output.
+    }
+  }
+
+  /**
+   * Capture that arrives after this exec's block closed.
+   *
+   * Those bytes come from something the cell started — a thread finishing a line, a `Popen` nobody
+   * waited for — so they belong to this exec's log and never to the block of a later cell. The volume
+   * is capped: a process that streams forever must not grow a log without end.
+   */
+  lateWrite(chunk: Buffer): void {
+    if (this.lateBytes >= LATE_MAX_BYTES) {
+      // Already at the cap: count what is given up on, but do not narrate every chunk after it.
+      this.lateDropped += chunk.length;
+      return;
+    }
+    this.lateBytes += chunk.length;
+    if (!this.lateAnnounced) {
+      this.lateAnnounced = true;
+      this.appendToFile(Buffer.from("\n[output that arrived after this cell ended]\n", "utf8"));
+    }
+    const room = LATE_MAX_BYTES - (this.lateBytes - chunk.length);
+    if (chunk.length > room) {
+      this.appendToFile(chunk.subarray(0, room));
+      this.lateDropped += chunk.length - room;
+      this.appendToFile(Buffer.from(`\n[... ${this.lateDropped} bytes of further output dropped ...]\n`, "utf8"));
+      this.lateDropped = 0;
+    } else {
+      this.appendToFile(chunk);
+    }
+  }
+
+  /** Append to the log after it was closed, without keeping the descriptor open. */
+  private appendToFile(chunk: Buffer): void {
+    let fd: number | undefined;
+    try {
+      fd = openSync(this.logPath, "a");
+      writeSync(fd, chunk);
+    } catch {
+      // Same rule as `write`: losing the log must not cost the call anything.
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Already gone.
+        }
+      }
     }
   }
 
@@ -143,7 +200,10 @@ export class Exec {
   finalize(): void {
     if (this.settled) return;
     if (this.graceTimer) clearTimeout(this.graceTimer);
-    if (this.frame) this.status = this.frame.status;
+    // A process that died underneath the cell outranks whatever the `exec_end` frame claims: a daemon
+    // that gets as far as the frame on its way out would otherwise report an ordinary success.
+    if (this.deathNote || this.channel.closed) this.status = "dead";
+    else if (this.frame) this.status = this.frame.status;
     else if (this.status === "running") this.status = "dead";
     this.finishedAt = Date.now();
     this.closeLog();
@@ -181,7 +241,11 @@ export class Channel {
   private readonly splitter: CaptureSplitter;
   private frameBuffer = "";
   private loose: Buffer[] = [];
+  private looseBytes = 0;
+  private looseDropped = 0;
   private sink: Exec | null = null;
+  /** The exec whose closing boundary we saw last: the producer of any late capture bytes. */
+  private lastClosed?: Exec;
   private lock: Promise<unknown> = Promise.resolve();
   private readonly daemonNotes: string[] = [];
   private readySettle: (frame: ReadyFrame) => void = () => {};
@@ -207,7 +271,7 @@ export class Channel {
 
     this.splitter = new CaptureSplitter(
       (chunk) => this.writeToSink(chunk),
-      (id) => this.onBoundary(id),
+      (id, marker) => this.onBoundary(id, marker),
     );
     this.attach(proc);
   }
@@ -216,6 +280,14 @@ export class Channel {
 
   private attach(proc: ChildProcess): void {
     proc.stdout?.on("data", (chunk: Buffer) => this.onFrameBytes(chunk));
+    proc.stdout?.on("end", () => {
+      // The write end of the protocol pipe is gone, so no frame can ever arrive again — a cell that
+      // closed the descriptor leaves a daemon that is alive but mute. Declare the channel over, but
+      // give the exit event a moment to report the real reason first.
+      if (this.closed) return;
+      const timer = setTimeout(() => this.onExit(null, null, "closed its protocol stream without exiting"), 500);
+      timer.unref?.();
+    });
     proc.stderr?.on("data", (chunk: Buffer) => this.splitter.push(chunk));
     proc.stdin?.on("error", () => {
       // EPIPE the moment the daemon dies; the exit handler reports what actually happened.
@@ -278,31 +350,56 @@ export class Channel {
   }
 
   private writeToSink(chunk: Buffer): void {
-    if (this.sink) this.sink.write(chunk);
-    else this.loose.push(chunk);
+    if (this.sink) {
+      this.sink.write(chunk);
+      return;
+    }
+    // Nothing is writing into a block. Since the last block closed, the capture stream has been
+    // written by whatever the previous cell left behind, so that is whose log it goes to: presenting
+    // it as the next cell's output would be a lie, and dropping it silently would be worse.
+    if (this.lastClosed) {
+      this.lastClosed.lateWrite(chunk);
+      return;
+    }
+    // Startup noise: it belongs to the first block that opens.
+    this.loose.push(chunk);
+    this.looseBytes += chunk.length;
+    while (this.looseBytes > LOOSE_MAX_BYTES && this.loose.length > 0) {
+      const oldest = this.loose.shift()!;
+      this.looseBytes -= oldest.length;
+      this.looseDropped += oldest.length;
+    }
   }
 
-  private onBoundary(id: string): void {
+  private onBoundary(id: string, marker: Buffer): void {
     const exec = id ? this.execs.get(id) : undefined;
     if (!exec) {
-      // A marker from an exec this host forgot, or a false positive in the output. Put the following
-      // bytes in no block rather than guessing at which one they belong to.
-      this.sink = null;
+      // A marker this host has no record of — a false positive from a program that printed the byte
+      // sequence, or a marker from an exec some other host forgot. It is data: put the bytes back
+      // where they came from rather than closing a block or silencing the cell that follows.
+      this.note(`boundary marker for ${id || "an unreadable id"} is not one of ours: kept as output`);
+      this.writeToSink(marker);
       return;
     }
     if (!exec.blockOpen) {
       exec.blockOpen = true;
       this.sink = exec;
-      // Capture that arrived with no block open (startup warnings, a previous cell's late thread
-      // output) is attached to the block that follows it, so it is never invisible.
+      // Capture that arrived before any block was open (daemon startup noise, a warning at import)
+      // is attached to the block that follows it, so it is never invisible.
       if (this.loose.length > 0) {
+        if (this.looseDropped > 0) {
+          exec.write(Buffer.from(`\n[... ${this.looseDropped} bytes of earlier output dropped ...]\n`, "utf8"));
+          this.looseDropped = 0;
+        }
         exec.write(Buffer.concat(this.loose));
         this.loose = [];
+        this.looseBytes = 0;
       }
       return;
     }
     this.sink = null;
     exec.blockClosed = true;
+    this.lastClosed = exec;
     exec.considerSettle();
   }
 
@@ -313,8 +410,11 @@ export class Channel {
     this.deathNote = `the Python process behind channel "${this.name}" ended (${how})`;
     this.flushLoose();
     for (const exec of this.execs.values()) {
+      // Every exec in the channel shares the process that just went away, including one that had
+      // already finished: an `exec_end` that arrived seconds before the death still means the
+      // channel is over, and a result built now has to say so.
+      exec.deathNote ??= this.deathNote;
       if (exec.settled) continue;
-      exec.deathNote = this.deathNote;
       if (exec.status === "running") exec.status = exec.killRequested ? "interrupted" : "dead";
       exec.finalize();
     }
@@ -409,15 +509,16 @@ export class Channel {
     try {
       const outcome = await Promise.race(racers);
 
-      // Settled one way or another: a frame means the cell finished, its absence means the channel died.
-      if (exec.settled) return exec.frame ? "finished" : "dead";
+      // Settled one way or another: a frame means the cell finished, but a channel that died
+      // underneath it means the call is not a success however tidy the frame looks.
+      if (exec.settled) return exec.frame && !exec.deathNote ? "finished" : "dead";
 
       if (outcome === "abort") {
         this.interrupt();
         const grace = sleep(INTERRUPT_GRACE_MS);
         await Promise.race([exec.done, grace.promise]);
         grace.cancel();
-        if (exec.settled) return exec.frame ? "finished" : "dead";
+        if (exec.settled) return exec.frame && !exec.deathNote ? "finished" : "dead";
         // The cell ignored the interrupt. Leave it running rather than kill the channel: that is the
         // caller's decision, and killing loses every variable in it.
         exec.backgrounded = true;
@@ -477,23 +578,33 @@ export class Channel {
 
   // ── Teardown ───────────────────────────────────────────────────────────────
 
-  /** Ask the daemon to exit, then take its process group with it if it does not. */
+  /**
+   * Ask the daemon to exit, then take its whole process group down.
+   *
+   * The daemon answers `shutdown` and goes promptly, but its cells' children do not: a dev server, a
+   * build, or a training loop keeps running in the same process group after the channel is gone,
+   * holding the port and the CPU that made the channel worth killing in the first place. So the group
+   * is always taken down, whether the daemon cooperated or not.
+   */
   async close(graceMs = 3000): Promise<void> {
-    if (this.closed) return;
-    try {
-      this.send({ t: "shutdown" });
-    } catch {
-      // Already dying.
-    }
     const exited = this.exitPromise();
-    const first = sleep(graceMs);
-    await Promise.race([exited, first.promise]);
-    first.cancel();
-    if (this.closed) return;
-    this.killGroup("SIGTERM");
-    const second = sleep(1500);
-    await Promise.race([exited, second.promise]);
-    second.cancel();
+    if (!this.closed) {
+      try {
+        this.send({ t: "shutdown" });
+      } catch {
+        // Already dying.
+      }
+      const first = sleep(graceMs);
+      await Promise.race([exited, first.promise]);
+      first.cancel();
+      if (!this.closed) {
+        this.killGroup("SIGTERM");
+        const second = sleep(1500);
+        await Promise.race([exited, second.promise]);
+        second.cancel();
+      }
+    }
+    // A process group outlives its leader, so anything still in it is reachable here.
     this.killGroup("SIGKILL");
   }
 
@@ -503,12 +614,17 @@ export class Channel {
   }
 
   private killGroup(signal: NodeJS.Signals): void {
-    for (const target of [-this.pid, this.pid]) {
+    try {
+      process.kill(-this.pid, signal);
+      return;
+    } catch {
+      // The group is gone. Only the leader could still be, and only if it has not been reaped.
+    }
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
       try {
-        process.kill(target, signal);
-        return;
+        process.kill(this.pid, signal);
       } catch {
-        // The group may be gone while the leader lives on, or vice versa.
+        // Already gone.
       }
     }
   }
@@ -520,6 +636,18 @@ export class Channel {
 }
 
 // ── Starting a channel ───────────────────────────────────────────────────────
+
+/**
+ * How long a daemon gets to report `ready`. Overridable (`PI_REPLMODE_READY_TIMEOUT_MS`, capped) so
+ * the "started but never became ready" path can be tested without waiting two minutes.
+ */
+function readyTimeout(): number {
+  const raw = process.env.PI_REPLMODE_READY_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_READY_TIMEOUT_MS;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_READY_TIMEOUT_MS;
+  return Math.min(value, 600_000);
+}
 
 export async function startChannel(start: ChannelStart): Promise<Channel> {
   ensureDirs();
@@ -545,12 +673,13 @@ export async function startChannel(start: ChannelStart): Promise<Channel> {
     ),
   );
 
-  const timeout = sleep(READY_TIMEOUT_MS);
+  const readyTimeoutMs = readyTimeout();
+  const timeout = sleep(readyTimeoutMs);
   try {
     const ready = await Promise.race([
       channel.readyPromise,
       timeout.promise.then(() => {
-        throw new Error(`the channel daemon did not report ready within ${READY_TIMEOUT_MS / 1000}s`);
+        throw new Error(`the channel daemon did not report ready within ${readyTimeoutMs / 1000}s`);
       }),
     ]);
     channel.ready = ready;

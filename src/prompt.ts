@@ -40,7 +40,8 @@ export function lostChannelsLines(notes: HistoryNote[]): string[] {
     "",
     "These channels ran in an earlier pi process and are gone now — their variables were lost:",
     ...notes.map(
-      (note) => `  ${note.channel}: last cell ${note.status} in ${formatDuration(note.elapsed)} \u2014 ${note.code}${definitionHint(note)}`,
+      (note) =>
+        `  ${note.channel}: last cell ${note.status} in ${formatDuration(note.elapsed)} \u2014 ${note.code}${definitionHint(note)}${tornHint(note)}`,
     ),
     "Nothing from that listing is bound; re-create what you need instead of assuming it is there.",
   ];
@@ -51,6 +52,11 @@ function definitionHint(note: HistoryNote): string {
   const shown = note.definitions.slice(0, 6).join(", ");
   const more = note.definitions.length > 6 ? `, +${note.definitions.length - 6} more` : "";
   return ` (defined: ${shown}${more})`;
+}
+
+/** The history file was cut off after this record; say so instead of pretending it is the newest. */
+function tornHint(note: HistoryNote): string {
+  return note.torn ? ` (+${note.torn} unreadable record${note.torn > 1 ? "s" : ""} after it)` : "";
 }
 
 export function renderSection(notes: HistoryNote[]): string {

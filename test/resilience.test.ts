@@ -119,4 +119,19 @@ describe("killing a channel", () => {
     const tasks: { id: string; status: string }[] = waited.details.tasks ?? [];
     expect(tasks.find((task) => task.id === cell.details.id)?.status).toBe("dead");
   });
+
+  it("R1-10: takes the same processes down at session shutdown, not only on an explicit kill", async () => {
+    // `PI_REPLMODE_KEEP_RUNNING=0` and a quit are documented to leave nothing running behind.
+    const pidFile = `${ext.agentDir}/quit-child.pid`;
+    await run(
+      `import subprocess\nchild = subprocess.Popen(['bash','-c','sleep 60'], stdin=subprocess.DEVNULL)\nopen(${JSON.stringify(pidFile)},'w').write(str(child.pid))\nprint('spawned for the quit path')`,
+      { channel: "r-quitkids", timeout: 15 },
+    );
+    await waitFor(() => existsSync(pidFile), 15_000, "the cell to record its child's pid");
+    const childPid = Number(readFileSync(pidFile, "utf8"));
+    expect(isPidAlive(childPid)).toBe(true);
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    await waitFor(() => !isPidAlive(childPid), 10_000, "the cell's child to die with the session");
+  });
 });

@@ -89,6 +89,36 @@ describe("lost channels", () => {
     expect(await section()).not.toContain("live");
   });
 
+  it("R1-13: still reports a channel whose newest history record was torn by a crash", async () => {
+    // An append that a crash cut short leaves a half-written last line. Reading only the last line
+    // used to drop the channel from the note entirely, and the next record written to the file was
+    // glued onto the torn one and became unreadable too.
+    const path = join(historyDir(), "torn.jsonl");
+    const intact = JSON.stringify({
+      ts: "2026-01-01T00:00:00.000Z",
+      id: "repl-torn001",
+      channel: "torn",
+      status: "completed",
+      elapsed: 1.5,
+      code: "half_built = load_thing()",
+      definitions: ["half_built"],
+    });
+    writeFileSync(path, `${intact}\n{"ts": "2026-01-02T00:00:00.000Z", "id": "repl-torn002", "chan`, "utf8");
+
+    await ext.emit({ type: "session_start", reason: "startup" }, { hasUI: true });
+    const shown = await section();
+    expect(shown, "a torn record lost the channel from the note").toContain("torn");
+    expect(shown).toContain("half_built");
+    expect(shown).toContain("unreadable record");
+
+    // And the file is sealed before the next record is appended, so the newest one still parses.
+    await ext.callTool("run", { code: "torn_fixed = 1", channel: "torn" });
+    const lines = readFileSync(path, "utf8").trim().split("\n");
+    const newest = JSON.parse(lines.at(-1)!);
+    expect(newest.code).toContain("torn_fixed");
+    expect(newest.status).toBe("completed");
+  });
+
   it("keeps the history file bounded so a long session cannot grow it without limit", async () => {
     const path = join(historyDir(), "big.jsonl");
     const filler = "x".repeat(200);
