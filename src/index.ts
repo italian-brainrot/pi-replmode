@@ -97,7 +97,7 @@ export default function (pi: ExtensionAPI): void {
       "Pass a longer `timeout` only for work you expect to take that long; a cell that outlives its timeout moves to the background and blocks its channel.",
       "Use separate channels for independent long-running work; one channel runs one cell at a time.",
       "Channels are capped: at the cap the idlest one is retired with its variables, and if they are all busy a new channel is refused. Keep the count to what you need.",
-      "`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started.",
+      "`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started, except any that moved into a process group of their own.",
     ],
 
     async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<ReplResult> {

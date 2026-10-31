@@ -104,6 +104,28 @@ describe("the file names a channel name becomes", () => {
     ).not.toBe(stem);
   });
 
+  it("R3-03: and no stem this function produced is a name it would keep verbatim", () => {
+    // The rule that makes the mapping injective is that a name which already looks digested never keeps
+    // it. Checked over the names a session uses, over the stems they become, and over the stems of those
+    // stems — a stem is exactly the string a model may copy back into `channel`, and none of them may
+    // land on the same file or map to itself.
+    const names = ["main", "a/b", "a_b", "r3-dig/x", "x".repeat(40), "work-2", "notes/live", "-r3-dash", "a-b_C9"];
+    const stems = names.map((name) => channelFileStem(name));
+    const digested = stems.filter((stem) => /-[0-9a-f]{10}$/.test(stem));
+    expect(digested.length, "none of these names got a digest, so the test is not testing anything").toBeGreaterThan(0);
+
+    for (const stem of digested) {
+      expect(channelFileStem(stem), `the stem "${stem}" is a fixed point of the mapping`).not.toBe(stem);
+    }
+    const all = [...stems, ...digested.map((stem) => channelFileStem(stem))];
+    const collisions = all.filter((entry, index) => all.indexOf(entry) !== index);
+    expect(collisions, `two of these names collapse onto one file name: ${collisions.join(", ")}`).toEqual([]);
+    for (const entry of all) {
+      expect(entry, `a stem is not a plain file name: ${entry}`).toMatch(/^[a-zA-Z0-9_-]+$/);
+      expect(entry.length, `a stem is longer than the 60 characters any stem must fit in: ${entry}`).toBeLessThanOrEqual(60);
+    }
+  });
+
   it("R3-03: keeps the history of two such channels apart, so neither is forgotten", async () => {
     const crafted = channelFileStem("r3-own/x");
 
@@ -137,8 +159,53 @@ describe("a channel name that looks like a command-line option", () => {
     const ext = await fresh();
     const result = await ext.callTool("run", { code: "print('dash channel works')", channel: "-r3-dash" });
     const shown = text(result);
-    expect(result.isError, `a channel named "-r3-dash" cannot be created: ${shown}`).toBe(false);
+    // `toBeUndefined`, not `toBe(false)`: the tool's contract, pinned green by background.test.ts, is that
+    // a successful result carries no `isError` at all (pi: "if provided, replaces the tool result error
+    // flag"). Argued in "One test changed (pass 3 fixes)" in docs/AUDIT.md.
+    expect(result.isError, `a channel named "-r3-dash" cannot be created: ${shown}`).toBeUndefined();
     expect(shown).toContain("dash channel works");
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    ext.dispose();
+  });
+
+  it("R3-02: and so do the names that are whole options", async () => {
+    // `--channel=-x` and `--channel=--help` are one token each, so argparse cannot mistake the value for
+    // another option. `--help` is the nastiest case: as a separate token it makes the daemon print its
+    // usage onto the protocol fd and exit 0, which the host reads as a daemon speaking nonsense.
+    const ext = await fresh();
+    for (const name of ["-x", "--help", "-"]) {
+      const result = await ext.callTool("run", { code: "print('started anyway')", channel: name });
+      const shown = text(result);
+      expect(result.isError, `a channel named ${JSON.stringify(name)} cannot be created: ${shown}`).toBeUndefined();
+      expect(shown, `a channel named ${JSON.stringify(name)} did not run the cell: ${shown}`).toContain("started anyway");
+    }
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    ext.dispose();
+  });
+});
+
+describe("a channel name that is not a sane length", () => {
+  it("F3-02: is refused, because the name is kept and quoted for ever", async () => {
+    // Fixer hardening in the class of R3-01: a channel name is not only a file name, it is pasted into
+    // every result about that channel and, through the history file, into the prompt section of every
+    // later session — where it is paid for on every request. Refusing is cheaper than quoting it.
+    const ext = await fresh();
+    const huge = `n${"z".repeat(500)}`;
+    const result = await ext.callTool("run", { code: "print(1)", channel: huge });
+    expect(result.isError, `a ${huge.length}-character channel name was accepted`).toBe(true);
+    expect(text(result), `the refusal does not say what is wrong: ${text(result)}`).toContain("channel name");
+
+    // Nothing about that name was written anywhere a later session would have to carry.
+    await ext.emit({ type: "session_start", sessionId: "f3-02-name" }, { hasUI: true });
+    const shown = await section(ext);
+    expect(shown, "a refused channel name reached the prompt section").not.toContain("zzzz");
+
+    // A name that is merely long is still fine — this is a guard, not a rename of the feature.
+    const long = `n${"w".repeat(150)}`;
+    const ok = await ext.callTool("run", { code: "print('a long name works')", channel: long });
+    expect(text(ok)).toContain("a long name works");
 
     await ext.emit({ type: "session_shutdown", reason: "quit" });
     ext.dispose();

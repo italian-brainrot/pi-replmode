@@ -17,10 +17,10 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { PythonEnv } from "./env.ts";
-import { MAX_READ_BYTES, type Truncation, truncateMiddle } from "./format.ts";
+import { MAX_READ_BYTES, oneLine, type Truncation, truncateMiddle } from "./format.ts";
 import { channelFileStem } from "./names.ts";
 import { DAEMON_LOG_DIR, EXEC_LOG_DIR, ensureDirs, IPYTHON_DIR, PYTHON_PACKAGE_DIR } from "./paths.ts";
 import { CaptureSplitter, type DaemonFrame, type ExecStatus, type HostFrame, parseFrame, stripSentinels } from "./wire.ts";
@@ -47,6 +47,18 @@ const DAEMON_NOTE_LIMIT = 40;
 const LOOSE_MAX_BYTES = 64 * 1024;
 /** Capture attributed to an exec that had already ended: a thread or child that outlived the cell. */
 const LATE_MAX_BYTES = 256 * 1024;
+/** How much of one daemon `log` frame the host keeps: the ring is bounded by count *and* by bytes (R3-01). */
+const DAEMON_NOTE_CHARS = 500;
+
+/** Header for capture that reached an exec's log after that exec's block had closed. */
+const LATE_OUTPUT_HEADER = "\n[output that arrived after this cell ended: from something the channel left running, not from a cell]\n";
+/**
+ * Header for capture that arrived before *any* block opened, parked in the log of the only exec there
+ * is. It is not late output of that cell and must not be labelled as such: no cell had run yet when
+ * these bytes were written (R3-10).
+ */
+const STARTUP_OUTPUT_HEADER =
+  "\n[output that arrived before any cell's output block opened: from the channel starting up, not from this cell]\n";
 
 export type ReadyFrame = Extract<DaemonFrame, { t: "ready" }>;
 export type ExecEndFrame = Extract<DaemonFrame, { t: "exec_end" }>;
@@ -116,7 +128,7 @@ export class Exec {
    * waited for — so they belong to this exec's log and never to the block of a later cell. The volume
    * is capped: a process that streams forever must not grow a log without end.
    */
-  lateWrite(chunk: Buffer): void {
+  lateWrite(chunk: Buffer, header: string = LATE_OUTPUT_HEADER): void {
     if (this.lateBytes >= LATE_MAX_BYTES) {
       // Already at the cap: count what is given up on, but do not narrate every chunk after it.
       this.lateDropped += chunk.length;
@@ -128,9 +140,7 @@ export class Exec {
       // Careful with this wording: the exec this lands in is the one whose block closed last, which is
       // the most likely producer but not a proven one — an orphan that keeps writing wanders into later
       // execs' logs too. Say whose log it is, not what caused it (R2-07).
-      this.appendToFile(
-        Buffer.from("\n[output that arrived after this cell ended: from something the channel left running, not from a cell]\n", "utf8"),
-      );
+      this.appendToFile(Buffer.from(header, "utf8"));
     }
     const room = LATE_MAX_BYTES - (this.lateBytes - chunk.length);
     if (chunk.length > room) {
@@ -262,7 +272,6 @@ export class Channel {
   private readonly splitter: CaptureSplitter;
   private frameBuffer = "";
   private loose: Buffer[] = [];
-  private looseBytes = 0;
   private looseDropped = 0;
   private sink: Exec | null = null;
   /** The exec whose closing boundary we saw last: the producer of any late capture bytes. */
@@ -398,12 +407,9 @@ export class Channel {
     }
     // Startup noise: it belongs to the first block that opens.
     this.loose.push(chunk);
-    this.looseBytes += chunk.length;
-    while (this.looseBytes > LOOSE_MAX_BYTES && this.loose.length > 0) {
-      const oldest = this.loose.shift()!;
-      this.looseBytes -= oldest.length;
-      this.looseDropped += oldest.length;
-    }
+    const kept = keepNewest(this.loose, LOOSE_MAX_BYTES);
+    this.loose = kept.chunks;
+    this.looseDropped += kept.dropped;
   }
 
   private onBoundary(id: string, marker: Buffer): void {
@@ -428,7 +434,6 @@ export class Channel {
         }
         exec.write(Buffer.concat(this.loose));
         this.loose = [];
-        this.looseBytes = 0;
       }
       return;
     }
@@ -482,10 +487,55 @@ export class Channel {
     this.startFailureReported = true;
     const parts = [this.deathNote, this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined, this.startupOutput()];
     // The whole answer still has to fit the tool's limit, and a broken interpreter can write a great
-    // deal before it dies: keep the head and the tail, and send the model to the daemon's log for the
+    // deal before it dies: keep the head and the tail, and send the model to a file for the
     // rest. Tail-heavy, because the line that says *why* is at the end of a traceback.
     const said = truncateMiddle(parts.filter((part): part is string => Boolean(part?.trim())).join("\n"), START_FAILURE_MAX_CHARS, 0.35);
-    this.readyFail(new Error(said.truncated ? `${said.text}\n[the daemon's full output is in ${this.daemonLogPath}]` : said.text));
+    if (!said.truncated) {
+      this.readyFail(new Error(said.text));
+      return;
+    }
+    // The pointer used to name the daemon's own log file, and that was wrong twice over: an interpreter
+    // that died before `python -m replmode` ran never opened it, and even when it exists the log holds
+    // `log` frames, never the capture stream where the complaint arrived. So the host writes what it did
+    // receive into that path, and the file the answer sends the model to has the bytes (R3-07).
+    const written = this.writeFailedStartOutput();
+    if (!written) {
+      this.readyFail(new Error(`${said.text}\n[the rest of the daemon's output was dropped and could not be saved]`));
+      return;
+    }
+    const dropped =
+      this.looseDropped > 0
+        ? `\n[${this.looseDropped} bytes from the middle of that output were dropped and are not in that file either]`
+        : "";
+    this.readyFail(new Error(`${said.text}\n[the daemon's full output is in ${written}]${dropped}`));
+  }
+
+  /**
+   * Park the output of a channel that never came up somewhere the start-failure report can point at.
+   *
+   * Only for a daemon that never reported `ready`: once a channel ran, that path is the daemon's own log
+   * and these bytes are a cell's capture, which belongs in the exec log instead.
+   */
+  private writeFailedStartOutput(): string | undefined {
+    if (this.ready !== undefined) return undefined;
+    const capture = Buffer.concat(this.loose).toString("utf8");
+    const parts: string[] = [];
+    if (this.looseDropped > 0) {
+      parts.push(`[... ${this.looseDropped} bytes from the middle of this output were dropped before they reached the host ...]\n`);
+    }
+    if (this.fatalNote) parts.push(`[the daemon reported a fatal error]\n${this.fatalNote}\n`);
+    if (parts.length === 0 && !capture.trim()) return undefined;
+    try {
+      ensureDirs();
+      appendFileSync(
+        this.daemonLogPath,
+        `\n[pi-replmode: output from the channel "${this.name}" process that failed to start (pid ${this.pid})]\n${parts.join("")}${capture}\n`,
+        "utf8",
+      );
+      return this.daemonLogPath;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Capture that arrived while no block was open, as text: a daemon that dies at startup leaves its
@@ -507,14 +557,18 @@ export class Channel {
     // `startupOutput()` can still report what the interpreter said (R2-06).
     if (!last) return;
     this.loose = [];
-    this.looseBytes = 0;
     // Late capture, so it goes in through the path that appends to a closed log and counts against its
     // cap — `Exec.write` no-ops once the descriptor is gone, which used to drop these bytes (R2-06).
-    last.lateWrite(trailing);
+    // With the *startup* header: these bytes arrived before any block opened, so the late-output
+    // wording would invent a cell that never ran (R3-10).
+    last.lateWrite(trailing, STARTUP_OUTPUT_HEADER);
   }
 
   private note(text: string): void {
-    this.daemonNotes.push(text);
+    // Bounded by count *and* by bytes: a `log` frame is text the daemon (and therefore a cell) chooses,
+    // and a dead channel's result pastes the last few of them — a ring of 40 unbounded strings is both
+    // a memory hole and a way for one cell to blow the answer limit (R3-01).
+    this.daemonNotes.push(oneLine(text, DAEMON_NOTE_CHARS));
     if (this.daemonNotes.length > DAEMON_NOTE_LIMIT) this.daemonNotes.shift();
   }
 
@@ -732,7 +786,16 @@ export async function startChannel(start: ChannelStart): Promise<Channel> {
     start,
     spawn(
       start.env.python,
-      ["-m", "replmode", "--channel", start.name, "--log", join(DAEMON_LOG_DIR, `${channelFileStem(start.name)}.log`), "--cwd", start.cwd],
+      // Each option and its value in one token: a channel name is model-chosen, and argparse reads
+      // `--channel -x` as an option with a missing value, so a name starting with a dash could never
+      // start a channel and `--help` printed onto the protocol fd (R3-02).
+      [
+        "-m",
+        "replmode",
+        `--channel=${start.name}`,
+        `--log=${join(DAEMON_LOG_DIR, `${channelFileStem(start.name)}.log`)}`,
+        `--cwd=${start.cwd}`,
+      ],
       {
         cwd: start.cwd,
         // Its own process group: Ctrl-C in the terminal belongs to pi, and closing a channel takes
@@ -818,6 +881,33 @@ export function readTail(path: string, maxBytes: number): string {
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Keep the newest `cap` bytes of buffered capture, dropping from the front.
+ *
+ * The buffer used to drop whole chunks, so a single chunk larger than the rest could evict everything
+ * and leave it empty — a chatty broken interpreter lost nearly all of its own complaint, and which bytes
+ * survived depended on how node happened to slice the pipe. Trimming inside the oldest kept chunk keeps
+ * exactly the newest `cap` bytes, which is where the line saying *why* a daemon died is (R3-07).
+ */
+export function keepNewest(chunks: Buffer[], cap: number): { chunks: Buffer[]; bytes: number; dropped: number } {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.length;
+  if (total <= cap) return { chunks, bytes: total, dropped: 0 };
+
+  const dropped = total - cap;
+  const kept: Buffer[] = [];
+  let skip = dropped;
+  for (const chunk of chunks) {
+    if (chunk.length <= skip) {
+      skip -= chunk.length;
+      continue;
+    }
+    kept.push(skip > 0 ? chunk.subarray(skip) : chunk);
+    skip = 0;
+  }
+  return { chunks: kept, bytes: cap, dropped };
+}
 
 export function newExecId(taken: Map<string, Exec>): string {
   let id: string;

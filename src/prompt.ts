@@ -8,10 +8,13 @@
  * previous session are gone" note belongs.
  */
 
-import { formatDuration } from "./format.ts";
+import { formatDuration, oneLine } from "./format.ts";
 import type { HistoryNote } from "./manager.ts";
 
 export const SECTION_NAME = "replmode";
+
+/** How much of a remembered name the section quotes (R3-01). */
+const DEFINITION_HINT_NAME_CHARS = 60;
 
 /** The stable part: what the REPL is and what the contract around it is. */
 export const SECTION_LINES: string[] = [
@@ -28,8 +31,9 @@ export const SECTION_LINES: string[] = [
   "- A cell that passes its `timeout` is not killed: it keeps running in the background, you get a task ID",
   "  and a log path, and its channel is busy. `bg_wait` waits for any task and lists them all; `bg_stop`",
   "  interrupts one with SIGINT, which ends the cell and keeps the channel's variables. `bg_stop` with",
-  "  `kill: true` takes the whole channel down instead — that also ends the servers, builds and subprocesses",
-  "  its cells started, and loses every variable in it.",
+  "  `kill: true` takes the whole channel down instead: it ends the servers, builds and subprocesses in",
+  "  the process group it kills (a child that left that group survives), and it loses every variable",
+  "  in the channel.",
   "- Output over 50 000 characters is cut, head and tail kept; the whole text is written to a log file and",
   "  bound to a global like `_out_a91f0c` in that channel, so the next cell can slice it.",
   "- A cell that raises returns its traceback, and the channel keeps everything it had.",
@@ -52,7 +56,12 @@ export function lostChannelsLines(notes: HistoryNote[]): string[] {
 
 function definitionHint(note: HistoryNote): string {
   if (!note.definitions?.length) return "";
-  const shown = note.definitions.slice(0, 6).join(", ");
+  // Shortened where it is quoted: these names came out of a history file written by some earlier
+  // process, and this text goes out with every request of every later session (R3-01).
+  const shown = note.definitions
+    .slice(0, 6)
+    .map((name) => oneLine(name, DEFINITION_HINT_NAME_CHARS))
+    .join(", ");
   const more = note.definitions.length > 6 ? `, +${note.definitions.length - 6} more` : "";
   return ` (defined: ${shown}${more})`;
 }

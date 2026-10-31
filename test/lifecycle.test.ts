@@ -220,6 +220,43 @@ sys.exit(1)
     );
   });
 
+  it("R3-07: trims the startup buffer to its cap instead of dropping whole chunks", async () => {
+    // The buffer that holds capture from before the first block is 64 KB, and a broken interpreter can
+    // write far more than that. The host used to give up whole chunks, so an 80 KB complaint lost its
+    // first 40 KB and the model was told a bigger number than the loss it suffered. Two 40 KB writes,
+    // the first with a marker at byte 30 000: trimming keeps the last 64 KB and reports the bytes over
+    // the cap, and the marker survives. This is also the safe direction to pin it in — if the pipe
+    // happens to hand the bytes over in finer pieces, both versions keep the same bytes and this passes.
+    const first = `${"a".repeat(29_999)}MARKER-AT-30000${"a".repeat(9_985)}`;
+    const script = `import sys, time
+sys.stderr.write(${JSON.stringify(first)})
+sys.stderr.flush()
+time.sleep(0.3)
+sys.stderr.write("b" * 40_000)
+sys.stderr.write("\\nImportError: broken at the end\\n")
+sys.stderr.flush()
+sys.exit(1)
+`;
+    const result = await withStub("trim-the-buffer", script, {}, () => ext.callTool("run", { code: "print(1)", channel: "l-trim" }));
+    const shown = text(result);
+    expect(result.isError).toBe(true);
+    expect(shown, "the reason at the end of the complaint was cut away").toContain("ImportError: broken at the end");
+
+    const note = /(\d+) bytes from the middle of that output were dropped/.exec(shown);
+    expect(note, `the answer does not say how much was given up: ${shown.slice(-400)}`).not.toBeNull();
+    const dropped = Number(note![1]);
+    expect(
+      dropped,
+      `the host gave up ${dropped} bytes of an ${first.length + 40_030} byte complaint; only ${first.length + 40_030 - 65_536} are over the cap`,
+    ).toBeLessThan(20_000);
+
+    const pointer = /full output is in ([^\]]+)\]/.exec(shown)?.[1];
+    expect(pointer, "the answer says nothing about where the rest is").toBeTruthy();
+    const saved = readFileSync(pointer!, "utf8");
+    expect(saved, "the file the answer points at lost the part of the complaint that should have survived").toContain("MARKER-AT-30000");
+    expect(saved.length, "the saved output is not bounded by the buffer cap").toBeLessThan(70_000);
+  });
+
   it("R2-06: keeps the exit code when the complaint comes late, from something the daemon left behind", async () => {
     // `exit` can beat the last of the pipes, and a process the daemon spawned keeps the capture stream
     // open after the daemon is gone. The report is bounded by `STDIO_DRAIN_MS` on purpose; what must

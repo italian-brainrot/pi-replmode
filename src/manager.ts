@@ -48,6 +48,19 @@ const LISTING_MAX_TASKS = 30;
 const TRACEBACK_SHARE = 0.25;
 /** How much of an exception's own message is worth repeating when the traceback already carries it. */
 const EVALUE_CHARS = 500;
+/** An exception's *name* is cell-chosen too (`type("x" * 3000, (Exception,), {})`), so it is quoted short. */
+const ENAME_CHARS = 200;
+/** A channel name is quoted in results, in the history file, and in every later session's prompt. */
+const MAX_CHANNEL_NAME_CHARS = 200;
+/**
+ * What the notes quoting a cell's own names may cost. A Python identifier can be 4095 characters, and
+ * the names a cell bound are pasted into the result, into the history file, and from there into the
+ * prompt of every later session — so each copy has to be bounded where it is quoted (R3-01).
+ */
+const DEFINITION_NOTE_MAX = 25;
+const DEFINITION_NOTE_NAME_CHARS = 60;
+const HISTORY_DEFINITIONS_MAX = 20;
+const HISTORY_NAME_CHARS = 120;
 /** How long an interrupt is given before bg_stop reports the task as unresponsive. */
 const STOP_GRACE_MS = 5000;
 
@@ -190,13 +203,37 @@ export class ReplManager {
       .filter((channel) => !channel.current?.running)
       .sort((a, b) => a.lastUsed - b.lastUsed)
       .at(0);
-    if (!idlest) {
-      throw new ChannelCapacityError(
-        `all ${this.maxChannels} pi-replmode channels are busy and the cap (${this.maxChannels}, set with PI_REPLMODE_MAX_CHANNELS) is reached: ` +
-          "let a background task finish, stop one with bg_stop, or free a channel with bg_stop {kill: true}",
+    if (idlest) {
+      await this.shutdownChannel(idlest.name);
+      return;
+    }
+    throw this.capacityRefusal(live);
+  }
+
+  /**
+   * Why a new channel cannot be given a slot, in terms of what the model can do about it.
+   *
+   * The two refusals are different problems wearing the same sentence. With nothing running yet, the
+   * slots are held by daemons that have not reported `ready`, and there is no task for `bg_stop` to
+   * take — waiting is the only move. Saying "all N channels are busy" there points the model at a tool
+   * call that cannot work (R3-04).
+   */
+  private capacityRefusal(live: Channel[]): ChannelCapacityError {
+    const cap = `the cap (${this.maxChannels}, set with PI_REPLMODE_MAX_CHANNELS) is reached`;
+    const starting = [...this.starting.keys()];
+    const names = (list: string[]): string => list.map((name) => `"${name}"`).join(", ");
+
+    if (live.length === 0 && starting.length > 0) {
+      return new ChannelCapacityError(
+        `channel ${names(starting)} ${starting.length === 1 ? "is" : "are"} still starting and ${cap}: nothing is running yet, so there is no ` +
+          "task to stop and no idle channel to retire — wait for the call that is starting to finish, and try again then",
       );
     }
-    await this.shutdownChannel(idlest.name);
+    const alsoStarting = starting.length > 0 ? `; ${names(starting)} ${starting.length === 1 ? "is" : "are"} also still starting` : "";
+    return new ChannelCapacityError(
+      `all ${this.maxChannels} pi-replmode channels are busy and ${cap}: ` +
+        `let a background task finish, stop one with bg_stop, or free a channel with bg_stop {kill: true}${alsoStarting}`,
+    );
   }
 
   /** Close a channel and everything it started. Its variables go with it. */
@@ -224,6 +261,13 @@ export class ReplManager {
     if (!code.trim()) throw new Error("run: `code` is empty.");
     const timeoutSec = resolveTimeout(params.timeout);
     const channelName = (params.channel ?? "main").trim() || "main";
+    if (channelName.length > MAX_CHANNEL_NAME_CHARS) {
+      // One long name here is not just one long answer: it goes into the channel's history file and from
+      // there into the prompt section of every later session, where it is paid for on every request.
+      throw new Error(
+        `invalid channel name: ${channelName.length} characters. Keep it under ${MAX_CHANNEL_NAME_CHARS} — it names a channel, a log file and an IPython profile.`,
+      );
+    }
 
     let channel: Channel;
     try {
@@ -380,16 +424,24 @@ export class ReplManager {
 
     let varName: string | undefined;
     if (cut.truncated || traceback.truncated) {
-      // `countOutput` stops counting in very large logs, so say when the total is a floor.
-      const atLeast = totals?.partial ? "at least " : "";
+      // The full traceback goes into the log first, because it is not capture and the shortened copy in
+      // the result has to point at something that still holds it (R2-02).
+      if (traceback.truncated) exec.appendNote(`\n[full traceback for this cell]\n${tracebackRaw}\n`);
+      // Then the numbers are taken from the file the notes point at, after that append: the traceback is
+      // the one truncation that changes the log's size, and quoting the totals measured beforehand
+      // understates the file the model is sent to (R3-09). `countOutput` stops counting in very large
+      // logs, so say when the total is a floor.
+      const file = countOutput(exec.logPath);
+      const atLeast = file.partial ? "at least " : "";
+      const totalChars = Math.max(file.chars, cut.totalChars);
+      const totalLines = Math.max(file.lines, cut.totalLines);
       if (cut.truncated) {
         notes.push(
-          `output truncated: showing ${cut.headChars} of ${atLeast}${cut.totalChars} characters at the start and ${cut.tailChars} at the end ` +
-            `(${cut.shownLines} of ${atLeast}${cut.totalLines} lines)`,
+          `output truncated: showing ${cut.headChars} of ${atLeast}${totalChars} characters at the start and ${cut.tailChars} at the end ` +
+            `(${cut.shownLines} of ${atLeast}${totalLines} lines)`,
         );
       }
       if (traceback.truncated) {
-        exec.appendNote(`\n[full traceback for this cell]\n${tracebackRaw}\n`);
         // Head *and* tail, like the output note: the smoke test caught this one claiming only the head
         // was shown when the tail was on the page too.
         notes.push(
@@ -405,12 +457,13 @@ export class ReplManager {
         notes.push(`${what}: ${exec.logPath}`);
       }
     }
-    if (frame?.definitions?.length) notes.push(`defined by this cell: ${frame.definitions.join(", ")}`);
+    if (frame?.definitions?.length) notes.push(`defined by this cell: ${definitionList(frame.definitions)}`);
     if (notes.length > 0) blocks.push(notes.map((note) => `[${note}]`).join("\n"));
 
     const failed = status === "failed" || status === "interrupted" || status === "dead";
     const kept = cut.truncated || traceback.truncated || read.windowed || exec.backgrounded;
     const evalue = frame?.evalue ? oneLine(frame.evalue, EVALUE_CHARS) : null;
+    const ename = frame?.ename ? oneLine(frame.ename, ENAME_CHARS) : null;
 
     return {
       content: [{ type: "text", text: blocks.join("\n\n") }],
@@ -424,7 +477,7 @@ export class ReplManager {
         ...(varName ? { varName } : {}),
         ...(kept ? { logPath: exec.logPath, fullOutputPath: exec.logPath } : {}),
         ...(frame?.definitions?.length ? { definitions: frame.definitions } : {}),
-        ...(frame?.ename ? { ename: frame.ename, evalue } : {}),
+        ...(frame?.ename ? { ename, evalue } : {}),
       },
       structuredContent: {
         status,
@@ -434,7 +487,7 @@ export class ReplManager {
         ...(kept ? { full_output_path: exec.logPath } : {}),
         ...(varName ? { variable: varName } : {}),
         elapsed_seconds: round(exec.elapsed),
-        ...(frame?.ename ? { error: { ename: frame.ename, evalue: evalue ?? "" } } : {}),
+        ...(frame?.ename ? { error: { ename: ename ?? "", evalue: evalue ?? "" } } : {}),
       },
       ...(failed ? { isError: true } : {}),
     };
@@ -484,7 +537,9 @@ export class ReplManager {
       cut.text.trim() || "(no output)",
       `[${exec.deathNote ?? "the channel's Python process ended"}]`,
       ...(cut.truncated ? [`[output truncated: the whole capture is in ${exec.logPath}]`] : []),
-      ...(notes.length > 0 ? [`daemon said:\n${notes.join("\n")}`] : []),
+      ...(notes.length > 0
+        ? [`daemon said:\n${notes.join("\n")}\n[each line is shortened; the daemon's own log is ${exec.channel.daemonLogPath}]`]
+        : []),
       "[the channel is gone and its variables are lost; the next run on it starts a fresh one]",
     ];
     return {
@@ -631,7 +686,7 @@ export class ReplManager {
           chars: counts.chars,
           bytes: counts.bytes,
           countsPartial: counts.partial,
-          ename: exec.frame?.ename ?? null,
+          ename: exec.frame?.ename ? oneLine(exec.frame.ename, ENAME_CHARS) : null,
           evalue: exec.frame?.evalue ? oneLine(exec.frame.evalue, EVALUE_CHARS) : null,
         };
       });
@@ -697,10 +752,25 @@ export class ReplManager {
       };
     }
 
+    return this.stoppedResult(exec, taskId);
+  }
+
+  /**
+   * What a completed `bg_stop` says.
+   *
+   * `bg_stop`'s promise is that the cell dies and the channel keeps its variables. When the interrupt is
+   * what took the daemon down — a SIGINT handler that exits, a C library that dies on the signal — the
+   * death note the channel left behind has to be in the answer, or "stopped (dead)" reads as an ordinary
+   * stop of an ordinary task and the model reaches for variables that are already gone (R3-05).
+   */
+  private stoppedResult(exec: Exec, taskId: string): ReplResult {
+    const status = statusOf(exec);
+    const death = exec.deathNote ?? (exec.channel.closed ? exec.channel.deathNote : undefined);
+    const gone = death ? `\n${death}; the channel is gone and its variables are lost; the next run on it starts a fresh one` : "";
     return {
-      content: [{ type: "text", text: `task ${taskId} stopped (${statusOf(exec)}).\nLog: ${exec.logPath}` }],
-      details: { channel: exec.channelName, id: taskId, status: statusOf(exec), logPath: exec.logPath },
-      structuredContent: { status: statusOf(exec), task_id: taskId, channel: exec.channelName },
+      content: [{ type: "text", text: `task ${taskId} stopped (${status}).${gone}\nLog: ${exec.logPath}` }],
+      details: { channel: exec.channelName, id: taskId, status, logPath: exec.logPath },
+      structuredContent: { status, task_id: taskId, channel: exec.channelName },
     };
   }
 
@@ -774,7 +844,17 @@ export class ReplManager {
             const parsed = JSON.parse(lines[index]!) as HistoryRecord;
             if (!parsed || typeof parsed !== "object") throw new Error("not a record");
             const channel = typeof parsed.channel === "string" && parsed.channel ? parsed.channel : stem;
-            latest.set(channel, { ...parsed, channel, ...(torn > 0 ? { torn } : {}) });
+            const record: HistoryRecord = {
+              ...parsed,
+              channel,
+              ts: typeof parsed.ts === "string" ? parsed.ts : "",
+              ...(torn > 0 ? { torn } : {}),
+            };
+            // One channel can be remembered by more than one file — `a_b.jsonl` from before names got
+            // digests and `a_b-<digest>.jsonl` after — and `readdirSync` order would then decide which
+            // cell the model is told about. Keep the newest record by its own timestamp (R3-08).
+            const known = latest.get(channel);
+            if (!known || known.ts <= record.ts) latest.set(channel, record);
             break;
           } catch {
             torn++;
@@ -809,7 +889,7 @@ export class ReplManager {
       status: statusOf(exec),
       elapsed: round(exec.elapsed),
       code: oneLine(exec.code, HISTORY_CODE_CHARS),
-      ...(exec.frame?.definitions?.length ? { definitions: exec.frame.definitions.slice(0, 20) } : {}),
+      ...(exec.frame?.definitions?.length ? { definitions: definitionNames(exec.frame.definitions) } : {}),
     };
     const path = join(HISTORY_DIR, `${channelFileStem(exec.channelName)}.jsonl`);
     try {
@@ -918,6 +998,21 @@ function intEnv(name: string, fallback: number): number {
   if (!raw) return fallback;
   const value = Number.parseInt(raw, 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * The names a cell bound, quoted for a model: each one shortened to something a human recognises, and
+ * the ones that did not fit counted rather than pasted (R3-01).
+ */
+function definitionList(names: string[]): string {
+  const shown = names.slice(0, DEFINITION_NOTE_MAX).map((name) => oneLine(name, DEFINITION_NOTE_NAME_CHARS));
+  const more = names.length - shown.length;
+  return `${shown.join(", ")}${more > 0 ? ` (…and ${more} more)` : ""}`;
+}
+
+/** The names worth keeping, clipped and capped: the same list goes into the history file (R3-01). */
+function definitionNames(names: string[]): string[] {
+  return names.slice(0, HISTORY_DEFINITIONS_MAX).map((name) => oneLine(name, HISTORY_NAME_CHARS));
 }
 
 function round(value: number): number {

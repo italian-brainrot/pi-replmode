@@ -101,6 +101,32 @@ describe("text the daemon chooses", () => {
       `the prompt section grew from ${baseline.length} to ${after.length} characters because of the names one cell bound`,
     ).toBeLessThan(baseline.length + 2_000);
   });
+
+  it("F3-01: and not with the name of the exception it raised", async () => {
+    // Fixer hardening in the same class as R3-01, and the last field of a `run` result a cell can still
+    // size: `type("n" * 3000, (Exception,), {})` is a legal class, and its `__name__` is what `ename`
+    // carries — into `details`, into `structuredContent.error`, and into the task listing `bg_wait`
+    // prints as `failed (<name>)`.
+    const result = await run("E = type('n' * 3000, (Exception,), {})\nraise E('the reason')", { channel: "l-ename" });
+    const shown = text(result);
+    expect(shown.length, `the result is ${shown.length} characters`).toBeLessThan(MAX_OUTPUT_CHARS + 5_000);
+    expect(shown, "the exception is no longer named at all").toContain("nnnn");
+    expect((result.details.ename ?? "").length, `details.ename is ${(result.details.ename ?? "").length} characters`).toBeLessThanOrEqual(
+      200,
+    );
+    const error = result.structuredContent?.error as { ename?: string } | undefined;
+    expect((error?.ename ?? "").length, "structuredContent.error.ename is not clipped").toBeLessThanOrEqual(200);
+
+    // The listing is the copy that reaches a model as text, in a result of a different tool.
+    await run("E = type('m' * 3000, (Exception,), {})\nraise E('a background reason')", { channel: "l-ename-bg", timeout: 0 });
+    const listed = await ext.callTool("bg_wait", { timeout: 30 });
+    const listing = text(listed);
+    expect(listing, "the task listing no longer says the cell failed").toContain("failed (");
+    expect(listing.length, `the task listing is ${listing.length} characters because of an exception name`).toBeLessThan(5_000);
+    for (const task of listed.details?.tasks ?? []) {
+      expect((task.ename ?? "").length, `the listing reports ename as ${task.ename?.length} characters`).toBeLessThanOrEqual(200);
+    }
+  });
 });
 
 describe("the traceback budget, at its seams", () => {

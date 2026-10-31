@@ -6,11 +6,16 @@
 # Add a line here whenever you fix something the audit reported, and run this before declaring a pass
 # green. Anchors are exact source text: if one stops matching, the fix moved, so re-find it rather than
 # deleting the line.
+#
+# Usage: bash scripts/mutation-audit.sh [label-substring]   (a filter, because a full pass is minutes)
 set -u
 cd /home/qq/distrobox/ubuntu/Projects/pi-replmode
 
+FILTER="${1:-}"
+
 run_mutation() {
   local label="$1" file="$2" py="$3" testspec="$4"
+  if [ -n "$FILTER" ] && [[ "$label" != *"$FILTER"* ]]; then return; fi
   echo "=================================================="
   echo "MUTATION ${label}"
   python3 - "$file" "$py" <<'EOF'
@@ -27,7 +32,9 @@ EOF
   git checkout -- "$file"
 }
 
-run_mutation "M1 channelFileStem never appends a digest" src/names.ts '  if (readable === name) return readable;
+# ── pass 2's fixes, as found by pass 3 ───────────────────────────────────────
+
+run_mutation "M1 channelFileStem never appends a digest" src/names.ts '  if (readable === name && !LOOKS_DIGESTED.test(name)) return readable;
   return `${readable}-${digest(name)}`;
 ---MUTATE---
   return readable;' "test/names.test.ts"
@@ -55,7 +62,7 @@ run_mutation "M5 fatal frame is not kept" src/channel.ts '        this.fatalNote
 ---MUTATE---
         this.fatalNote = undefined;' "test/lifecycle.test.ts"
 
-run_mutation "M6 flushLoose uses Exec.write again (bytes dropped after the log closed)" src/channel.ts '    last.lateWrite(trailing);
+run_mutation "M6 flushLoose uses Exec.write again (bytes dropped after the log closed)" src/channel.ts '    last.lateWrite(trailing, STARTUP_OUTPUT_HEADER);
 ---MUTATE---
     last.write(trailing);' "test/lifecycle.test.ts"
 
@@ -84,6 +91,105 @@ run_mutation "M12 RUN_OUTPUT keeps output/truncated required" src/index.ts '    
 ---MUTATE---
     output: Type.String(),
     truncated: Type.Boolean(),' "test/honesty.test.ts"
+
+# ── pass 3's fixes ───────────────────────────────────────────────────────────
+
+run_mutation "R3-02 the channel name is two argv tokens again" src/channel.ts '        `--channel=${start.name}`,
+---MUTATE---
+        "--channel", start.name,' "test/names.test.ts"
+
+run_mutation "R3-03 a name that looks digested is used verbatim again" src/names.ts '  if (readable === name && !LOOKS_DIGESTED.test(name)) return readable;
+---MUTATE---
+  if (readable === name) return readable;' "test/names.test.ts"
+
+run_mutation "R3-04 the refusal blames busy channels when the slots are starting" src/manager.ts '    if (live.length === 0 && starting.length > 0) {
+---MUTATE---
+    if (false && live.length === 0 && starting.length > 0) {' "test/lifecycle.test.ts"
+
+run_mutation "R3-05 bgStop never reads the death note" src/manager.ts '    const death = exec.deathNote ?? (exec.channel.closed ? exec.channel.deathNote : undefined);
+---MUTATE---
+    const death: string | undefined = undefined;' "test/resilience.test.ts"
+
+run_mutation "R3-05 bgStop mentions the death but not the variables" src/manager.ts 'the channel is gone and its variables are lost; the next run on it starts a fresh one` : "";
+---MUTATE---
+the channel went` : "";' "test/resilience.test.ts"
+
+run_mutation "R3-06 the section drops the process-group exception" src/prompt.ts '  "  the process group it kills (a child that left that group survives), and it loses every variable",
+  "  in the channel.",
+---MUTATE---
+  "  its cells started, and it loses every variable in the channel.",' "test/prompt.test.ts"
+
+run_mutation "R3-06 the run guidelines drop it too" src/index.ts '"`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started, except any that moved into a process group of their own.",
+---MUTATE---
+"`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started.",' "test/prompt.test.ts"
+
+run_mutation "R3-08 two history files, and the last one read wins" src/manager.ts '            if (!known || known.ts <= record.ts) latest.set(channel, record);
+---MUTATE---
+            latest.set(channel, record);' "test/names.test.ts"
+
+run_mutation "R3-01 the daemon note ring is bounded by count only" src/channel.ts '    this.daemonNotes.push(oneLine(text, DAEMON_NOTE_CHARS));
+---MUTATE---
+    this.daemonNotes.push(text);' "test/limits.test.ts"
+
+run_mutation "R3-01 the definitions note quotes every name in full" src/manager.ts 'notes.push(`defined by this cell: ${definitionList(frame.definitions)}`);
+---MUTATE---
+notes.push(`defined by this cell: ${frame.definitions.join(", ")}`);' "test/limits.test.ts"
+
+run_mutation "R3-01 the prompt section quotes remembered names unbounded" src/prompt.ts '    .map((name) => oneLine(name, DEFINITION_HINT_NAME_CHARS))
+---MUTATE---
+    .map((name) => name)' "test/limits.test.ts"
+
+run_mutation "R3-01 the history file stores the names a cell bound as they came" src/manager.ts 'function definitionNames(names: string[]): string[] {
+  return names.slice(0, HISTORY_DEFINITIONS_MAX).map((name) => oneLine(name, HISTORY_NAME_CHARS));
+}
+---MUTATE---
+function definitionNames(names: string[]): string[] {
+  return names.slice(0, HISTORY_DEFINITIONS_MAX);
+}' "test/limits.test.ts"
+
+run_mutation "R3-09 the truncation note quotes totals taken before the traceback append" src/manager.ts '      const file = countOutput(exec.logPath);
+---MUTATE---
+      const file = totals ?? { bytes: 0, lines: cut.totalLines, chars: cut.totalChars, partial: false };' "test/limits.test.ts"
+
+run_mutation "R3-10 startup bytes get the late-output header again" src/channel.ts '    last.lateWrite(trailing, STARTUP_OUTPUT_HEADER);
+---MUTATE---
+    last.lateWrite(trailing);' "test/lifecycle.test.ts"
+
+run_mutation "R3-07 a failed start points at a file it never wrote" src/channel.ts '    const written = this.writeFailedStartOutput();
+---MUTATE---
+    const written: string | undefined = undefined;' "test/lifecycle.test.ts"
+
+run_mutation "R3-07 the startup buffer drops whole chunks again" src/channel.ts '    const kept = keepNewest(this.loose, LOOSE_MAX_BYTES);
+    this.loose = kept.chunks;
+    this.looseDropped += kept.dropped;
+---MUTATE---
+    let total = 0;
+    for (const chunk of this.loose) total += chunk.length;
+    while (total > LOOSE_MAX_BYTES && this.loose.length > 0) {
+      const oldest = this.loose.shift()!;
+      total -= oldest.length;
+      this.looseDropped += oldest.length;
+    }' "test/lifecycle.test.ts"
+
+run_mutation "R3-07 keepNewest keeps the oldest bytes instead of the newest" src/channel.ts '  const dropped = total - cap;
+  const kept: Buffer[] = [];
+  let skip = dropped;
+---MUTATE---
+  const dropped = total - cap;
+  const kept: Buffer[] = [];
+  const skip = 0;' "test/buffers.test.ts"
+
+run_mutation "F3-01 the exception name is quoted unclipped in the result" src/manager.ts '    const ename = frame?.ename ? oneLine(frame.ename, ENAME_CHARS) : null;
+---MUTATE---
+    const ename = frame?.ename ?? null;' "test/limits.test.ts"
+
+run_mutation "F3-01 the exception name is quoted unclipped in the task listing" src/manager.ts '          ename: exec.frame?.ename ? oneLine(exec.frame.ename, ENAME_CHARS) : null,
+---MUTATE---
+          ename: exec.frame?.ename ?? null,' "test/limits.test.ts"
+
+run_mutation "F3-02 a channel name of any length is accepted" src/manager.ts '    if (channelName.length > MAX_CHANNEL_NAME_CHARS) {
+---MUTATE---
+    if (false && channelName.length > MAX_CHANNEL_NAME_CHARS) {' "test/names.test.ts"
 
 echo "=================================================="
 git status --short
