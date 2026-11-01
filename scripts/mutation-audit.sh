@@ -281,7 +281,7 @@ run_mutation "R4-06 a cancelled call sends its cell anyway once the channel arri
 ---MUTATE---
     if (false && signal?.aborted) {
       return this.abortedResult(
-        channel.name,' "test/lifecycle.test.ts"
+        channel.name,' "test/run.test.ts"
 
 run_mutation "R4-06 the abort never reaches the start race" src/channel.ts '      ...(abort ? [abort.promise.then(() => CANCELLED)] : []),
 ---MUTATE---
