@@ -240,8 +240,13 @@ export class ReplManager {
     onProgress: (message: string) => void,
     signal: AbortSignal | undefined,
   ): Promise<Channel> {
-    await this.makeRoom();
+    // The session this call belongs to is the one that made it, so the epoch is taken on entry: a start
+    // that spends seconds inside `makeRoom` — retiring a daemon that will not answer `shutdown` takes as
+    // long as that daemon takes to die — would otherwise be measured against the session that begins
+    // *after* a quit, and would adopt its daemon into the map the quit just cleared and send its cell to
+    // a caller that has gone (R5-02, one position away from F4-01's guard).
     const epoch = this.quitEpoch;
+    await this.makeRoom();
     // A call its user cancelled stops here, before a daemon exists, rather than after: the slot is
     // released with the creation, so an aborted start cannot hold one for the whole ready timeout
     // (R4-06). Abandoning the wait for the environment costs nothing — the build is single-flight and

@@ -948,7 +948,14 @@ time.sleep(600)
 
     expect(coldPid, "the second stub daemon never wrote its pid").toBeGreaterThan(0);
     expect(isPidAlive(coldPid), "a daemon this call spawned after its session ended is still running").toBe(false);
-    expect(existsSync(sideEffect), "the cell of a call whose session ended ran anyway").toBe(false);
+    // Pass 5 wrote this as `existsSync(sideEffect)`, which no product change can satisfy: the stub marks
+    // this file for *every* cell it runs, and the retired channel's cell — the legitimate one, run before
+    // the quit — creates the file first. The pass-5 write-up measured the file as
+    // "r5-02-hot r5-02-cold ", which is what is being asserted here: the marker of the call whose session
+    // ended must be absent, and the one that proves the case ran must be present.
+    const ran = existsSync(sideEffect) ? readFileSync(sideEffect, "utf8") : "";
+    expect(ran, "the cell of a call whose session ended ran anyway").not.toContain("r5-02-cold");
+    expect(ran, "the channel retired to make room never ran its cell: the case did not run").toContain("r5-02-hot");
     expect(text(result), `the call was answered as if its session were still there: ${text(result)}`).toMatch(/session ended/);
   });
 

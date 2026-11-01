@@ -432,6 +432,12 @@ run_mutation "R5-03 one unreadable history record takes the whole section with i
     throw error;
   }' "test/prompt.test.ts"
 
+run_mutation "R5-02 the quit epoch is taken after the room is made" src/manager.ts '    const epoch = this.quitEpoch;
+    await this.makeRoom();
+---MUTATE---
+    await this.makeRoom();
+    const epoch = this.quitEpoch;' "test/lifecycle.test.ts"
+
 echo "=================================================="
 if [ -n "$ANCHORS_ONLY" ]; then
   echo "ANCHOR CHECK ONLY — bad anchors: $BADANCHOR"
