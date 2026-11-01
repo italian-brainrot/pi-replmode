@@ -388,9 +388,12 @@ export class ReplManager {
       // One long name here is not just one long answer: it goes into the channel's history file and from
       // there into the prompt section of every later session, where it is paid for on every request.
       // The wording has to state the boundary the code enforces — a name of exactly the limit is
-      // accepted, so "keep it under 200" forbids a call the tool would have made (R4-07).
+      // accepted, so "keep it under 200" forbids a call the tool would have made (R4-07) — and state the
+      // real reason, which is that the name comes back to the model. It is not a file-name limit:
+      // `channelFileStem` digests every name over 40 characters or with an unsafe character, so a
+      // 200-character name produces a file name barely longer than `main`'s (R5-06).
       throw new Error(
-        `invalid channel name: ${channelName.length} characters, and a name is ${MAX_CHANNEL_NAME_CHARS} at most — it names a channel, a log file and an IPython profile.`,
+        `invalid channel name: ${channelName.length} characters, and a name is ${MAX_CHANNEL_NAME_CHARS} at most: the name comes back in results, in the history file, and in the prompt of every later session.`,
       );
     }
 
@@ -790,7 +793,7 @@ export class ReplManager {
     const running = infos.filter((info) => info.status === "running").map((info) => info.id);
     const finished = [...watched.values()].filter((exec) => exec.settled).map((exec) => exec.id);
     return {
-      content: [{ type: "text", text: [summary, ...taskSection(infos)].join("\n") }],
+      content: [{ type: "text", text: [summary, ...taskSection(infos, this.droppedTasks.size)].join("\n") }],
       details: {
         channel: infos[0]?.channel ?? "main",
         running,
@@ -857,9 +860,15 @@ export class ReplManager {
         // for, or which the cap did on its behalf — removed it seconds ago. Saying "pruned after 3 days"
         // blames a retention window that had nothing to do with it, and leaves the cell's output
         // unfindable (R4-09).
+        // The pointer is checked before it is promised, like every other log this tool names: the
+        // manager outlives `/new`, `/resume` and `/reload`, and each of those boundaries runs the
+        // retention sweep, so the file a killed task named can be gone long before the id is asked about
+        // (R5-04).
         throw new Error(
           `unknown task: ${taskId}. Its channel "${dropped.channel}" was ${dropped.why}, which removed that channel's tasks from this session. ` +
-            `The cell's output is in ${dropped.logPath}, and the channel's variables went with it.`,
+            (existsSync(dropped.logPath)
+              ? `The cell's output is in ${dropped.logPath}, and the channel's variables went with it.`
+              : `The cell's output was in ${dropped.logPath} (the log file is no longer there), and the channel's variables went with it.`),
         );
       }
       throw new Error(
@@ -912,13 +921,20 @@ export class ReplManager {
     await Promise.race([exec.done, sleep(STOP_GRACE_MS)]);
 
     if (!exec.settled) {
+      // Why the cell has not taken SIGINT is not always a guess. `processGone` already reads this pid's
+      // state for the liveness check fifteen lines away, and the state can contradict the standard
+      // explanation outright: a daemon in `T` is not executing any code to block a signal, it is stopped,
+      // and no signal reaches it until something continues it (R5-05). Naming the state is for the model
+      // to act on — it does not make this call escalate, because a timeout never kills a cell and
+      // `kill: true` stays the model's decision.
+      const diagnosis = signalDiagnosis(exec.channel.pid);
       return {
         content: [
           {
             type: "text",
             text:
               `task ${taskId} is still running: it did not stop on SIGINT within ${STOP_GRACE_MS / 1000}s. ` +
-              "Code that blocks signals, or a C extension holding the GIL, can do that. " +
+              (diagnosis || "Code that blocks signals, or a C extension holding the GIL, can do that. ") +
               "bg_stop with kill: true takes the whole channel down to stop it, which loses that channel's variables.",
           },
         ],
@@ -1176,8 +1192,26 @@ function taskListing(infos: TaskInfo[]): string[] {
   return lines;
 }
 
-function taskSection(infos: TaskInfo[]): string[] {
-  if (infos.length === 0) return ["", "No background tasks have run in this session."];
+/**
+ * The listing half of a `bg_wait` answer.
+ *
+ * `untracked` is how many tasks this process stopped tracking because their channel went (their ids are
+ * still in `droppedTasks`, and `bg_stop` can still name the log each left). The empty-listing sentence has
+ * to agree with the summary printed above it: a `bg_stop { kill: true }` from another call can empty the
+ * registry while this wait is in flight, and "No background tasks have run in this session" then denies a
+ * task the same answer has just reported as finished (R5-07). R4-09's accepted half-measure stands — the
+ * dropped tasks are not given rows: a row would offer a log line the model cannot act on and a status no
+ * exec is carrying any more.
+ */
+function taskSection(infos: TaskInfo[], untracked = 0): string[] {
+  if (infos.length === 0) {
+    return [
+      "",
+      untracked > 0
+        ? `No background tasks are tracked any more; ${untracked} ${untracked === 1 ? "was" : "were"} dropped when their channel went, and bg_stop with the task ID names the log each one left.`
+        : "No background tasks have run in this session.",
+    ];
+  }
   const running = infos.filter((info) => info.status === "running").length;
   const shown = infos.slice(0, LISTING_MAX_TASKS);
   const omitted = infos.length - shown.length;
@@ -1270,12 +1304,43 @@ export function processGone(pid: number): boolean {
     reachable = (error as NodeJS.ErrnoException).code === "EPERM";
   }
   if (!reachable) return true;
+  return processState(pid) === "Z";
+}
+
+/**
+ * The state letter the process table has for this pid — `R`, `S`, `D`, `T`, `Z` — or undefined when
+ * there is no `/proc` to ask, or nothing there to ask. The parenthesised comm field of `stat` can hold
+ * spaces, so the state is read after the last `)`.
+ */
+function processState(pid: number): string | undefined {
+  if (pid <= 0) return undefined;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] === "Z";
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+/**
+ * Why a cell has not taken SIGINT, when the process table actually knows (R5-05).
+ *
+ * The fallback sentence — code that blocks signals, or C code holding the GIL — is a fair guess about a
+ * process that is *running*. It is contradicted outright by a daemon that has been stopped, and by one
+ * stuck in a kernel call, and both of those are visible in the state `processGone` reads a few lines
+ * away. Empty for the states that the guess does describe, so an ordinary wedged cell still gets the
+ * ordinary explanation.
+ */
+function signalDiagnosis(pid: number): string {
+  const state = processState(pid);
+  if (state === undefined || state === "R" || state === "S") return "";
+  const states: Record<string, string> = {
+    D: "in uninterruptible sleep — inside a kernel call it cannot leave, so no signal is delivered until it wakes",
+    T: "stopped (SIGSTOP, or a job-control stop): it is running no code, and no signal reaches it until something continues it",
+    t: "held by a debugger: as with a stop, no signal reaches it until it is continued",
+    Z: "already gone — a zombie whose exit had not reached the host when this was answered — so there is no cell left running to stop",
+  };
+  return `the process table says the Python process behind this channel is ${states[state] ?? `in state ${state}`}. `;
 }
 
 function sleep(ms: number): Promise<void> {

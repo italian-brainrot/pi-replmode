@@ -276,6 +276,19 @@ describe("the rule a channel name has to obey", () => {
       /quoted|prompt|every later session|comes back/i,
     );
   });
+
+  it("R5-06: and the refusal gives the model the same reason the parameter does", async () => {
+    // Two copies of one rule, and pass 5 found them both wrong in the same way. The refusal is the copy
+    // a model sees after it has already chosen a bad name, so a false reason there is paid for by a
+    // call that has to be re-decided from scratch.
+    const refused = await ext.callTool("run", { code: "print(1)", channel: "n".repeat(201) });
+    expect(refused.isError).toBe(true);
+    const shown = text2(refused);
+    expect(shown, `the refusal credits something other than the model for the limit: ${shown}`).toMatch(
+      /quoted|prompt|every later session|comes back/i,
+    );
+    expect(shown, `the refusal forbids a length the tool accepts: ${shown}`).not.toMatch(/under 200/);
+  });
 });
 
 describe("a history record the section cannot read", () => {

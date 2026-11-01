@@ -298,7 +298,7 @@ run_mutation "R4-04 the settled bg_stop branch ignores that the channel went" sr
 ---MUTATE---
               "" +' "test/resilience.test.ts"
 
-run_mutation "R4-04 the gone-process probe reads a zombie as still running" src/manager.ts '    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] === "Z";
+run_mutation "R4-04 the gone-process probe reads a zombie as still running" src/manager.ts '  return processState(pid) === "Z";
 ---MUTATE---
     return false;' "test/resilience.test.ts"
 
@@ -340,20 +340,39 @@ run_mutation "R4-09 a task removed by its channel closing is blamed on the reten
 ---MUTATE---
       this.droppedTasks.set(`dropped-by-a-mutation-${id}`, { channel: name, logPath: exec.logPath, why });' "test/resilience.test.ts"
 
+run_mutation "R5-04 the dropped-task answer promises a log the retention sweep has deleted" src/manager.ts '            (existsSync(dropped.logPath)
+---MUTATE---
+            (dropped.why.length >= 0' "test/resilience.test.ts"
+
+run_mutation "R5-05 the busy answer ignores what the process table says and guesses anyway" src/manager.ts 'function signalDiagnosis(pid: number): string {
+  const state = processState(pid);
+---MUTATE---
+function signalDiagnosis(pid: number): string {
+  const state: string | undefined = undefined;' "test/resilience.test.ts"
+
+run_mutation "R5-07 the empty listing denies a task the same answer has just reported finished" src/manager.ts '      content: [{ type: "text", text: [summary, ...taskSection(infos, this.droppedTasks.size)].join("\n") }],
+---MUTATE---
+      content: [{ type: "text", text: [summary, ...taskSection(infos)].join("\n") }],' "test/listing.test.ts"
+
+run_mutation "R5-06 the channel parameter blames file names for the name limit again" src/index.ts '        "A name is at most 200 characters: it is quoted back in results, in the history file, and in the prompt of every later session.",
+---MUTATE---
+        "A name is at most 200 characters: it names the log and history files of that channel.",' "test/prompt.test.ts"
+
+run_mutation "R5-06 the refusal blames file names for the name limit again" src/manager.ts 'at most: the name comes back in results, in the history file, and in the prompt of every later session.`,
+---MUTATE---
+at most — it names a channel, a log file and an IPython profile.`,' "test/prompt.test.ts"
+
 run_mutation "R4-05 the refusal credits the cap to the env value it ignored" src/manager.ts '      return { value: DEFAULT_MAX_CHANNELS, source: `the default, because PI_REPLMODE_MAX_CHANNELS=${raw} is not a usable cap` };
 ---MUTATE---
       return { value: DEFAULT_MAX_CHANNELS, source: "set with PI_REPLMODE_MAX_CHANNELS" };' "test/cap.test.ts"
 
-run_mutation "R4-07 the channel parameter says nothing about the name length" src/index.ts ' +
-        // R4-07: this is where a name is chosen, so this is where the rule that makes a call fail has to
-        // be — the refusal alone leaves the model to discover it once a session.
-        "A name is at most 200 characters: it names the log and history files of that channel.",
+run_mutation "R4-07 the channel parameter says nothing about the name length" src/index.ts '        "A name is at most 200 characters: it is quoted back in results, in the history file, and in the prompt of every later session.",
 ---MUTATE---
-' "test/prompt.test.ts"
+        "",' "test/prompt.test.ts"
 
-run_mutation "R4-07 the refusal forbids a length the tool accepts" src/manager.ts '        `invalid channel name: ${channelName.length} characters, and a name is ${MAX_CHANNEL_NAME_CHARS} at most — it names a channel, a log file and an IPython profile.`,
+run_mutation "R4-07 the refusal forbids a length the tool accepts" src/manager.ts '        `invalid channel name: ${channelName.length} characters, and a name is ${MAX_CHANNEL_NAME_CHARS} at most: the name comes back in results, in the history file, and in the prompt of every later session.`,
 ---MUTATE---
-        `invalid channel name: ${channelName.length} characters. Keep it under ${MAX_CHANNEL_NAME_CHARS} — it names a channel, a log file and an IPython profile.`,
+        `invalid channel name: ${channelName.length} characters. Keep it under ${MAX_CHANNEL_NAME_CHARS}: the name comes back in results, in the history file, and in the prompt of every later session.`,
 ' "test/prompt.test.ts"
 
 run_mutation "R4-08 the README promises a whole answer inside the limit again" README.md '`run` answer can come back a couple of kilobytes over 50 000 characters.

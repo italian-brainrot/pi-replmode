@@ -35,7 +35,11 @@ const RUN_PARAMETERS = Type.Object({
         'Isolated REPL instance (default "main"), created on first use. Separate variables and process per channel. ' +
         // R4-07: this is where a name is chosen, so this is where the rule that makes a call fail has to
         // be — the refusal alone leaves the model to discover it once a session.
-        "A name is at most 200 characters: it names the log and history files of that channel.",
+        // R5-06: and the reason has to be one the code backs up. File names are not bounded by the name
+        // (`channelFileStem` digests anything over 40 characters or with an unsafe character, so every
+        // name this tool accepts yields a stem of at most ~51); the name is bounded because it comes
+        // back to the model, in results and in every later session's prompt.
+        "A name is at most 200 characters: it is quoted back in results, in the history file, and in the prompt of every later session.",
     }),
   ),
 });
