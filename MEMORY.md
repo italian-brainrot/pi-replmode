@@ -15,7 +15,8 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   [docs/AUDIT.md](docs/AUDIT.md) §"Pass 5 fixes — 2026-11-01 (fixer)": per-finding write-ups (what
   changed, what is still weak), and §"Handoff to pass 6 (tester)" for the attack list in order.
   Gate this pass leaves: tsc/biome green, **204 vitest, 0 failures** (two identical full runs),
-  **47 pytest**, mutation script **67 anchors all matching** and every pass-5 mutation dying.
+  **47 pytest**, mutation script **66 anchors, all matching, 64 of 66 die** (the two survivors are the
+  accepted ones).
   One test *line* changed, argued in AUDIT: pass 5's R5-02 asserted `existsSync(sideEffect)`, which the
   retired channel's own legitimate cell makes true — it now asserts the cold marker is absent and the
   hot one present. New test files/ids to know: `R5-01: and a joiner whose creator gives up…`,
@@ -161,7 +162,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   from a copy taken before the break — **not** with `git checkout`, which threw away uncommitted work — and a
   signal now *stops* the script (a trap that only cleaned up let bash carry on with the backup directory
   deleted: every remaining mutation got applied and none restored, and it ate an afternoon). Run
-  **`ANCHORS_ONLY=1 bash scripts/mutation-audit.sh`** first: seconds, checks all 67 anchors against the
+  **`ANCHORS_ONLY=1 bash scripts/mutation-audit.sh`** first: seconds, checks all 66 anchors against the
   source, and a stale anchor is otherwise silently skipped — pass 5's fixes rotted four anchors in one
   sitting (`processGone`'s zombie line, both R4-07 prose anchors). Its verdict is the *set of failing test
   names* compared with a per-file baseline taken on a clean tree — an exit code says nothing while tests are

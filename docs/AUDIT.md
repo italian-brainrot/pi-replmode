@@ -2978,8 +2978,8 @@ mutation anchors moved with the code).
 
 ### Pass 5's mutations, and the tooling that came out of them
 
-Ten new mutations (two each for R5-01, R5-03 and R5-06, one each for R5-02, R5-04, R5-05, R5-07 and
-the late-spawn pin). Each was checked individually while its fix was fresh, then the whole list was run
+Eleven new mutations (two each for R5-01, R5-03 and R5-06, one each for R5-02, R5-04, R5-05, R5-07 and
+the late-spawn pin; pass 4 left 55). Each was checked individually while its fix was fresh, then the whole list was run
 again on a committed tree: **66 mutations, all anchors matched, 64 die, and the two survivors are the
 accepted ones** — `flushLoose`'s `lateWrite`→`write` and `failure()`'s choice of status. Nothing new
 survived; the re-anchored pass-3/pass-4 mutations (the zombie read, the two name-rule sentences, the
@@ -2989,7 +2989,7 @@ files are ~45 s each and each mutation runs one baseline plus one mutated run of
 `scripts/mutation-audit.sh` changed under the pressure of this pass, and DEV.md documents it:
 
 - **`ANCHORS_ONLY=1 bash scripts/mutation-audit.sh`** — every anchor against the current source, no
-  vitest, no tsc, ~10 seconds for 67 anchors. Run that before the long pass; a stale anchor is otherwise
+  vitest, no tsc, ~15 seconds for all 66 anchors. Run that before the long pass; a stale anchor is otherwise
   *silently skipped*, and this pass produced four stale anchors in one sitting (the R4-04 zombie line,
   both R4-07 prose anchors, and the R4-07 parameter anchor, which pass 4's own mutation had been deleting
   by exact text and my rewording moved).
