@@ -13,7 +13,20 @@ CHANNEL="smoke-abort"
 STUB_ENV="${STUB_ENV:-/tmp/pi-smoke-env-slow}"
 READY_TIMEOUT_MS="${READY_TIMEOUT_MS:-60000}"
 PIDFILE=/tmp/pi-smoke-abort-start.pid
-rm -f "$PIDFILE" "$STUB_ENV/../smoke-abort-ran.txt" /tmp/pi-smoke-abort-ran.txt
+rm -f "$PIDFILE" /tmp/pi-smoke-abort-ran.txt
+
+# The slow interpreter: an environment directory that already looks complete, whose `bin/python`
+# sleeps long enough that the call is still waiting for `ready` when Esc arrives. Built here so the
+# script is one command; a real environment would come from ~/.cache/pi-replmode.
+if [ ! -x "$STUB_ENV/bin/python" ]; then
+  REAL_PYTHON=$(ls -1 "$HOME"/.cache/pi-replmode/py-env-*/bin/python 2>/dev/null | head -1)
+  [ -n "$REAL_PYTHON" ] || REAL_PYTHON=$(command -v python3)
+  mkdir -p "$STUB_ENV/bin"
+  printf '#!/bin/sh\nsleep 25\nexec %s "$@"\n' "$REAL_PYTHON" > "$STUB_ENV/bin/python"
+  chmod +x "$STUB_ENV/bin/python"
+  : > "$STUB_ENV/.complete"
+  echo "built a slow stub interpreter at $STUB_ENV (execs $REAL_PYTHON after 25s)"
+fi
 
 export PI_REPLMODE_ENV_DIR="$STUB_ENV" PI_REPLMODE_READY_TIMEOUT_MS="$READY_TIMEOUT_MS"
 export PI_SMOKE_PIDFILE="$PIDFILE"

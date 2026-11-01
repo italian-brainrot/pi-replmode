@@ -103,9 +103,10 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   The aborted-start smoke does not work with `-p`: SIGINT in print mode is a hard kill — no
   `session_shutdown` runs and no abort fires (measured: an idle daemon survives SIGINT and is closed only
   by a clean exit). `scripts/smoke-abort-start.sh` does it in the real interactive TUI under a pty, typing
-  the prompt, waiting for the daemon to exist, and pressing Esc as a byte. It needs a slow interpreter:
-  `PI_REPLMODE_ENV_DIR` at a dir whose `bin/python` sleeps before exec'ing the real one, with a long
-  `PI_REPLMODE_READY_TIMEOUT_MS` so the call is still starting when Esc lands. It passes when the tool
+  the prompt, waiting for the daemon to exist, and pressing Esc as a byte. It builds its own slow
+  interpreter — an env dir whose `bin/python` sleeps 25s before exec'ing a real one, at
+  `/tmp/pi-smoke-env-slow` unless `STUB_ENV=` points elsewhere — and raises `PI_REPLMODE_READY_TIMEOUT_MS`
+  so the call is still starting when Esc lands. It passes when the tool
   answers `call aborted while channel "…" was still starting`, the cell's side effect is absent, and no
   daemon with that `--channel=` is left running.
 
