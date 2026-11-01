@@ -23,7 +23,16 @@ import {
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
-import { type Channel, ChannelBusyError, type Exec, type ExecOutcome, type ReadyFrame, readLog, startChannel } from "./channel.ts";
+import {
+  type Channel,
+  ChannelBusyError,
+  ChannelStartAbortedError,
+  type Exec,
+  type ExecOutcome,
+  type ReadyFrame,
+  readLog,
+  startChannel,
+} from "./channel.ts";
 import { ensureEnv } from "./env.ts";
 import { formatDuration, formatSize, MAX_OUTPUT_CHARS, MAX_READ_BYTES, nonceVarName, oneLine, truncateMiddle } from "./format.ts";
 import { channelFileStem } from "./names.ts";
@@ -129,7 +138,8 @@ interface HistoryRecord {
   elapsed: number;
   code: string;
   definitions?: string[];
-  /** Records after the one reported that could not be read — a torn append after a crash. */
+  /** Records after the one reported that this program cannot use — a torn append, or a record with no
+   *  usable channel name in it. */
   torn?: number;
 }
 
@@ -149,37 +159,126 @@ export class ReplManager {
   readonly channels = new Map<string, Channel>();
   /** Execs that became background tasks, in the order they went to the background. */
   readonly tasks = new Map<string, Exec>();
+  /** Tasks their channel's closure removed, with the reason: see `bgStop`'s unknown-id answer. */
+  private readonly droppedTasks = new Map<string, { channel: string; logPath: string; why: string }>();
 
   private readonly starting = new Map<string, Promise<Channel>>();
+  /**
+   * Daemons that have spawned but not answered `ready` yet. They are in no map a shutdown reads, so a
+   * session that ends while one is coming up would leave it running forever (F4-01).
+   */
+  private readonly halfStarted = new Set<Channel>();
+  /**
+   * Bumped by every `quit()`. A start that began before a quit and finished during it is closed rather
+   * than adopted; a start that begins afterwards belongs to the next session and is adopted normally.
+   */
+  private quitEpoch = 0;
   private readonly listeners = new Set<(exec: Exec) => void>();
   /** Read per channel creation, so the cap can be changed without rebuilding the manager. */
   private get maxChannels(): number {
-    return intEnv("PI_REPLMODE_MAX_CHANNELS", DEFAULT_MAX_CHANNELS);
+    return this.maxChannelsSetting().value;
+  }
+
+  /**
+   * The cap, and which setting it came from. The refusal is the only place the cap is ever *named*, and
+   * it must not credit a number to a value it threw away: `PI_REPLMODE_MAX_CHANNELS=0` falls back to the
+   * default, and saying "the cap (4, set with PI_REPLMODE_MAX_CHANNELS)" there tells the model the
+   * variable asked for 4 (R4-05).
+   */
+  private maxChannelsSetting(): { value: number; source: string } {
+    const raw = process.env.PI_REPLMODE_MAX_CHANNELS?.trim();
+    if (!raw) return { value: DEFAULT_MAX_CHANNELS, source: "the default" };
+    const value = Number.parseInt(raw, 10);
+    if (!Number.isFinite(value) || value <= 0) {
+      return { value: DEFAULT_MAX_CHANNELS, source: `the default, because PI_REPLMODE_MAX_CHANNELS=${raw} is not a usable cap` };
+    }
+    return { value, source: "set with PI_REPLMODE_MAX_CHANNELS" };
   }
 
   // ── Channels ───────────────────────────────────────────────────────────────
 
-  private async getChannel(name: string, cwd: string, onProgress: (message: string) => void): Promise<Channel> {
+  private async getChannel(
+    name: string,
+    cwd: string,
+    onProgress: (message: string) => void,
+    signal: AbortSignal | undefined,
+  ): Promise<Channel> {
     const existing = this.channels.get(name);
-    if (existing && !existing.closed) return existing;
+    // `closed` only becomes true once node has been told the process is gone, which can lag the death by
+    // an event-loop turn or longer. A call that lands in that window would be handed a daemon that cannot
+    // answer: its cell goes to a dead pipe and the call comes back blaming a death the model cannot act
+    // on. The process table knows (F4-02, same probe as R4-04's settled answer).
+    if (existing && !existing.closed && !processGone(existing.pid)) return existing;
     if (existing) this.channels.delete(name);
 
     const pending = this.starting.get(name);
     if (pending) return pending;
 
-    const starting = this.createChannel(name, cwd, onProgress);
+    const starting = this.createChannel(name, cwd, onProgress, signal);
     this.starting.set(name, starting);
+    // The slot comes back the moment the caller cancels, not when that call's rejection has worked its
+    // way back through the await chain: the next `run` can ask for the cap in between, and a slot held
+    // by a call that has already been cancelled is what R4-06 is about. `release` is guarded by identity
+    // so it can never drop somebody else's creation.
+    const release = (): void => {
+      if (this.starting.get(name) === starting) this.starting.delete(name);
+    };
+    signal?.addEventListener("abort", release, { once: true });
     try {
       return await starting;
     } finally {
-      this.starting.delete(name);
+      // The listener goes away with the wait: one signal can be handed to many calls in a session, and a
+      // listener that outlives each of them is a leak measured in channels.
+      signal?.removeEventListener("abort", release);
+      release();
     }
   }
 
-  private async createChannel(name: string, cwd: string, onProgress: (message: string) => void): Promise<Channel> {
+  private async createChannel(
+    name: string,
+    cwd: string,
+    onProgress: (message: string) => void,
+    signal: AbortSignal | undefined,
+  ): Promise<Channel> {
     await this.makeRoom();
-    const env = await ensureEnv(onProgress);
-    const channel = await startChannel({ name, cwd, env });
+    const epoch = this.quitEpoch;
+    // A call its user cancelled stops here, before a daemon exists, rather than after: the slot is
+    // released with the creation, so an aborted start cannot hold one for the whole ready timeout
+    // (R4-06). Abandoning the wait for the environment costs nothing — the build is single-flight and
+    // carries on in the background for whoever asks next.
+    const env = await untilAborted(ensureEnv(onProgress), signal, name);
+    let spawned: Channel | undefined;
+    let channel: Channel;
+    try {
+      channel = await startChannel({
+        name,
+        cwd,
+        env,
+        signal,
+        onSpawned: (daemon) => {
+          spawned = daemon;
+          // A daemon spawned after this session's quit began is closed on sight: it is not in the set the
+          // quit is walking (F4-01).
+          if (epoch === this.quitEpoch) this.halfStarted.add(daemon);
+          else void daemon.close();
+        },
+      });
+    } catch (error) {
+      // A quit that took this channel's daemon on the way out deserves its own sentence, not a death
+      // note for a process the host itself stopped (F4-01).
+      if (epoch !== this.quitEpoch) throw new Error("the session ended while this channel was starting");
+      throw error;
+    } finally {
+      // `halfStarted` is only ever the set of daemons that are *still* starting: whichever way this call
+      // ends, the daemon is either adopted, closed by the start path, or closed here.
+      if (spawned) this.halfStarted.delete(spawned);
+    }
+    if (epoch !== this.quitEpoch) {
+      // The session this call belonged to ended while the daemon was coming up: it has nobody left to
+      // talk to it, and the next session will start its own.
+      void channel.close();
+      throw new Error("the session ended while this channel was starting");
+    }
     this.channels.set(name, channel);
     return channel;
   }
@@ -204,7 +303,7 @@ export class ReplManager {
       .sort((a, b) => a.lastUsed - b.lastUsed)
       .at(0);
     if (idlest) {
-      await this.shutdownChannel(idlest.name);
+      await this.shutdownChannel(idlest.name, "retired to make room for a new channel");
       return;
     }
     throw this.capacityRefusal(live);
@@ -219,31 +318,40 @@ export class ReplManager {
    * call that cannot work (R3-04).
    */
   private capacityRefusal(live: Channel[]): ChannelCapacityError {
-    const cap = `the cap (${this.maxChannels}, set with PI_REPLMODE_MAX_CHANNELS) is reached`;
+    const cap = this.maxChannelsSetting();
+    const limit = `the cap (${cap.value}, ${cap.source}) is reached`;
     const starting = [...this.starting.keys()];
     const names = (list: string[]): string => list.map((name) => `"${name}"`).join(", ");
 
     if (live.length === 0 && starting.length > 0) {
       return new ChannelCapacityError(
-        `channel ${names(starting)} ${starting.length === 1 ? "is" : "are"} still starting and ${cap}: nothing is running yet, so there is no ` +
-          "task to stop and no idle channel to retire — wait for the call that is starting to finish, and try again then",
+        `channel ${names(starting)} ${starting.length === 1 ? "is" : "are"} still starting and ${limit}: nothing is running yet, so there is no ` +
+          "task to stop and no idle channel to retire — wait for the call that is starting to finish, or cancel it, and try again then",
       );
     }
     const alsoStarting = starting.length > 0 ? `; ${names(starting)} ${starting.length === 1 ? "is" : "are"} also still starting` : "";
     return new ChannelCapacityError(
-      `all ${this.maxChannels} pi-replmode channels are busy and ${cap}: ` +
+      `all ${cap.value} pi-replmode channels are busy and ${limit}: ` +
         `let a background task finish, stop one with bg_stop, or free a channel with bg_stop {kill: true}${alsoStarting}`,
     );
   }
 
   /** Close a channel and everything it started. Its variables go with it. */
-  async shutdownChannel(name: string): Promise<boolean> {
+  async shutdownChannel(name: string, why = "closed"): Promise<boolean> {
     const channel = this.channels.get(name);
     if (!channel) return false;
     this.channels.delete(name);
     await channel.close();
     for (const [id, exec] of [...this.tasks]) {
-      if (exec.channelName === name) this.tasks.delete(id);
+      if (exec.channelName !== name) continue;
+      this.tasks.delete(id);
+      // Remembered so a later `bg_stop` for one of these ids can say what took it, instead of blaming
+      // the retention window for a deletion the model itself asked for seconds ago (R4-09).
+      this.droppedTasks.set(id, { channel: name, logPath: exec.logPath, why });
+      if (this.droppedTasks.size > TASK_REGISTRY_LIMIT) {
+        const oldest = this.droppedTasks.keys().next().value;
+        if (oldest !== undefined) this.droppedTasks.delete(oldest);
+      }
     }
     return true;
   }
@@ -264,19 +372,29 @@ export class ReplManager {
     if (channelName.length > MAX_CHANNEL_NAME_CHARS) {
       // One long name here is not just one long answer: it goes into the channel's history file and from
       // there into the prompt section of every later session, where it is paid for on every request.
+      // The wording has to state the boundary the code enforces — a name of exactly the limit is
+      // accepted, so "keep it under 200" forbids a call the tool would have made (R4-07).
       throw new Error(
-        `invalid channel name: ${channelName.length} characters. Keep it under ${MAX_CHANNEL_NAME_CHARS} — it names a channel, a log file and an IPython profile.`,
+        `invalid channel name: ${channelName.length} characters, and a name is ${MAX_CHANNEL_NAME_CHARS} at most — it names a channel, a log file and an IPython profile.`,
       );
     }
 
     let channel: Channel;
     try {
-      channel = await this.getChannel(channelName, cwd, onProgress);
+      channel = await this.getChannel(channelName, cwd, onProgress, signal);
     } catch (error) {
       const note = error instanceof Error ? error.message : String(error);
       // A capacity refusal is not a channel that failed to start — nothing was started, and every
       // other channel in the session is running. Say which of the two the model is being told.
       const refused = error instanceof ChannelCapacityError;
+      if (!refused && signal?.aborted) {
+        // The call was cancelled while its channel was coming up: no cell was sent, and the slot is
+        // free again. Saying so is the honest answer, and it is not a channel that failed (R4-06).
+        return this.abortedResult(
+          channelName,
+          `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and the slot its daemon held is free again`,
+        );
+      }
       const status: TaskStatus = refused ? "running" : "dead";
       return {
         content: [{ type: "text", text: refused ? note : `channel "${channelName}" could not start: ${note}` }],
@@ -289,6 +407,16 @@ export class ReplManager {
     return channel.withLock(() => this.runLocked(channel, code, timeoutSec, signal, onUpdate));
   }
 
+  /** A call its user cancelled before any cell went on the wire (R4-06). */
+  private abortedResult(channelName: string, text: string): ReplResult {
+    return {
+      content: [{ type: "text", text }],
+      details: { channel: channelName, status: "dead" },
+      structuredContent: { status: "dead", channel: channelName, aborted: true, error: text },
+      isError: true,
+    };
+  }
+
   private async runLocked(
     channel: Channel,
     code: string,
@@ -296,6 +424,15 @@ export class ReplManager {
     signal: AbortSignal | undefined,
     onUpdate?: (partial: ReplResult) => void,
   ): Promise<ReplResult> {
+    // Same rule one step later: a call that was cancelled while it queued behind another call on this
+    // channel does not get to send its cell anyway. A cell has side effects from its first line, and
+    // the user has already pressed Esc (R4-06).
+    if (signal?.aborted) {
+      return this.abortedResult(
+        channel.name,
+        `call aborted before it reached channel "${channel.name}": nothing was sent, so nothing ran and the channel kept its state`,
+      );
+    }
     const busy = channel.busyTask();
     if (busy) throw new ChannelBusyError(channel.name, busy.id);
 
@@ -695,6 +832,17 @@ export class ReplManager {
   async bgStop(taskId: string, reason: string | undefined, kill: boolean): Promise<ReplResult> {
     const exec = this.findExec(taskId);
     if (!exec) {
+      const dropped = this.droppedTasks.get(taskId);
+      if (dropped) {
+        // This id did not age out of the registry: closing the channel it ran on — which the model asked
+        // for, or which the cap did on its behalf — removed it seconds ago. Saying "pruned after 3 days"
+        // blames a retention window that had nothing to do with it, and leaves the cell's output
+        // unfindable (R4-09).
+        throw new Error(
+          `unknown task: ${taskId}. Its channel "${dropped.channel}" was ${dropped.why}, which removed that channel's tasks from this session. ` +
+            `The cell's output is in ${dropped.logPath}, and the channel's variables went with it.`,
+        );
+      }
       throw new Error(
         `unknown task: ${taskId}. The ID comes from a run that moved to the background; tasks are tracked per pi process and pruned after ${Math.round(RETENTION_MS / 86_400_000)} days.`,
       );
@@ -703,14 +851,18 @@ export class ReplManager {
     if (kill) {
       // The escalation: nothing less reaches a cell that ignores SIGINT, and it costs the channel.
       const alive = !exec.channel.closed;
-      await this.shutdownChannel(exec.channelName);
+      await this.shutdownChannel(exec.channelName, "killed with bg_stop {kill: true}");
       return {
         content: [
           {
             type: "text",
             text:
               `channel "${exec.channelName}" killed${reason ? ` (${reason})` : ""}. The cell was stopped by taking the whole channel down, ` +
-              `so its variables are gone.${alive ? "" : " (the channel was already gone)"}`,
+              `so its variables are gone.${alive ? "" : " (the channel was already gone)"}` +
+              // The kill is the last thing the model will be told about this cell: closing the channel
+              // takes the task out of the listing, so the answer has to carry the log the way a plain
+              // stop does (R4-09).
+              `\nLog: ${exec.logPath}`,
           },
         ],
         details: { channel: exec.channelName, id: taskId, status: "dead", logPath: exec.logPath },
@@ -719,12 +871,16 @@ export class ReplManager {
     }
 
     if (exec.settled) {
+      // The cell really did finish, and the status says so. But a channel that went *after* it finished
+      // is exactly the case where a model reaches for a variable that is no longer there, so the settled
+      // branch reads the death note too (R4-04) — the branch R3-05's fix never walked into.
       return {
         content: [
           {
             type: "text",
             text:
               `task ${taskId} already finished (${statusOf(exec)})${reason ? `; stop requested: ${reason}` : ""}` +
+              this.channelGoneNote(exec) +
               (existsSync(exec.logPath) ? `\nLog: ${exec.logPath}` : ""),
           },
         ],
@@ -765,13 +921,32 @@ export class ReplManager {
    */
   private stoppedResult(exec: Exec, taskId: string): ReplResult {
     const status = statusOf(exec);
-    const death = exec.deathNote ?? (exec.channel.closed ? exec.channel.deathNote : undefined);
-    const gone = death ? `\n${death}; the channel is gone and its variables are lost; the next run on it starts a fresh one` : "";
     return {
-      content: [{ type: "text", text: `task ${taskId} stopped (${status}).${gone}\nLog: ${exec.logPath}` }],
+      content: [{ type: "text", text: `task ${taskId} stopped (${status}).${this.channelGoneNote(exec)}\nLog: ${exec.logPath}` }],
       details: { channel: exec.channelName, id: taskId, status, logPath: exec.logPath },
       structuredContent: { status, task_id: taskId, channel: exec.channelName },
     };
+  }
+
+  /**
+   * The sentence about a channel that went away, for any answer that would otherwise imply the variables
+   * in it survived. Empty when the channel is still there, which is the common case and the promise
+   * `bg_stop` normally keeps (R3-05, R4-04).
+   */
+  private channelGoneNote(exec: Exec): string {
+    const death = exec.deathNote ?? (exec.channel.closed ? exec.channel.deathNote : undefined);
+    if (death) return `\n${death}; the channel is gone and its variables are lost; the next run on it starts a fresh one`;
+    // The host only learns about a death from node's exit event, which under load can trail the process
+    // being gone by an event-loop turn or more. Asked "can I stop this task?", the honest answer in that
+    // window still has to say the channel is not there — and say that the exit status is what is
+    // missing, not that it invented one.
+    if (processGone(exec.channel.pid)) {
+      return (
+        `\nthe Python process behind channel "${exec.channelName}" has stopped (its exit status had not reached the host when this was answered)` +
+        "; the channel is gone and its variables are lost; the next run on it starts a fresh one"
+      );
+    }
+    return "";
   }
 
   // ── Session lifecycle ──────────────────────────────────────────────────────
@@ -819,7 +994,8 @@ export class ReplManager {
    *
    * Keyed by the name the model used, which the record carries. The file name is a sanitised, digested
    * form of it (see `names.ts`) and asking the live channel map with *that* would report a running
-   * channel as lost (R2-04).
+   * channel as lost (R2-04) — so a record with no usable name in it is passed over rather than keyed by
+   * the stem of the file it happens to be in (R4-02).
    */
   lastHistoryByChannel(): Map<string, HistoryRecord> {
     const latest = new Map<string, HistoryRecord>();
@@ -831,33 +1007,41 @@ export class ReplManager {
     }
     for (const entry of names) {
       if (!entry.endsWith(".jsonl")) continue;
-      const stem = entry.slice(0, -".jsonl".length);
       try {
         const lines = readFileSync(join(HISTORY_DIR, entry), "utf8")
           .split("\n")
           .filter((line) => line.trim());
         // A crash mid-append leaves a torn record at the end. Reading only the last line would drop
         // the channel from the note entirely; the newest record that parses still says what it held.
-        let torn = 0;
+        let unusable = 0;
         for (let index = lines.length - 1; index >= 0; index--) {
           try {
             const parsed = JSON.parse(lines[index]!) as HistoryRecord;
             if (!parsed || typeof parsed !== "object") throw new Error("not a record");
-            const channel = typeof parsed.channel === "string" && parsed.channel ? parsed.channel : stem;
+            // A record whose `channel` field is missing or empty cannot be attributed to a channel, and
+            // the file's stem is not one: it is a digest of a name, and keying the note by it both
+            // misses the live channel the note is about and invents a third channel that `run` would
+            // happily create if the model typed the stem back (R4-02, and R3-03's fixed-point rule).
+            // So keep looking further back in the same file rather than inventing a name.
+            const name = typeof parsed.channel === "string" && parsed.channel ? parsed.channel : "";
+            if (!name) {
+              unusable++;
+              continue;
+            }
             const record: HistoryRecord = {
               ...parsed,
-              channel,
+              channel: name,
               ts: typeof parsed.ts === "string" ? parsed.ts : "",
-              ...(torn > 0 ? { torn } : {}),
+              ...(unusable > 0 ? { torn: unusable } : {}),
             };
             // One channel can be remembered by more than one file — `a_b.jsonl` from before names got
             // digests and `a_b-<digest>.jsonl` after — and `readdirSync` order would then decide which
             // cell the model is told about. Keep the newest record by its own timestamp (R3-08).
-            const known = latest.get(channel);
-            if (!known || known.ts <= record.ts) latest.set(channel, record);
+            const known = latest.get(record.channel);
+            if (!known || known.ts <= record.ts) latest.set(record.channel, record);
             break;
           } catch {
-            torn++;
+            unusable++;
           }
         }
       } catch {
@@ -913,7 +1097,11 @@ export class ReplManager {
   }
 
   async quit(): Promise<void> {
-    const channels = [...this.channels.values()];
+    // `starting` holds promises, which nothing can close; `halfStarted` holds the daemons those calls
+    // spawned, and those can (F4-01). A half-started channel is closed with the same one-shot `close`
+    // the start path uses, so whichever of the two gets there first is the one that acts.
+    ++this.quitEpoch;
+    const channels = [...this.channels.values(), ...this.halfStarted];
     this.channels.clear();
     await Promise.all(channels.map((channel) => channel.close()));
   }
@@ -993,11 +1181,29 @@ export function resolveTimeout(timeout: number | undefined): number {
   return timeout;
 }
 
-function intEnv(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
-  if (!raw) return fallback;
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+/**
+ * Await `work`, but stop waiting as soon as the call is cancelled. The work itself is not stopped — it
+ * is either a shared environment build, which is worth finishing for the next caller, or the daemon
+ * spawn, which `startChannel` closes on its own. What this returns is a creation that releases its slot
+ * promptly instead of holding one for a call nobody is waiting for (R4-06).
+ */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined, channel: string): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new ChannelStartAbortedError(channel));
+  return new Promise<T>((resolve, reject) => {
+    const watch = abortWatch(signal);
+    work.then(
+      (value) => {
+        watch.off();
+        resolve(value);
+      },
+      (error) => {
+        watch.off();
+        reject(error);
+      },
+    );
+    void watch.promise.then(() => reject(new ChannelStartAbortedError(channel)));
+  });
 }
 
 /**
@@ -1017,6 +1223,35 @@ function definitionNames(names: string[]): string[] {
 
 function round(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/**
+ * Has this process stopped, as far as something that cannot wait for node's exit event can tell?
+ *
+ * A child that has died but not yet been reported is a zombie, and `kill(pid, 0)` succeeds on a zombie,
+ * so the process-table state is read from `/proc` where that exists. Without `/proc` an unreachable pid
+ * counts as gone and a reachable one as running, which is what the answer did before: it lags a death
+ * by however long node takes to notice it.
+ *
+ * Exported because the state it has to read correctly — a zombie is gone, a running process is not — is
+ * a window in node's own event loop and cannot be walked into from a tool call.
+ */
+export function processGone(pid: number): boolean {
+  if (pid <= 0) return true;
+  let reachable = false;
+  try {
+    process.kill(pid, 0);
+    reachable = true;
+  } catch (error) {
+    reachable = (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+  if (!reachable) return true;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] === "Z";
+  } catch {
+    return false;
+  }
 }
 
 function sleep(ms: number): Promise<void> {

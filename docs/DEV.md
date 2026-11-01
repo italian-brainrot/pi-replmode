@@ -45,8 +45,8 @@ scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so
                    definition of where the environment lives)
 scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
                    "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
-                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 36 mutations /
-                   ~14 minutes (it typechecks each mutation and re-runs a baseline per test file)
+                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 55 mutations /
+                   ~20 minutes (it typechecks each mutation and re-runs a baseline per test file)
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
 ```
 
@@ -98,9 +98,16 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   `import os; os._exit(3)` followed by a second call on the same channel (the death reported, a fresh
   channel next). For `bg_stop`, start a background cell that installs
   `signal.signal(signal.SIGINT, lambda *a: os._exit(7))` and stop it: the answer must say the channel went
-  with the cell. Since R4-06, one more: start a call whose channel is slow to come up and abort it, then
-  `ps` for a `python -m replmode` that outlived the call — an aborted start must not leave a daemon holding
-  a slot, and must not run its cell.
+  with the cell, and since R4-09 that answer ends with `Log: <path>`.
+
+  The aborted-start smoke does not work with `-p`: SIGINT in print mode is a hard kill — no
+  `session_shutdown` runs and no abort fires (measured: an idle daemon survives SIGINT and is closed only
+  by a clean exit). `scripts/smoke-abort-start.sh` does it in the real interactive TUI under a pty, typing
+  the prompt, waiting for the daemon to exist, and pressing Esc as a byte. It needs a slow interpreter:
+  `PI_REPLMODE_ENV_DIR` at a dir whose `bin/python` sleeps before exec'ing the real one, with a long
+  `PI_REPLMODE_READY_TIMEOUT_MS` so the call is still starting when Esc lands. It passes when the tool
+  answers `call aborted while channel "…" was still starting`, the cell's side effect is absent, and no
+  daemon with that `--channel=` is left running.
 
 ## Things that bite
 
@@ -155,11 +162,32 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   one of them where it is quoted (`oneLine`, with the limits as constants in `manager.ts`/`prompt.ts`, and
   the note ring clipped in `Channel.note` so the host never holds the whole string). `details.definitions`
   is deliberately the raw list.
-- **The 50 000-character limit covers the whole answer, not just the capture.** The traceback arrives in
-  the `exec_end` frame and is appended after the capture, so it needs its own share of the budget or a
-  cell that raises with a row of data in its message returns a result of unbounded size (R2-02). If you
-  shorten anything, put the full text in the exec log and bind the nonce global — that is the deal every
-  shortening here makes.
+- **The 50 000-character limit covers the cell's text — the capture *and* the traceback — not the notes
+  around them.** The traceback arrives in the `exec_end` frame and is appended after the capture, so it
+  needs its own share of the budget or a cell that raises with a row of data in its message returns a
+  result of unbounded size (R2-02). If you shorten anything, put the full text in the exec log and bind
+  the nonce global — that is the deal every shortening here makes. What is *not* inside that budget is
+  the text the host adds around the cut: the `[new channel: …]` banner, the truncation notes and their
+  log pointer, the death notes, the daemon's last lines. They add a couple of kilobytes, which is why
+  every `limits.test.ts` assertion allows `MAX_OUTPUT_CHARS + 5_000` — and why no document may promise a
+  whole answer inside the limit (R4-08).
+- **A cancelled call never sends its cell.** `run` threads its `AbortSignal` into the channel creation:
+  a call aborted while its daemon is still coming up closes that half-started daemon (the same teardown
+  a failed start does, and `Channel.close` is one-shot per channel), releases the slot it was holding,
+  and answers "aborted" without putting the cell on the wire; a call aborted while it queued behind
+  another call on the same channel sends nothing either (R4-06). This is consistent with the interrupt
+  rule — an abort detaches or interrupts, it never kills a running cell — and it is what makes Esc the
+  only way out of a wedged start.
+- **A quit closes daemons that never finished starting.** `starting` holds promises, and nothing can close
+  a promise, so `startChannel` hands the manager the daemon the instant it spawns (`halfStarted`) and
+  `quit()` closes those as well as the live channels. `createChannel` also compares a **quit epoch**: a
+  start that began before a quit and finishes during it is closed rather than adopted, because the map it
+  would be adopted into is one the quit has just cleared. The epoch, not a flag — the manager outlives
+  sessions, so a flag would poison the next one (F4-01).
+- **A channel is only a channel while its process is.** `channel.closed` turns true when node is *told*
+  about a death, which can lag the death itself, so `getChannel` asks `processGone` (a zombie counts as
+  gone) before handing a caller a channel, and the settled-task branch of `bg_stop` asks the same question
+  before implying a channel is alive (F4-02, R4-04).
 - **An interrupt has two paths.** Running bytecode: CPython's default handler raises in the cell.
   Parked on an `await`: the loop catches the `KeyboardInterrupt` and `Runner.interrupt_cell` puts it on
   the future the cell task waits for (`asyncio.Task` has no `throw`). Keep the raw loop and the default
@@ -179,12 +207,27 @@ spikes/            the experiments that proved interrupt and formatter behaviour
 - **The channel cap counts daemons that are still starting.** `run` is parallel and the prompt recommends
   one channel per piece of work, so five calls on five new names arrive in one tick; counting only
   daemons that have answered gives five processes under a cap of 2 (R2-03). Anything that moves the
-  `channels.set` / `starting.delete` handoff has to keep the union of the two maps correct.
+  `channels.set` / `starting.delete` handoff has to keep the union of the two maps correct — which is
+  also why an aborted start is cancelled *inside* `createChannel`/`startChannel` rather than by racing
+  `getChannel` from outside: a creation that is still running in the background would otherwise install
+  its daemon in `channels` after the call that spawned it gave up (R4-06).
+- **A test file must not import from `src/` at the top of the file.** `loadExtension` points
+  `PI_CODING_AGENT_DIR` at a temp dir *before* it imports the extension, and `src/paths.ts` fixes
+  `EXEC_LOG_DIR`, `HISTORY_DIR` and the rest at import time — so a static `import { x } from "../src/…"`
+  evaluates those paths while the environment still names the user's real agent dir, and the extension
+  can end up running the whole file against `~/.pi/agent/replmode/`. Import the module under test inside
+  a test (`await import("../src/manager.ts")`), or use `vi.resetModules()` plus a second
+  `loadExtension({agentDir})` the way `names.test.ts` does. That file's top-level `getManager()` works
+  only because the manager is a `globalThis` singleton built by the extension's own correctly-pathed
+  module instance; do not copy that shape for anything that reads a path.
 - **vitest timing**: `bg_wait` returns when *any* task finishes, so assertions about elapsed time
   must be relative to when each task was started, not to the cell's own length. Anything that waits on
   real signal delivery is timing-sensitive; prefer `waitFor` over fixed sleeps, and never assert on
   *where* a racy interrupt landed (a SIGINT left pending across an exec boundary may be reported as the
-  cell or as the loop, and both are correct).
+  cell or as the loop, and both are correct). A full-suite run is loaded enough that node can trail a
+  child's death by more than one poll interval: `bg_stop` on a task whose channel died an instant earlier
+  was flaky for exactly that reason, which is why `bgStop` asks `processGone` rather than trusting
+  `channel.closed` alone.
 - **Temp litter**: a full vitest run leaves a few dozen `/tmp/replmode-agent-*` and `/tmp/replmode-cwd-*`
   directories behind (a few MB in total) — `loadExtension` removes the agent dir it created itself, but
   `names.test.ts` shares one across its tests via `makeTempDir` and no file removes that one, and the cwd

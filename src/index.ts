@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-codi
 import { Type } from "typebox";
 import { ChannelBusyError } from "./channel.ts";
 import { DEFAULT_BG_WAIT_TIMEOUT_SEC, getManager, type ReplResult, type RunParams, resolveTimeout, type TaskStatus } from "./manager.ts";
-import { renderSection, SECTION_NAME } from "./prompt.ts";
+import { historyChannelLabel, renderSection, SECTION_NAME } from "./prompt.ts";
 
 const RUN_DESCRIPTION =
   "Execute Python code in a stateful IPython REPL. This is how you read, edit, and write files and run " +
@@ -31,7 +31,11 @@ const RUN_PARAMETERS = Type.Object({
   ),
   channel: Type.Optional(
     Type.String({
-      description: 'Isolated REPL instance (default "main"), created on first use. Separate variables and process per channel.',
+      description:
+        'Isolated REPL instance (default "main"), created on first use. Separate variables and process per channel. ' +
+        // R4-07: this is where a name is chosen, so this is where the rule that makes a call fail has to
+        // be — the refusal alone leaves the model to discover it once a session.
+        "A name is at most 200 characters: it names the log and history files of that channel.",
     }),
   ),
 });
@@ -164,8 +168,10 @@ export default function (pi: ExtensionAPI): void {
     section = renderSection(manager.lostChannelNotes());
     const notes = manager.lostChannelNotes();
     if (notes.length > 0 && ctx.hasUI) {
+      // Quoted through the same bound as the section: this is the other place a remembered name reaches
+      // a model, and it reads the same history files (R4-01).
       ctx.ui.notify(
-        `pi-replmode: ${notes.length} channel(s) from a previous session are gone (${notes.map((note) => note.channel).join(", ")}); their variables were lost`,
+        `pi-replmode: ${notes.length} channel(s) from a previous session are gone (${notes.map((note) => historyChannelLabel(note)).join(", ")}); their variables were lost`,
         "info",
       );
     }

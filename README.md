@@ -77,10 +77,15 @@ is then the only way out, and it costs the channel's variables.
 
 ### Output over 50 000 characters
 
-The limit covers the whole answer, the traceback included. The middle is cut, head and tail kept, and
-nothing is simply dropped: the whole output is written to a per-cell log file, and the same log is
-bound to a global named `_out_a91f0c` in that channel, so the next cell can slice it without
-re-running anything.
+The limit is spent on the cell's own text: its output and its traceback together, with the traceback
+explicitly given a share of the budget so an exception carrying a megabyte of data in its message
+cannot make the answer unbounded. The middle is cut, head and tail kept, and nothing is simply
+dropped: the whole output is written to a per-cell log file, and the same log is bound to a global
+named `_out_a91f0c` in that channel, so the next cell can slice it without re-running anything.
+
+The text *around* that — the `[new channel: …]` banner, the notes explaining which parts were cut and
+where the whole thing is, the daemon's last lines when a channel died — sits outside the budget, so a
+`run` answer can come back a couple of kilobytes over 50 000 characters.
 
 ## Python environment
 

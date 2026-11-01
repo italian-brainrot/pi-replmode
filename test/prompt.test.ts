@@ -257,4 +257,14 @@ describe("what the README promises about the output limit", () => {
       /limit covers the whole answer/i,
     );
   });
+
+  it("R4-08: and replaces the claim with the one that is true", () => {
+    // Forbidding the false sentence is only half of it — the other half is that the replacement stays.
+    // Without this, deleting the paragraph altogether would satisfy the test above and leave the README
+    // silent about how big an answer can be, which is how the false claim got there in the first place.
+    const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
+    expect(readme, "the README no longer says what the 50 000 characters are spent on").toMatch(/output and its traceback together/i);
+    expect(readme, "the README does not say that the notes around a cut are outside the limit").toMatch(/outside the budget/i);
+    expect(readme, "the README does not admit that an answer can go over the limit").toMatch(/over 50 000/i);
+  });
 });

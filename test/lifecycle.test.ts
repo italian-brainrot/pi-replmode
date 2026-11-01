@@ -511,6 +511,36 @@ while True:
     const frames = existsSync(framesFile) ? readFileSync(framesFile, "utf8") : "";
     expect(frames, `the aborted call sent its cell to a daemon that came up late: ${frames}`).not.toContain("execute");
   });
+
+  it("R4-06: and the aborted call gets its answer at once, not when the ready timeout happens to fire", async () => {
+    // The two probes above are about what an aborted start leaves behind. This one pins how the answer
+    // arrives: the abort has to reach the start race itself. If it does not, the call sits until the
+    // daemon's ready timeout — and pressing Esc is only honoured whenever that timeout is short, which
+    // in a real session (two minutes) is indistinguishable from never.
+    const pidFile = join(ext.agentDir, "aborted-promptly.pid");
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    const controller = new AbortController();
+    const started = Date.now();
+    await withStub("aborted-promptly", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
+      const wedged = ext.callTool(
+        "run",
+        { code: "print('cancelled while starting')", channel: "l-abortfast" },
+        { signal: controller.signal },
+      );
+      await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
+      controller.abort();
+
+      const cancelled = await wedged;
+      expect(cancelled.isError, "the aborted call somehow succeeded").toBe(true);
+      expect(text(cancelled), `the aborted call did not say it was aborted: ${text(cancelled)}`).toContain("aborted");
+      const stubPid = Number(readFileSync(pidFile, "utf8"));
+      await waitFor(() => !isPidAlive(stubPid), 20_000, "the daemon of an aborted start to be stopped with it");
+    });
+    expect(Date.now() - started, "an aborted start waited for the ready timeout instead of for the abort").toBeLessThan(10_000);
+  });
 });
 
 describe("a daemon that dies before its first output boundary", () => {
@@ -699,5 +729,75 @@ time.sleep(60)
 
     const after = await ext.callTool("run", { code: "print('fresh channel after the interrupt')", channel: "l-intdeath" });
     expect(text(after)).toContain("fresh channel after the interrupt");
+  });
+});
+
+describe("a session that ends while a channel is still starting", () => {
+  // A quit in the middle of a file closes every channel that file has open. That is fine here (each test
+  // names its own channel and starts it again), and it is why these two come last: nothing after them
+  // can assume a channel from before them is still alive.
+  it("F4-01: takes the half-started daemon down with it instead of leaving it running", async () => {
+    // `bg_stop` has no task id for a channel that is still starting, and pass 3 accepted that. The host
+    // does hold the creation, though, and `quit()` read only the map of *live* channels: a session
+    // interrupted while a channel was coming up left a `python -m replmode` running with nobody left to
+    // talk to it. Found with the real-pi smoke, not by any test.
+    const pidFile = join(ext.agentDir, "quit-mid-start.pid");
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    let call: Promise<any> | undefined;
+    await withStub("quit-mid-start", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
+      call = ext.callTool("run", { code: "print(1)", channel: "l-quitstart" }, { signal: new AbortController().signal });
+      await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
+      const shutting = Date.now();
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+      expect(Date.now() - shutting, "the quit waited for the ready timeout instead of closing the daemon").toBeLessThan(5_000);
+    });
+
+    const result = await call!;
+    const stubPid = Number(readFileSync(pidFile, "utf8"));
+    expect(stubPid, "the stub daemon never wrote its pid").toBeGreaterThan(0);
+    await waitFor(() => !isPidAlive(stubPid), 20_000, "a quit to stop the daemon that was still starting");
+    expect(result.isError, "the call the quit interrupted answered as if it had run").toBe(true);
+    expect(text(result), `the answer blames something other than the ending session: ${text(result)}`).toMatch(/session ended/);
+  });
+
+  it("F4-01: and a daemon that becomes ready during the quit is not handed to the next session", async () => {
+    // The quit walks the daemons it knows about, and a start already in flight can still finish inside
+    // that window. Without the epoch check that daemon is adopted into a map the quit has already
+    // cleared — nothing will ever close it — and its cell goes on the wire to a session that has ended.
+    // The margins here are wide on purpose: the late daemon answers ready 1.2s in, while the quit is
+    // still inside the 3s grace it gives a daemon that will not take SIGTERM.
+    const pidDir = join(ext.agentDir, "f401-late");
+    mkdirSync(pidDir, { recursive: true });
+    const script = `import os, signal, sys, time
+channel = [a for a in sys.argv if a.startswith("--channel=")][0].split("=", 1)[1]
+open(${JSON.stringify(`${pidDir}/`)} + channel + ".pid", "w").write(str(os.getpid()))
+signal.signal(signal.SIGTERM, lambda *a: None)
+if channel == "l-quitlate":
+    time.sleep(1.2)
+    print(${JSON.stringify(readyFrame("l-quitlate"))}, flush=True)
+time.sleep(600)
+`;
+    let late: Promise<any> | undefined;
+    let stubborn: Promise<any> | undefined;
+    await withStub("quit-late-ready", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
+      // One daemon that will not die, so the quit is still walking when the other one answers.
+      stubborn = ext.callTool("run", { code: "print(1)", channel: "l-quitstubborn" }, { signal: new AbortController().signal });
+      late = ext.callTool("run", { code: "print(1)", channel: "l-quitlate" }, { signal: new AbortController().signal });
+      await waitFor(() => existsSync(join(pidDir, "l-quitlate.pid")), 15_000, "both stub daemons to exist");
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+    });
+
+    const results = await Promise.all([late!, stubborn!]);
+    for (const name of ["l-quitlate", "l-quitstubborn"]) {
+      const pid = Number(readFileSync(join(pidDir, `${name}.pid`), "utf8"));
+      await waitFor(() => !isPidAlive(pid), 20_000, `${name} to be stopped by the quit`);
+    }
+    for (const result of results) {
+      expect(result.isError, "a call whose session ended answered as if it had run").toBe(true);
+      expect(text(result), `the answer does not say the session ended: ${text(result)}`).toMatch(/session ended/);
+    }
   });
 });

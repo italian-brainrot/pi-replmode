@@ -126,6 +126,51 @@ describe("killing a channel", () => {
     expect(text(after), "the variables the model was left believing in are still there, so the note is noise").toContain("[new channel");
   });
 
+  it("R4-04: and a process that has stopped but is not reaped yet reads as gone", async () => {
+    // The window `channelGoneNote`'s fallback exists for: node has not been told about a death yet, so
+    // the host's own flags still say the channel is there, and an answer built in that window must not
+    // imply its variables survived. A zombie is the state to get right — `kill(pid, 0)` succeeds on one
+    // — and a cell makes one at will, because Python never reaps a child nobody waits for.
+    //
+    // Imported here rather than at the top of the file: a static import of `src/` evaluates `paths.ts`
+    // before `loadExtension` has pointed `PI_CODING_AGENT_DIR` at a temp dir, and the extension would
+    // then run this whole file against the real `~/.pi/agent/replmode/`.
+    const { processGone } = await import("../src/manager.ts");
+    const task = await run('import subprocess\nchild = subprocess.Popen(["/bin/true"])\nprint("child", child.pid)', {
+      channel: "r-zombie",
+      timeout: 20,
+    });
+    const childPid = Number(/child (\d+)/.exec(text(task))?.[1]);
+    expect(childPid, `the cell did not report a child pid: ${text(task)}`).toBeGreaterThan(1);
+
+    // The live channel's own daemon must not read as gone: a probe that says otherwise would report
+    // every working channel as lost, which is the harm R2-04 was about.
+    expect(processGone(task.details.pid!), "a live channel's daemon reads as gone").toBe(false);
+    await waitFor(() => processGone(childPid), 10_000, "the child the cell never waited for to read as gone");
+  });
+
+  it("F4-02: a call that arrives in the moment after a daemon dies gets a fresh channel, not a dead answer", async () => {
+    // A daemon killed and a call that follows it at once: node has not been told about the death, the map
+    // still holds a channel whose `closed` is false, and the call is handed that channel — its cell goes
+    // to a dead pipe and the answer blames a death the model can do nothing about. This is the window a
+    // flake in the test above fell into. The busy-wait is the point of the test, not a delay: it keeps the
+    // loop from delivering the exit event before the call looks at the map, so the window is occupied on
+    // purpose instead of raced.
+    const first = await run("print('first')", { channel: "r-deadwindow", timeout: 20 });
+    expect(text(first)).toContain("first");
+    process.kill(first.details.pid!, "SIGKILL");
+    const until = Date.now() + 100;
+    while (Date.now() < until) {
+      // hold the event loop: the child-exit event must still be pending when `run` asks for its channel
+    }
+
+    const after = await run("print('second')", { channel: "r-deadwindow" });
+    const shown = text(after);
+    expect(shown, `a call in the window after a death was handed the dead channel: ${shown}`).toContain("[new channel");
+    expect(shown, "the fresh channel did not run the cell").toContain("second");
+    expect(after.details.status, "the fresh channel did not come up live").toBe("completed");
+  });
+
   it("R3-05: and a kill for a task whose channel is already gone says so without contradicting itself", async () => {
     // The escalation branch, probed at the edge R3-05's fix sits next to: the channel died on its own
     // first, and the model asks for `kill: true` afterwards. The answer must not pretend it took

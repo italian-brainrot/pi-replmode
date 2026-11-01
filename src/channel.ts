@@ -18,7 +18,11 @@
  * oldest chunk, never dropped whole) and belongs to whichever block opens next. If the channel never
  * became ready, that buffer — the interpreter's own complaint — is worth more to the model than the
  * daemon's log file would be, so the host writes it into that path and points the failed start at it
- * (R3-07); a channel that *did* run keeps that file for itself.
+ * (R3-07); a channel that *did* run keeps that file for itself. Both ways a start fails say why in the
+ * call that asked for it: a daemon that dies is reported by the exit handler, and a daemon that is
+ * alive but never reports `ready` is stopped and reported the same way (R4-03). A call its user
+ * cancelled while its channel was still starting closes the half-started daemon and never sends its
+ * cell (R4-06).
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -39,6 +43,8 @@ const DEFAULT_READY_TIMEOUT_MS = 120_000;
 const SENTINEL_GRACE_MS = 750;
 /** How long a dead channel's stdio is given to drain before its start failure is reported (R2-06). */
 const STDIO_DRAIN_MS = 200;
+/** How long a daemon that never came up is given to leave on its own before the group is taken down. */
+const START_SHUTDOWN_GRACE_MS = 500;
 /** How much of a failed daemon's own complaint reaches the model; the rest stays in its log file. */
 const START_FAILURE_MAX_CHARS = 3000;
 /** How long an interrupt is given before an aborted call gives up and backgrounds the cell. */
@@ -73,6 +79,14 @@ export interface ChannelStart {
   name: string;
   cwd: string;
   env: PythonEnv;
+  /** The calling tool call's signal: an aborted call abandons the channel it was starting (R4-06). */
+  signal?: AbortSignal;
+  /**
+   * Handed the daemon the moment it has spawned, before it answers `ready`. A channel that is still
+   * starting is in none of the maps a shutdown reads, and a host that ends the session while one is
+   * coming up would otherwise leave it running with nobody left to talk to it (F4-01).
+   */
+  onSpawned?: (channel: Channel) => void;
 }
 
 export type ExecOutcome = "finished" | "detached" | "abandoned" | "dead";
@@ -249,6 +263,18 @@ export class Exec {
   }
 }
 
+/**
+ * The call that was starting this channel was cancelled, so the channel was closed again and its cell
+ * was never sent. Phrased for both readers: the aborted call sees it as its own reason for stopping,
+ * and a second call that was waiting on the same creation sees it as a start failure it did not cause.
+ */
+export class ChannelStartAbortedError extends Error {
+  constructor(readonly channel: string) {
+    super(`the call that was starting channel "${channel}" was cancelled, so its daemon was closed and nothing was sent to it`);
+    this.name = "ChannelStartAbortedError";
+  }
+}
+
 export class ChannelBusyError extends Error {
   constructor(
     readonly channel: string,
@@ -289,6 +315,8 @@ export class Channel {
   /** What the daemon said in its `fatal` frame: the reason it could not start, in its own words. */
   private fatalNote?: string;
   private startFailureReported = false;
+  /** One teardown per channel: `close` can be reached from a failed start *and* from the manager. */
+  private closing?: Promise<void>;
   private readySettle: (frame: ReadyFrame) => void = () => {};
   private readyFail: (error: Error) => void = () => {};
 
@@ -491,29 +519,64 @@ export class Channel {
   private reportStartFailure(): void {
     if (this.startFailureReported) return;
     this.startFailureReported = true;
-    const parts = [this.deathNote, this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined, this.startupOutput()];
-    // The whole answer still has to fit the tool's limit, and a broken interpreter can write a great
-    // deal before it dies: keep the head and the tail, and send the model to a file for the
-    // rest. Tail-heavy, because the line that says *why* is at the end of a traceback.
+    this.readyFail(this.startFailureError());
+  }
+
+  /**
+   * Stop a daemon that is alive but never reported `ready`, and report it the way a daemon that died is
+   * reported (R4-03).
+   *
+   * That was not always the case: the ready timeout threw a bare "did not report ready" while the
+   * interpreter's complaint sat in `loose`, and R3-07's write-and-point — which hangs off the exit
+   * handler — only ran about half a second later, on a file the answer never named. So the process is
+   * stopped first (there is a death to describe now), its pipes get the same bounded moment the exit
+   * path gives them, and the reason is built from everything it said.
+   */
+  async reportNeverReady(reason: string): Promise<Error> {
+    this.startFailureReported = true;
+    // Started, not awaited: the answer should not wait for a stubborn process group to come down.
+    void this.close(START_SHUTDOWN_GRACE_MS);
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, STDIO_DRAIN_MS);
+      timer.unref?.();
+      this.proc.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    const said = [this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined, this.startupOutput()].filter((part): part is string =>
+      Boolean(part?.trim()),
+    );
+    return this.startFailureError(
+      said.length > 0
+        ? `${reason}; it was stopped after the timeout, and this is what it said before it stopped`
+        : `${reason}; it said nothing at all before it was stopped`,
+    );
+  }
+
+  /**
+   * Why this channel is not coming up, with everything the process said about itself. `reason` replaces
+   * the exit note for a process the host stopped rather than one that died.
+   *
+   * The whole answer still has to fit the tool's limit, and a broken interpreter can write a great
+   * deal before it dies: keep the head and the tail, and send the model to a file for the
+   * rest. Tail-heavy, because the line that says *why* is at the end of a traceback.
+   */
+  private startFailureError(reason?: string): Error {
+    const parts = [reason ?? this.deathNote, this.fatalNote ? `the daemon said: ${this.fatalNote}` : undefined, this.startupOutput()];
     const said = truncateMiddle(parts.filter((part): part is string => Boolean(part?.trim())).join("\n"), START_FAILURE_MAX_CHARS, 0.35);
-    if (!said.truncated) {
-      this.readyFail(new Error(said.text));
-      return;
-    }
+    if (!said.truncated) return new Error(said.text);
     // The pointer used to name the daemon's own log file, and that was wrong twice over: an interpreter
     // that died before `python -m replmode` ran never opened it, and even when it exists the log holds
     // `log` frames, never the capture stream where the complaint arrived. So the host writes what it did
     // receive into that path, and the file the answer sends the model to has the bytes (R3-07).
     const written = this.writeFailedStartOutput();
-    if (!written) {
-      this.readyFail(new Error(`${said.text}\n[the rest of the daemon's output was dropped and could not be saved]`));
-      return;
-    }
+    if (!written) return new Error(`${said.text}\n[the rest of the daemon's output was dropped and could not be saved]`);
     const dropped =
       this.looseDropped > 0
         ? `\n[${this.looseDropped} bytes from the middle of that output were dropped and are not in that file either]`
         : "";
-    this.readyFail(new Error(`${said.text}\n[the daemon's full output is in ${written}]${dropped}`));
+    return new Error(`${said.text}\n[the daemon's full output is in ${written}]${dropped}`);
   }
 
   /**
@@ -723,7 +786,14 @@ export class Channel {
    * holding the port and the CPU that made the channel worth killing in the first place. So the group
    * is always taken down, whether the daemon cooperated or not.
    */
-  async close(graceMs = 3000): Promise<void> {
+  close(graceMs = 3000): Promise<void> {
+    // One teardown, whichever of the paths reaches it first: a start failure that already started
+    // closing its channel must not be joined by the manager closing the channel it never got.
+    this.closing ??= this.closeOnce(graceMs);
+    return this.closing;
+  }
+
+  private async closeOnce(graceMs: number): Promise<void> {
     const exited = this.exitPromise();
     if (!this.closed) {
       try {
@@ -820,22 +890,37 @@ export async function startChannel(start: ChannelStart): Promise<Channel> {
   );
 
   const readyTimeoutMs = readyTimeout();
+  start.onSpawned?.(channel);
   const timeout = sleep(readyTimeoutMs);
+  const abort = start.signal ? abortWatch(start.signal) : undefined;
+  // The three ways a start stops, told apart because they deserve different answers: the daemon died
+  // (its `ready` promise rejected, already carrying what it said), it never came up, or the call asking
+  // for it was cancelled.
+  const GAVE_UP = { kind: "timeout" } as const;
+  const CANCELLED = { kind: "cancelled" } as const;
   try {
-    const ready = await Promise.race([
+    const outcome = await Promise.race([
       channel.readyPromise,
-      timeout.promise.then(() => {
-        throw new Error(`the channel daemon did not report ready within ${readyTimeoutMs / 1000}s`);
-      }),
+      timeout.promise.then(() => GAVE_UP),
+      ...(abort ? [abort.promise.then(() => CANCELLED)] : []),
     ]);
-    channel.ready = ready;
+    if ("kind" in outcome) {
+      if (outcome.kind === "timeout") {
+        throw await channel.reportNeverReady(`the channel daemon did not report ready within ${readyTimeoutMs / 1000}s`);
+      }
+      throw new ChannelStartAbortedError(start.name);
+    }
+    channel.ready = outcome;
     return channel;
   } catch (error) {
-    // Nothing is half-started: a channel that never became ready is closed and reaped.
-    void channel.close(500);
+    // Nothing is half-started: a channel that never became ready is closed and reaped, and an aborted
+    // call leaves no daemon behind to hold a slot (R4-06). `close` is idempotent, so a start failure
+    // that is already closing its own channel is not closed twice.
+    void channel.close(START_SHUTDOWN_GRACE_MS);
     throw error;
   } finally {
     timeout.cancel();
+    abort?.off();
   }
 }
 

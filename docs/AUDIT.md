@@ -1838,3 +1838,446 @@ Then: `npm run check`, re-run `bash scripts/mutation-audit.sh` (add a line per f
 pass added are in the "pass 4's re-pins" block), and the real-`pi` smoke: the DEV.md prompt, one dash-named
 channel, `os._exit(3)`, and the `bg_stop` death sentence — plus, new this pass, one call aborted while its
 channel is starting, checked afterwards with `ps` for a daemon that should not exist.
+---
+
+## Pass 4 fixes — 2026-11-01 (fixer)
+
+Gate at the start: `tsc`/`biome` green, **185 vitest (172 pass, 13 fail)**, 47 pytest — the thirteen
+failures are pass 4's holding tests. Gate at the end: **green — `tsc`, `biome`, 191 vitest, 47 pytest**,
+two full runs with the same result (the first run of the gate had one failure, and it was a real defect:
+see F4-02). All nine findings are fixed; the thirteen holding tests went green
+untouched except one assertion in `test/limits.test.ts` that could not be satisfied by any working code
+in the file it lives in, argued under "One test changed (pass 4 fixes)". Five tests were *added*: two to
+pin the fixes themselves — the promptness of an aborted start (`lifecycle`) and the README's honest limit
+claim (`prompt`), because the R4-08 fix was a sentence and a fix that is a sentence needs a test that
+reads the sentence — one for the zombie case of the gone-process probe (`resilience`), two for a leak the
+smoke turned up (F4-01, below), and one for a defect a flake turned up (F4-02, below).
+
+The order was the one the handoff asked for: R4-06 first (the two tests were 30 s each), then R4-03,
+R4-02, R4-01, then the `bg_stop` pair, then the three wording findings.
+
+Real-`pi` smoke re-run (throwaway agent dir, thinking on for `qwen38-flash-next`): the DEV.md two-call
+prompt answers 42; a channel named `-smoke-dash` starts, keeps state across calls, and its first answer is
+`[defined by this cell: x]`; `os._exit(3)` comes back as
+
+```
+[new channel "diesoon": python 3.14.9, ipython 9.18.0, cwd /tmp, pid 405608, started in 18ms]
+
+(no output)
+
+[the Python process behind channel "diesoon" ended (exit code 3)]
+
+[the channel is gone and its variables are lost; the next run on it starts a fresh one]
+```
+
+and the next call on that name starts a fresh channel; a `bg_stop {kill: true}` on a cell that traps SIGINT
+now ends with `Log: /tmp/pi-smoke-agent4/replmode/exec/repl-zpw48uy0.log`, which is R4-09 at the real
+layer; and the new abort smoke answers
+
+```
+call aborted while channel "smoke-abort" was still starting: nothing was sent to it, and the slot its
+daemon held is free again
+```
+
+with the cell's side-effect file absent and no daemon with `--channel=smoke-abort` left running.
+
+That last one needed a new script, `scripts/smoke-abort-start.sh`, because **`pi -p` cannot smoke an
+abort**: SIGINT in print mode is a hard kill (exit 130) — no `session_shutdown` runs and no `AbortSignal`
+fires. Measured with a control: a session with an idle live channel, SIGINTed, left that daemon running;
+the same session ended with `/exit` closed it. My first two attempts at the smoke "failed" for exactly
+that reason, and it only became a real test once the interactive TUI was in the loop — the script runs `pi`
+under a pty (`script -qec`), types the prompt, waits for the daemon to exist, and sends the byte for Esc.
+DEV.md now says so, because the paragraph it used to have ("start a call whose channel is slow to come up
+and abort it, then `ps`") described something that cannot be done that way.
+
+### R4-06 — an aborted call abandons the channel it was starting
+
+The signal is threaded through the thing the user is cancelling, as pass 4 predicted, and it turned out
+to need three pieces, because the slot, the daemon and the cell are three different objects:
+
+- **`startChannel` takes a `signal`** and races `ready` against the timeout *and* the abort. The abort
+  branch throws a new `ChannelStartAbortedError`, and the existing "nothing is half-started" catch closes
+  the daemon — `Channel.close` is now one-shot per channel (`this.closing ??= …`), which is what makes it
+  safe for the catch to close a channel the start path is already tearing down, and what keeps a `quit()`
+  from starting a second close of the same group.
+- **`getChannel` releases the name the moment the signal fires**, not when the start settles:
+  `signal.addEventListener("abort", release, {once: true})`, guarded by promise identity so an aborted
+  creation can never delete a newer one, and detached in the `finally` because one signal is handed to many
+  calls in a session and a listener per call would outlive them. This is the part the tests cannot see — a
+  release that happens *when the start settles* satisfies both holding tests (they wait for the answer
+  first), and the user pressing Esc twice would still wait.
+- **`run` refuses to send the cell** if the signal fired while the call was queued behind another call on
+  the same channel, and turns its own `ChannelStartAbortedError` into an answer (`aborted: true`,
+  `status: "dead"`) rather than the "channel could not start" prose it would otherwise write. A second
+  call that *joined* an in-flight creation sees that creator's cancellation as a start failure with the
+  creator named — deliberate: one signal cannot cancel a creation another call is still waiting on.
+
+`createChannel` also stops at `untilAborted(ensureEnv(…), signal)` before it spawns, so an abort during a
+cold environment build answers at once. It does **not** cancel the build itself — the build is
+single-flight and shared, and finishing it is worth it for the next call.
+
+R3-04's capacity wording changed in the same commit: the refusal now says "wait for the call that is
+starting to finish, **or cancel it**, and try again then", which was false at the time pass 3 wrote it and
+is true now.
+
+Deliberately weak: **the release is synchronous, the teardown is not.** An aborted start releases the slot
+immediately and closes its daemon in the background, so for a few hundred milliseconds two daemons can
+exist under a cap of 1. That is a resource-accounting choice, not a bug — waiting for the teardown is what
+made Esc useless, and the next call either reuses the environment or builds nothing at all. The other
+choice is the answer: it says "nothing was sent, so nothing ran", which is true for the paths that reach
+`runLocked`, and true *by construction* for the start path because the abort branch throws before the cell
+is sent. Pass 5 should try hard to find a case where the cell runs anyway.
+
+*Pass 5 should try:* abort exactly as `ready` arrives (is the daemon closed, and does the answer say
+aborted?); abort the *joining* second call while the creator waits; abort a call queued behind a long
+running cell on a live channel (does that cell keep running? it should); abort during a cold env build and
+then start a channel immediately (does the next call see the half-finished environment?); Esc twice in a
+row; two aborted starts of the same name; whether `status: "dead"` is right for an aborted start (it is
+the only value that means "this channel does not exist" — argue it if you disagree, pass 2 already
+accepted the same shape for argument errors).
+
+### F4-01 (found by the fixer, with that smoke) — a quit that cannot see a channel that is still starting
+
+Chasing the smoke above turned up a leak no test held: `quit()` walked `this.channels`, and a channel that
+is still starting is not in `this.channels` — it is a promise in `this.starting`, which nothing can close.
+So a session that ended while a channel was coming up (a `/quit`, or an Esc-driven end with a call in
+flight) left that daemon running under nobody: the start would finish, the cell would go on the wire to a
+caller that had already gone away, and the channel would be filed into the map the quit had just cleared,
+so no later shutdown would ever look at it.
+
+Two pieces:
+
+- `startChannel` calls an `onSpawned` hook the moment the daemon exists, and the manager keeps those
+  daemons in a `halfStarted` set; `quit()` closes that set as well as `this.channels`. A daemon spawned
+  after the quit began walking its set is closed on sight.
+- `createChannel` captures a **quit epoch** and refuses to adopt a daemon that finishes after the quit it
+  raced: it closes it and answers "the session ended while this channel was starting". A start that
+  *begins* after a quit captures the new epoch and is adopted normally, because the manager outlives
+  sessions (`globalThis`) — a permanent "a quit happened" flag would break the next session, and that is
+  not hypothetical: `test/lifecycle.test.ts` already emits a quit in the middle of the file, and my first
+  version of this flag broke nine of its tests.
+
+Pinned twice: a daemon that never becomes ready while a quit runs (the daemon is gone, the quit takes
+seconds rather than the ready timeout, and the call answers with the session sentence), and a daemon that
+becomes ready *during* a quit — the second needs a stub that ignores SIGTERM so the quit is still walking
+when the ready lands, and it is the test that catches "the finished daemon is adopted by a session that no
+longer exists".
+
+Deliberately weak: the `onSpawned` branch that closes a daemon spawned **after** the quit started walking
+its set is not pinned. Reaching it means a window of milliseconds between the quit collecting the set and
+the spawn, and every way I found to force it needed a stub answering ready on a schedule tight enough to
+be a flake. The epoch check catches the same hazard a moment later, which is why this is a gap rather than
+a hole — and it is why there is no mutation for that branch.
+
+### F4-02 (found by a flake) — a channel the process table says is gone is not a channel
+
+The R4-04 test flaked in the first full gate run and passed in the second. After its `kill -9`, the
+follow-up `run` on the same name was handed the *dead* channel: the map still held it, because
+`channel.closed` only turns true once node has been told, and the call's cell went to a dead pipe. The
+answer was not a lie (`the Python process behind channel "r-stopgone" ended (exit code unknown, signal
+SIGKILL)`), but it charged a call that never ran for a death the model had already been told about, and
+whether it happened depended on which side of an event-loop turn the call landed.
+
+`getChannel` now asks the probe R4-04 introduced: a name whose daemon the process table says is gone (a
+zombie counts) is dropped from the map and started fresh. The flake is gone from `resilience.test.ts`, and
+the new test occupies the window deliberately instead of racing it — a synchronous busy-wait after the
+kill, so the child-exit event is still pending when the call looks at the map. Without the probe that test
+fails every time; with it, every time.
+
+Deliberately weak: one `kill(pid, 0)` and one `/proc` read per `getChannel`, and it trusts the pid the host
+spawned. A pid recycled to an unrelated process between the death and the call — which needs the daemon to
+die, be reaped and its pid to wrap inside an event loop turn — would restart a live channel for no reason:
+the state is wrong for one call, not corrupted. Pass 5 should try to break it anyway: a stopped (`T`)
+daemon, a channel whose spawn failed and so has no usable pid (`processGone` deliberately reads anything
+non-positive as gone), and a channel reused across a `/reload`.
+
+### R4-03 — a daemon that never becomes ready says what it said
+
+The ready-timeout branch no longer throws a bare message. It stops the daemon, gives its stdio a bounded
+drain (the same `STDIO_DRAIN_MS` the exit path uses, or whichever comes first: the timeout or the pipes'
+`close` event), and builds the answer through the *same* `startFailureError()` as the exit path, with one
+difference: the death-note clause is replaced by an explicit "the daemon was stopped before it became
+ready — if it kept running, the output below is all the host received". `fatalNote` and the captured
+startup bytes are appended in the same order, and the same 3 000-character cut applies, so a long
+complaint becomes the same `[the daemon's full output is in <file>]` pointer — which is honest now because
+the never-ready path went through the same "write what I received to the daemon's log path" helper as the
+failed-exit path (R3-07), and `startFailureReported` is set first so the exit that follows our own kill
+does not write the file twice.
+
+Deliberately weak: **the answer waits 200 ms, not the teardown.** A daemon that ignores SIGTERM keeps its
+group dying in the background while the model already has its answer; and for this path the *death note*
+is deliberately not quoted, because the death is ours. `reportStartFailure` is now
+`startFailureError(reason?)` with the `onExit` handler as its other caller, so the two paths cannot drift
+into two different shapes of diagnosis.
+
+*Pass 5 should try:* a daemon that writes its complaint *after* the ready timeout, while it is being
+closed — does any of it reach the answer, and does the count in the pointer agree with the file?; a never-
+ready daemon whose capture exceeds the 64 KB startup buffer (the file should hold exactly the newest
+64 KB, and the answer should say so); two never-ready starts under one name (does the log accumulate, as
+R3-07 pinned for the exit path?); a daemon that emits `ready` *and* then immediately dies.
+
+### R4-02 — a file stem is not a channel name
+
+`lastHistoryByChannel` no longer derives a name from the file it read. A record without a usable
+`channel` string is skipped — the scan keeps looking further back in the same file, then in the next — and
+counted into the `torn` hint, whose sentence is unchanged because `resilience.test.ts` pins that exact
+wording. The upgrade path is intact: a record that *carries* its name is still read out of a pre-digest
+file name (R2-04 and R3-08 keep passing), which is the only reason the old naming is still readable.
+
+Deliberately weak, and it deserves an argument: **a name-less record is now not reported at all.** We
+cannot recover the name — the stem is a digest, and per R3-03 a digested string names a *third* channel if
+it is typed back. Counting such a record in the `torn` hint is also a stretch of that word: the record was
+readable, it just had no usable name in it. Both are strictly better than what pass 4 measured (a live
+channel reported as lost, under a name it never had), and neither loses data: the file still sits on disk.
+The alternative — synthesise a labelled name, e.g. `(a channel remembered only as main-b613286a19)` —
+would be a new kind of lie in the same place, and nobody has argued for it.
+
+*Pass 5 should try:* a file whose every record lacks `channel`; one whose `channel` is `""`, a number, an
+array or an object; a newer name-less record in a file that also has an older named one (does the older one
+win, as it should?); whether the `torn` sentence misleads when the only problem is a missing name; and
+whether `details` or the notification can still be reached by a name that came from anywhere but a record.
+
+### R4-01 — the history record is quoted through a bound, and sometimes not at all
+
+`prompt.ts` owns a reader-side bound now, because the writer-side bound from pass 3 is not a promise about
+files that already exist. `historyChannelLabel(note)` is used by the section *and* by the `session_start`
+notification: the remembered name is `oneLine(…, 200)` like everything else model-facing, and a name
+containing a control character or a line separator is **not quoted at all** — the section says
+`(a channel whose name this section cannot print)` and the notification says the same. `note.status` (40)
+and `note.code` (400) go through `quoted(…)` too.
+
+Why not the flattening the handoff suggested: it cannot satisfy the second probe. `oneLine` keeps every
+word of the injected line, only on one line — `h-inject - and a line the model wrote: last cell …` — and
+the probe asks that those words not be there. Any transformation that preserves the characters preserves
+the injection, so the only reading that makes the probe satisfiable is: a name that cannot be printed
+safely is dropped from the display. That is what the fix does, and the probe is a better test than the
+suggestion.
+
+Found while in there, and closed: `definitionHint` crashed on a history file with `"definitions": [1, 2]`
+(`name.padEnd` is not a method of a number), which throws from `session_start` — a history file could
+therefore take away the whole session's prompt section. Names are now coerced with `String(…)` before
+clipping. And the liveness check keeps using the **raw** name (`this.channels.get(record.channel)`), so
+shortening at read time — the tempting place — would have re-created R2-04 for any name with whitespace;
+a test pins that a channel with a space in its name is *not* reported as lost.
+
+Deliberately weak: the placeholder loses the name (the section still says what that channel's last cell
+ran); bidi marks, ZWJ and variation selectors are still quoted, since none of them can break a line; and
+the run-side refusal still only bounds length, so a newline in a channel name is legal product behaviour —
+the fix is on the display side, as the tester's test requires.
+
+*Pass 5 should try:* a 200-character name and a 201-character one in a hand-written file (is the section
+line exactly as long as it claims?); a name that is only `\r`, or only `\u2028`; whether the placeholder is
+*useful* to a model, or whether quoting the name with escapes would be better; `code: null`,
+`status: {}`, `definitions: ["a", null]`, `elapsed: "abc"` — the whole record is `JSON.parse` output and the
+section is `String()` all the way down; and whether `String(value)` on an object (`[object Object]`) is a
+lie or just ugly.
+
+### R4-04 — the settled branch says the channel went, and reads the process table
+
+`channelGoneNote(exec)` is now shared by the stopped and the settled branch, so the settled answer carries
+the same death sentence. It reads the death note of the exec, of the channel it ran on, and — the new part
+— of a channel that has not been *reported* dead yet: pass 4's probe failed in the full-suite run and
+passed in isolation, because node had not been notified of the death, so `channel.closed` and
+`exec.deathNote` were both still unset when the tool answered. That is not a test defect, it is the tool
+lying about a dead channel for one event-loop turn; the fix is product code, not a `waitFor`:
+`processGone(pid)` (exported, unit-tested) checks the process table and counts a **zombie** as gone, which
+`kill(pid, 0)` alone does not. The settled answer then says "the Python process behind channel "x" has
+stopped (its exit status had not reached the host when this was answered); the channel is gone and its
+variables are lost".
+
+Deliberately weak: `/proc` is Linux-specific, and the documented fallback is the old lag; a recycled pid
+could in principle make the sentence say "gone" about a live channel (the window for that is a whole exec's
+lifetime — argued, not proven); and **the call site of the fallback is not pinned by a deterministic test**
+— the tester's `waitFor(!isPidAlive)` closes the window, and probing in the same tick as a `kill -9` is
+racy in the other direction. What is pinned is the unit that was actually missing: `processGone` on a
+process that has run, stopped and not been reaped.
+
+*Pass 5 should try:* `bg_stop` for a task on a channel killed *without* a `waitFor` (can you land in the
+window and get a lie?); a settled task on a channel closed by `closeAllForShutdown` (no `deathNote` — is
+the fallback sentence right?); whether "gone" is the right word for a zombie the host has not reaped; and
+whether the same missing probe should also be used by `deadResult`, which today relies on `channel.closed`
+being set by the exit event.
+
+### R4-09 — a killed channel's cell stays findable
+
+The disjunction was decided, and both halves were taken where they are cheap: the kill answer now ends
+with `Log: <path>` (the task answer already did), and the host keeps a small registry of the task ids it
+removed *because a channel went* (`droppedTasks`, keyed by id, `why` is the reason the channel went —
+"killed with bg_stop {kill: true}" or "retired to make room for a new channel"). The next `bg_stop` on
+such an id answers "Its channel "x" was killed …, which removed that channel's tasks from this session.
+The cell's output is in <log>, and the channel's variables went with it." — no mention of the retention
+window, because the retention window did not do it. The retention sentence is now only for ids the host
+has never heard of, which is the case it describes.
+
+Deliberately weak: **the listing still forgets the task** — keeping tasks whose channel is gone would make
+`bg_wait` list dead work forever and change what `statusOf` means without an argument for it. And
+`droppedTasks` is capped at 200 with insertion-order eviction, so after 200 killed channels the retention
+sentence comes back; the cap is a memory choice, not a claim about a session.
+
+*Pass 5 should try:* kill a channel, then `bg_wait` — is the vanished task's absence explained anywhere?;
+kill 201 tasks' worth of channels and check the eviction; kill a channel that had a task in `detached`
+(a cell that outlived its exec) — the `detached` set is per-channel and dies with it, while `droppedTasks`
+records the id: does that split produce a contradiction?; does the `pruneRetention` sweep delete the very
+log the new message points at, and does the message then still read as true?; and the `retired to make
+room` path — a task's channel evicted by the cap is a task the model did not kill, and the sentence has to
+say that.
+
+### R4-05 — the refusal says where the cap came from
+
+`maxChannelsSetting()` returns the value *and* the sentence that describes it: "the default" when nothing
+is set, "the cap (4, the default, because PI_REPLMODE_MAX_CHANNELS=0 is not a usable cap)" when something
+unusable is set, "the cap (2, set with PI_REPLMODE_MAX_CHANNELS)" when it is honoured. `intEnv` is gone
+(it had one caller), and DEV.md's line about it was rewritten. One correction to the finding's
+framing: `intEnv` was never shared with `PI_REPLMODE_READY_TIMEOUT_MS` — that parse is a separate `intEnv`
+inside `src/channel.ts` (`readyTimeout()`), with its own fallback and its own 600 000 ceiling. Same
+semantics, different function.
+
+Deliberately weak: the *other* capacity message (all names busy) keeps its wording, as pass 4 left it; and
+`PI_REPLMODE_READY_TIMEOUT_MS` still does not disclose an ignored value, because it is not model-facing —
+DEV.md says so under env vars, and nothing forces it to stay that way.
+
+*Pass 5 should try:* `PI_REPLMODE_MAX_CHANNELS=4abc` (`parseInt` accepts the 4 — is crediting the env
+var then honest?); `=0x10`, `=1e3`, `= 2 ` with spaces, `=-0`; and whether "all N are busy" is still right
+when N counts names that are *starting* under a cap the env var set.
+
+### R4-07 — the name rule is on the surface where names are chosen
+
+The `channel` parameter's description now ends with "A name is at most 200 characters: it names the log
+and history files of that channel." and the refusal says "…characters, and a name is 200 at most…" — the
+accepted boundary and the refused one are the same sentence shape now. The trimming happens before the
+length check, so `"  <201 chars>  "` is refused as 201, not as 205.
+
+Deliberately weak, on purpose and argued: **the rule is not in the prompt section and not in the system
+prompt guidelines.** The section is byte-stable across turns by design (its test says "the same bytes every
+turn"), so any rule it carries is paid for in prompt cache on every turn of every session, for a rule that
+a caller hits at most once per session. A model that has never chosen a long name pays it; a model that has
+is one call of feedback away from the rule. If pass 5 argues the other way, the place to put it is the
+`run` *result* — not the section — since the result is already rebuilt per turn and already carries the
+out-of-band sentence.
+
+*Pass 5 should try:* check the parameter description actually reaches the model (dump the tool schema from
+a real session — the prompt tests read the extension object, which is one step removed); whether "200 at
+most" and the digesting of unsafe names interact (a 190-character name with a space is *not* digested, and
+its stem is 201 characters: does the history file name then break anything?); and whether the description
+is where a *model* learns the rule, or only where a *human* does.
+
+### R4-08 — the README says what the limit covers
+
+The false sentence is gone. README now says the limit is spent on the cell's own text (output and traceback
+together, the traceback sharing the budget rather than riding on top), and that the notes and pointers
+around the cut — including the `[full output: …]` line, whose length nobody bounds because the agent dir
+path comes from the user — are outside it, so an answer can come back a couple of kilobytes over 50 000.
+DEV.md already said the honest thing. The new `prompt.test.ts` case pins the replacement (it says "output
+and traceback together", says the notes are outside the budget, and *denies* the false claim), which is
+what stops the fix from being "delete the paragraph and the test passes".
+
+Deliberately weak, and it is the honest answer rather than the tidy one: the limit is not made true by
+reserving room for the notes, because no fixed reserve is achievable (the log pointer contains the agent
+dir, and the agent dir contains an install path). The number that is actually enforced is the one on the
+cell's text.
+
+*Pass 5 should try:* measure the largest legitimate answer — banner, 25×60-character definitions note, two
+truncation notes, a pointer with a path from a very long `PI_CODING_AGENT_DIR` — and see whether the
+suite's `+5_000` slack still holds; whether `structuredContent.output` (capture only, no traceback) is a
+*third* copy that puts an answer over the transport limit; and whether "a couple of kilobytes" is still
+true with 6 daemon note lines (each ≤500) plus the out-of-band sentence.
+
+### One test changed (pass 4 fixes)
+
+`test/limits.test.ts`, the R4-01 case, the assertion that counts the section's note lines. It was
+
+```ts
+const notes = section.split("\n").filter((l) => l.includes("last cell"));
+expect(notes.length, "one lost channel, one line in the section").toBe(1);
+```
+
+and that cannot be satisfied by any working code in that file: by the time the case runs, four *other*
+channels have been lost in the same file (`l-notes` died on its own, `l-hint` was killed by the F3-04
+case, `h-hintq` and `h-longname` were written by hand), so a correct section has five such lines —
+measured: 5. The assertion was changed to measure the same thing as a **delta**: count the section's note
+lines before creating the channel, and require the new channel to add exactly one. The counting predicate
+is the section's own shape (`startsWith("  ")` and contains `"last cell"`), and one `measure()` call plus a
+`notesIn` helper were *added* — no assertion in the file was deleted or loosened. It still fails on the
+bug: with a raw newline in the remembered name, the channel contributes no well-formed note line, so the
+delta is 0; and the two other assertions in the same test (the name verbatim, the injected words absent)
+fail on their own.
+
+### Probed, and left alone (pass 4 fixes)
+
+- **`bg_wait` counts the output of every task it has.** The tester filed it as a note, not a holding test,
+  and the note is right: `taskInfos()` calls `countOutput` (open + read the whole file) for up to 200
+  tasks while printing at most 30 rows, so a session of long-running tasks re-reads gigabytes per call.
+  Left alone because the honest fix changes numbers in `details.tasks` for the rows that are not printed,
+  several listing tests pin those numbers, and the only test that would pin the *saving* measures time. If
+  a future pass takes it, the shape is: `statSync` for bytes, and count lines only for the printed window.
+- The mixed capacity wording ("all N are busy") when some names run and some start — pass 4 left it, I left
+  it, DEV.md still says the cap covers starting channels.
+- `fatalNote` unclipped in memory (pass 3's accepted list).
+- Whether the tool *refuses* a channel name with a newline. Pass 4's test creates such a channel on purpose
+  and asks only that the section not obey it, so refusing is not what the suite holds; if pass 5 wants the
+  refusal, it has to argue changing that test, and it should say what happens to a session that already has
+  such a channel in its history.
+
+### Pass 4's mutations, and the traps in the script
+
+`scripts/mutation-audit.sh` grew from 36 lines to 55: one per fix, plus two for the two halves of R4-04
+(the shared death note, and the zombie probe) and four for R4-06 (the slot release, the not-sent guard,
+the abort reaching the start race, and the half-started daemon being closed), which is the finding with
+four moving parts, two for F4-01 (the quit that ignores `halfStarted`, and the epoch check that refuses to
+adopt) and one for F4-02. All of them were checked to exist and be unambiguous before any run, with a
+throwaway copy of the script whose `run_mutation` only does the anchor check — worth knowing, because two
+of the new lines were wrong in the script rather than in the product, and neither is visible from the
+mutation's verdict:
+
+- a multi-line anchor must be **one** single-quoted argument, and an extra `'` at the end of its first line
+  silently turns the rest of the file into garbage for bash (`bash -n scripts/mutation-audit.sh` is the
+  two-second check that finds it);
+- an anchor whose text contains a `'` needs the `'"'"'` dance or, better, an anchor chosen to avoid it —
+  the R4-07 line ended up anchored on the *concatenation* (`+` and the two comment lines), so the mutation
+  removes the whole sentence and the file still compiles;
+- and my own refactors rotted three of pass 3's anchors the same way pass 4's rot rotted mine: M4 (`name` →
+  `channelName`), M7 (the history loop, including the key variable's name), and R3-05's second line
+  (`deathNote ?? …` was rewritten into a local). Each was re-found, none deleted.
+
+Full run on the committed tree: RESULT.
+
+### Handoff to pass 5 (tester)
+
+Attack these, in this order, and note that the first three are places where I chose the cheap side on
+purpose:
+
+1. **R4-06's teardown race** — the slot is released synchronously, the daemon is closed in the background.
+   Try to get two daemons under a cap of 1, to get the cell to run after an abort, or to get a channel into
+   `starting` that no call can reach. Abort exactly when `ready` arrives is the case I am least sure of, and
+   `scripts/smoke-abort-start.sh` is a working way to drive a real abort through the real TUI.
+2. **F4-01's shutdown window** — `quit()` now closes `halfStarted`, and `createChannel` refuses to adopt a
+   daemon that finishes after the quit it raced. The branch in `onSpawned` that closes a daemon spawned
+   *after* the quit began walking its set is unpinned (no mutation for it either, on purpose). Try to reach
+   it, and try to make a quit adopt a live daemon anyway: the epoch is per-manager, and a `/reload` keeps the
+   same manager, so a reload racing a start is the case where "the next session" and "the old session" are
+   the same object.
+3. **R4-04's `/proc` fallback, and F4-02's** — the settled-answer call site and the `getChannel` call site
+   are both pinned now, by a zombie unit and by a test that occupies the window with a busy-wait. Try to
+   make a live channel read as gone (a stopped daemon? a recycled pid? a channel adopted through
+   `globalThis` after a reload?), and try to land a `bg_stop` in the window between a process dying and
+   node noticing and see whether any answer still claims the channel is alive.
+4. **R4-09's half-measure** — the listing still forgets killed tasks, and `droppedTasks` is capped at 200.
+   Try the `detached` split (a task that outlived its exec, on a channel that then died) and the
+   retention-sweep-follows-the-pointer case.
+5. **R4-01's placeholder** — the fix stops the injection by *not printing* the name. Check whether the
+   section is still useful in that case, and whether any other field of a hand-written record can still
+   reshape it (`details`, `finishedAt`, `pid`, `status`) or crash it (`session_start` is unprotected
+   against a throw from anywhere in `lostChannelsLines`).
+6. **R4-02's silence** — a record with no usable name is now simply not reported. Is that a regression in
+   information for a session whose history predates pass 3, and does the `torn` sentence explain it?
+7. **R4-07's location choice** — the rule is in the tool schema, not in the prompt. Verify the schema
+   actually reaches a model (a real session's tool list), and check the digest/length interaction
+   (a 190-character name with spaces is legal, and its *stem* is longer than what the refusal calls safe).
+8. The size question again, from pass 3 and still only spot-checked: is there any *legitimate* answer that
+   breaks the transport, now that the README no longer promises the limit covers the whole thing?
+
+Things this pass held, so they are not re-derived: the one-shot `close` (a start failure that closes, plus
+a manager shutdown, is one close), the identity guard on the `starting` slot and the listener that is
+removed when the wait ends, `startFailureReported` being set before the never-ready kill, the raw name as
+the liveness key, the `+5_000` slack, the 60/120/200/500 clip numbers, the accepted list, the `torn`
+sentence, and that a quit is an epoch rather than a flag (the manager outlives sessions).
