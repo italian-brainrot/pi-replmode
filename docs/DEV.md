@@ -47,6 +47,8 @@ scripts/mutation-audit.sh  break one fixed defect at a time and see which tests 
                    "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
                    filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 55 mutations /
                    ~20 minutes (it typechecks each mutation and re-runs a baseline per test file)
+scripts/smoke-abort-start.sh  the real-pi abort smoke: a pty, the interactive TUI, and the byte for Esc
+                   (SIGINT to `pi -p` is a hard kill that runs no shutdown, so nothing else can reach this)
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
 ```
 
