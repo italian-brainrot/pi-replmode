@@ -26,6 +26,7 @@ import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import {
   type Channel,
   ChannelBusyError,
+  ChannelJoinAbortedError,
   ChannelStartAbortedError,
   type Exec,
   type ExecOutcome,
@@ -212,7 +213,16 @@ export class ReplManager {
     if (existing) this.channels.delete(name);
 
     const pending = this.starting.get(name);
-    if (pending) return pending;
+    if (pending) {
+      // A call that arrives while somebody else is starting this name waits on that creation, and waits
+      // with *its own* signal. Handed the bare promise, its `AbortSignal` was wired to nothing: a
+      // cancelled joiner sat unanswered until the creator's wait ended — for a daemon that never comes
+      // up, the whole ready timeout, two minutes at the shipped default (R5-01: R4-06's symptom one
+      // await away from R4-06's fix, and the shape `executeTool` and `run_subagent` hand you).
+      // Watching is all a joiner may do. It must not cancel the creation it is watching, close that
+      // daemon, or release that slot: another call owns all three, and its teardown still runs.
+      return untilAborted(pending, signal, name, true);
+    }
 
     const starting = this.createChannel(name, cwd, onProgress, signal);
     this.starting.set(name, starting);
@@ -395,9 +405,13 @@ export class ReplManager {
       if (!refused && signal?.aborted) {
         // The call was cancelled while its channel was coming up: no cell was sent, and the slot is
         // free again. Saying so is the honest answer, and it is not a channel that failed (R4-06).
+        // A call that was only *waiting* on somebody else's creation freed nothing when it cancelled —
+        // the other call is still running that start, and says so (R5-01).
         return this.abortedResult(
           channelName,
-          `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and the slot its daemon held is free again`,
+          error instanceof ChannelJoinAbortedError
+            ? `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and this call held neither the daemon nor the slot — the call that is starting that channel was not cancelled, so it carries on`
+            : `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and the slot its daemon held is free again`,
         );
       }
       const status: TaskStatus = refused ? "running" : "dead";
@@ -1191,10 +1205,15 @@ export function resolveTimeout(timeout: number | undefined): number {
  * is either a shared environment build, which is worth finishing for the next caller, or the daemon
  * spawn, which `startChannel` closes on its own. What this returns is a creation that releases its slot
  * promptly instead of holding one for a call nobody is waiting for (R4-06).
+ *
+ * `joined: true` is the other case: this call is waiting on *somebody else's* creation, so its cancel
+ * ends the wait and nothing else, and the answer must not claim it stopped a daemon it never owned
+ * (R5-01).
  */
-function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined, channel: string): Promise<T> {
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined, channel: string, joined = false): Promise<T> {
+  const gaveUp = (): Error => (joined ? new ChannelJoinAbortedError(channel) : new ChannelStartAbortedError(channel));
   if (!signal) return work;
-  if (signal.aborted) return Promise.reject(new ChannelStartAbortedError(channel));
+  if (signal.aborted) return Promise.reject(gaveUp());
   return new Promise<T>((resolve, reject) => {
     const watch = abortWatch(signal);
     work.then(
@@ -1207,7 +1226,7 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined, chan
         reject(error);
       },
     );
-    void watch.promise.then(() => reject(new ChannelStartAbortedError(channel)));
+    void watch.promise.then(() => reject(gaveUp()));
   });
 }
 

@@ -438,6 +438,14 @@ run_mutation "R5-02 the quit epoch is taken after the room is made" src/manager.
     await this.makeRoom();
     const epoch = this.quitEpoch;' "test/lifecycle.test.ts"
 
+run_mutation "R5-01 a call that joined somebody else's start is handed the bare promise again" src/manager.ts '      return untilAborted(pending, signal, name, true);
+---MUTATE---
+      return pending;' "test/lifecycle.test.ts"
+
+run_mutation "R5-01 a joiner's own cancel is described as freeing the creator's slot" src/manager.ts '          error instanceof ChannelJoinAbortedError
+---MUTATE---
+          error instanceof ChannelStartAbortedError' "test/lifecycle.test.ts"
+
 echo "=================================================="
 if [ -n "$ANCHORS_ONLY" ]; then
   echo "ANCHOR CHECK ONLY — bad anchors: $BADANCHOR"

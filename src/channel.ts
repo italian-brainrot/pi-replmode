@@ -275,6 +275,20 @@ export class ChannelStartAbortedError extends Error {
   }
 }
 
+/**
+ * A call that was *waiting on* somebody else's channel creation stopped waiting (R5-01).
+ *
+ * Separate from `ChannelStartAbortedError` because the two cancellations are not the same event and the
+ * answers must not be: this call never owned the daemon, never held the slot, and changing that would
+ * take a creation away from the call that is still waiting for it.
+ */
+export class ChannelJoinAbortedError extends Error {
+  constructor(readonly channel: string) {
+    super(`the call that was waiting for channel "${channel}" to start was cancelled; the call starting it was not`);
+    this.name = "ChannelJoinAbortedError";
+  }
+}
+
 export class ChannelBusyError extends Error {
   constructor(
     readonly channel: string,

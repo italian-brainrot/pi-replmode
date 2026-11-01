@@ -636,9 +636,55 @@ time.sleep(600)
     expect(waitedMs, "an aborted joiner waited for somebody else's start instead of for its own abort").toBeLessThan(4_000);
     expect(joinerResult.isError, "the aborted joiner somehow succeeded").toBe(true);
     expect(text(joinerResult), `the aborted joiner did not say it was aborted: ${text(joinerResult)}`).toContain("aborted");
+    // And it must not claim more than a joiner's cancel did: it never owned the daemon or the slot.
+    expect(text(joinerResult), `a joiner's own cancel is described as freeing something it never held: ${text(joinerResult)}`).not.toMatch(
+      /free again|its daemon/,
+    );
     // The joiner's cancel is its own: the call that owns the creation is still answered on its own terms
     // (cancelled, or a start failure — what matters is that its cell never ran).
     expect(creatorResult.isError, "the call that owned the creation was reported as a success").toBe(true);
+  });
+
+  it("R5-01: and a joiner whose creator gives up is told what the creator did", async () => {
+    // The other half of the join contract, which the fix above must not break: when it is the *creator*
+    // that cancels, everybody waiting on that creation is answered promptly with the creator's sentence
+    // — the daemon was closed and nothing was sent — while the creator itself is told its slot came
+    // free. Pinning both sentences, and which call gets which, is what keeps the two answers attached to
+    // the right call now that there are two of them.
+    const pidFile = join(ext.agentDir, "joiner-creator-abort.pid");
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    const creator = new AbortController();
+    const joiner = new AbortController();
+    let creatorResult: any;
+    let joinerResult: any;
+    await withStub("joiner-creator-abort", script, { PI_REPLMODE_READY_TIMEOUT_MS: "9000" }, async () => {
+      const a = ext.callTool("run", { code: "print('the creator')", channel: "l-joincreator" }, { signal: creator.signal });
+      await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
+      const b = ext.callTool("run", { code: "print('the joiner')", channel: "l-joincreator" }, { signal: joiner.signal });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      creator.abort();
+      const both = await Promise.race([
+        Promise.all([a, b]),
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 8_000)),
+      ]);
+      expect(both, "a joiner was still unanswered eight seconds after the call that was starting its channel was cancelled").toBeDefined();
+      creatorResult = both![0];
+      joinerResult = both![1];
+    });
+
+    const stubPid = Number(readFileSync(pidFile, "utf8"));
+    await waitFor(() => !isPidAlive(stubPid), 20_000, "the daemon of the cancelled start to be taken down with it");
+
+    expect(creatorResult.isError, "the call that cancelled its own start reported a success").toBe(true);
+    expect(text(creatorResult), `the creator does not say its slot came back: ${text(creatorResult)}`).toContain("free again");
+    expect(joinerResult.isError, "the joiner whose creation was cancelled reported a success").toBe(true);
+    const shown = text(joinerResult);
+    expect(shown, `the joiner was not told its channel could not start: ${shown}`).toContain("could not start");
+    expect(shown, `the joiner was not told the creator's cancel is what closed the daemon: ${shown}`).toContain("was cancelled");
+    expect(shown, `the joiner's answer claims the joiner freed the slot: ${shown}`).not.toContain("free again");
   });
 });
 
