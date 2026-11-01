@@ -1843,7 +1843,7 @@ channel is starting, checked afterwards with `ps` for a daemon that should not e
 ## Pass 4 fixes — 2026-11-01 (fixer)
 
 Gate at the start: `tsc`/`biome` green, **185 vitest (172 pass, 13 fail)**, 47 pytest — the thirteen
-failures are pass 4's holding tests. Gate at the end: **green — `tsc`, `biome`, 191 vitest, 47 pytest**,
+failures are pass 4's holding tests. Gate at the end: **green — `tsc`, `biome`, 192 vitest, 47 pytest**,
 two full runs with the same result (the first run of the gate had one failure, and it was a real defect:
 see F4-02). All nine findings are fixed; the thirteen holding tests went green
 untouched except one assertion in `test/limits.test.ts` that could not be satisfied by any working code
@@ -1910,7 +1910,10 @@ to need three pieces, because the slot, the daemon and the cell are three differ
   the same channel, and turns its own `ChannelStartAbortedError` into an answer (`aborted: true`,
   `status: "dead"`) rather than the "channel could not start" prose it would otherwise write. A second
   call that *joined* an in-flight creation sees that creator's cancellation as a start failure with the
-  creator named — deliberate: one signal cannot cancel a creation another call is still waiting on.
+  creator named — deliberate: one signal cannot cancel a creation another call is still waiting on. The
+  guard inside the lock is a separate case with its own test (`run.test.ts`: a cell holds a channel, a
+  second call queues, its user aborts while it waits, the file that cell would have written is not
+  written) — the two start-path aborts never reach that code, as the mutation run proved.
 
 `createChannel` also stops at `untilAborted(ensureEnv(…), signal)` before it spawns, so an abort during a
 cold environment build answers at once. It does **not** cancel the build itself — the build is
@@ -2239,7 +2242,33 @@ mutation's verdict:
   `channelName`), M7 (the history loop, including the key variable's name), and R3-05's second line
   (`deathNote ?? …` was rewritten into a local). Each was re-found, none deleted.
 
-Full run on the committed tree: RESULT.
+Full run on the committed tree: **55 mutations, 53 of them die, and the two that survive are the two the
+loop has already accepted** — `flushLoose`'s `Exec.lateWrite` → `Exec.write` (both append in the only
+reachable case, and the *header* is a separate mutation that does die) and `failure()`'s choice of status
+(the enum has no "your arguments were invalid" value). End to end it takes about 20 minutes.
+
+That was the second run. The first reported **four** survivors, and two of them were pass-4 fixes — which
+is what the check is for:
+
+- **R4-06's guard inside the channel lock.** The mutation that lets a cancelled call send its cell once the
+  channel arrives changed nothing. Two reasons, both about the tests rather than the product: the two abort
+  cases in `lifecycle.test.ts` work on channels that never came up, so neither reaches `runLocked`, and the
+  mutation line pointed at that same file. There is now a case in `run.test.ts` for it (a cell holds a
+  channel, a second call queues behind it, its user aborts while it waits, and the file that cell would have
+  written is not written), and the mutation line points there. Verified by hand as well: with the guard
+  switched off the case fails, with it on it passes.
+- **F4-01's quit.** The mutation taking `halfStarted` back out of `quit()`'s reach survived because my test
+  asked whether the daemon was gone only *after* awaiting the interrupted call — and the never-ready path
+  would have stopped that daemon 30 s later on its own. Same question, asked earlier (while the quit is the
+  only thing that could have closed it) and with a tighter bound, 5 s rather than 20. That test is one this
+  pass added, so nothing of the tester's was touched, but the lesson is general: **a test that awaits a call
+  before it checks a process gives every timeout in the product a chance to do the killing.**
+
+The run also caught a mutation that did not compile: a bash quoting slip left a stray `'` in the replacement
+text of the R4-09 kill-answer line, which edited the source into invalid TypeScript. The script reports that
+as "THE MUTATION DOES NOT COMPILE" and skips the line rather than counting it as a survival — that check
+paid for itself the first time it was needed. Fixed by anchoring on the concatenation (`+` and the comment
+lines) instead of the template literal, the same shape R4-07a ended up with.
 
 ### Handoff to pass 5 (tester)
 
