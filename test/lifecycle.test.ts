@@ -11,7 +11,7 @@
  * pass-3 audit of the pass-2 fixes uses the same stub-interpreter trick; its ids are R3-nn.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MAX_OUTPUT_CHARS } from "../src/format.ts";
@@ -1040,6 +1040,77 @@ time.sleep(600)
     for (const result of results) {
       expect(result.isError, "a call whose session ended answered as if it had run").toBe(true);
       expect(text(result), `the answer does not say the session ended: ${text(result)}`).toMatch(/session ended/);
+    }
+  });
+
+  it("F4-01: and a daemon that spawns after the quit began walking is closed on sight", async () => {
+    // The last branch of the quit story, and the one pass 4 and pass 5 both left unpinned: `quit()`
+    // walks `channels` and `halfStarted`, and a start that began before the quit but spawns *after* the
+    // walk is in neither. Only the spawn hook sees it, and it has to act on sight — waiting for the
+    // epoch check after `ready` would mean waiting for a wedged interpreter that never answers, for the
+    // whole ready timeout.
+    //
+    // The branch is reached deterministically by holding the single-flight environment build on its own
+    // `mkdir` lock (`<envDir>.lock`, the lock `acquireLock` takes when the directory is not marked
+    // complete): the call enters `ensureEnv`, the session ends while it is in the lock wait, and the
+    // lock is then removed so the build finishes and the daemon spawns into a session that has gone.
+    const envDir = join(ext.agentDir, "stub-env", "spawn-after-quit");
+    const pidFile = join(ext.agentDir, "spawn-after-quit.pid");
+    rmSync(pidFile, { force: true });
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    mkdirSync(join(envDir, "bin"), { recursive: true });
+    writeFileSync(join(envDir, "bin", "python"), `#!/usr/bin/env python3\n${script}`, { mode: 0o755 });
+    // An environment that is not built yet, and one that somebody else appears to be building.
+    rmSync(join(envDir, ".complete"), { force: true });
+    mkdirSync(`${envDir}.lock`);
+
+    const saved = { ...process.env };
+    let pid = 0;
+    let call: Promise<any> | undefined;
+    try {
+      process.env.PI_REPLMODE_ENV_DIR = envDir;
+      process.env.PI_REPLMODE_READY_TIMEOUT_MS = "30000";
+      call = ext.callTool("run", { code: "print(1)", channel: "l-spawnafter" }, { signal: new AbortController().signal });
+      // The call is inside its lock wait (500ms polls) by now, so no daemon exists to be closed.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+      // The session has ended. Let the build complete: the daemon spawns behind it.
+      writeFileSync(join(envDir, ".complete"), JSON.stringify({ hash: "000000000000", base: "python3", version: "3" }), "utf8");
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+
+      await waitFor(
+        () => {
+          try {
+            pid = Number(readFileSync(pidFile, "utf8"));
+          } catch {
+            pid = 0;
+          }
+          return Number.isInteger(pid) && pid > 0;
+        },
+        20_000,
+        "the daemon to spawn after the quit had finished walking: the case did not run",
+      );
+      try {
+        // Asked while the 30s ready timeout is still far away, so the timeout cannot be what killed it:
+        // the spawn hook is the only thing in the product that has ever held this daemon.
+        await waitFor(() => !isPidAlive(pid), 6_000, "the daemon spawned after the quit to be closed on sight");
+      } catch {
+        // Reported by the assertion below, with the pid in hand.
+      }
+      const result = await call!;
+      expect(isPidAlive(pid), `the daemon spawned into an ended session (pid ${pid}) outlived it`).toBe(false);
+      expect(result.isError, "the call that spawned into an ended session reported a success").toBe(true);
+      expect(text(result), `the answer blames something other than the ending session: ${text(result)}`).toMatch(/session ended/);
+    } finally {
+      for (const key of ["PI_REPLMODE_ENV_DIR", "PI_REPLMODE_READY_TIMEOUT_MS"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key]!;
+      }
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+      if (pid > 0 && isPidAlive(pid)) process.kill(pid, "SIGKILL");
     }
   });
 });

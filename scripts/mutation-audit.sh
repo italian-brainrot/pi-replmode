@@ -25,9 +25,14 @@ TOTAL=0
 BADANCHOR=0
 # The mutated file is restored from a copy taken before it was touched, never with `git checkout`: the
 # audit runs most often against a tree that is mid-fix and therefore uncommitted, and checking out HEAD
-# over it throws that work away.
-cleanup() { [ -n "$MUTATED" ] && restore_file; rm -rf "$WORK"; }
-trap cleanup EXIT INT TERM
+# over it throws that work away. A signal has to *stop* the script: a trap that only cleaned up let bash
+# carry on with `$WORK` deleted, which applied every remaining mutation and restored none of them.
+cleanup() {
+  if [ -n "$MUTATED" ]; then restore_file; MUTATED=""; fi
+  rm -rf "$WORK"
+}
+trap 'cleanup; exit 130' INT TERM
+trap cleanup EXIT
 
 # Which test names fail in a file, one per line. The count is not enough: while the audit loop is
 # running, some tests are red on purpose, so "something failed" says nothing about whether the
@@ -49,7 +54,11 @@ PYEOF
 }
 
 restore_file() {
-  [ -f "$WORK/orig" ] && cp "$WORK/orig" "$MUTATED" && rm -f "$WORK/orig"
+  if [ ! -f "$WORK/orig" ]; then
+    echo "!! NO BACKUP of $MUTATED: the mutation is still in the tree, fix it by hand before anything else runs"
+    return 1
+  fi
+  cp "$WORK/orig" "$MUTATED" && rm -f "$WORK/orig"
 }
 
 declare -A BASELINE
@@ -353,6 +362,11 @@ function signalDiagnosis(pid: number): string {
 run_mutation "R5-07 the empty listing denies a task the same answer has just reported finished" src/manager.ts '      content: [{ type: "text", text: [summary, ...taskSection(infos, this.droppedTasks.size)].join("\n") }],
 ---MUTATE---
       content: [{ type: "text", text: [summary, ...taskSection(infos)].join("\n") }],' "test/listing.test.ts"
+
+run_mutation "F4-01 a daemon spawned after the quit began walking is not closed on sight" src/manager.ts '          if (epoch === this.quitEpoch) this.halfStarted.add(daemon);
+          else void daemon.close();
+---MUTATE---
+          if (epoch === this.quitEpoch) this.halfStarted.add(daemon);' "test/lifecycle.test.ts"
 
 run_mutation "R5-06 the channel parameter blames file names for the name limit again" src/index.ts '        "A name is at most 200 characters: it is quoted back in results, in the history file, and in the prompt of every later session.",
 ---MUTATE---
