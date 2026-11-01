@@ -10,36 +10,42 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
 - Status: M1 (core) and M2 (channels, timeouts→background, bg_wait/bg_stop, reload re-adoption) are
   done and covered by real-process tests (pytest + vitest). M3 = display/images, `pi.read_image`,
   `pi.ask`, `pi.run_subagent` over a `call`/`call_reply` pump — not started.
-- Audit loop state: **pass 5 (tester) is complete — seven findings, all with holding tests that stay red.**
-  Next is **pass 5 (fixer)**. Read [docs/AUDIT.md](docs/AUDIT.md) §"Pass 5 audit — 2026-11-02 (tester)":
-  per-finding write-ups with the measured reproduction, and §"Handoff to the fixer (pass 5)" lists the seven
-  in order (**R5-03 → R5-02 → R5-01 → R5-04 → R5-07 → R5-05 → R5-06**), each with the mutation to add.
-  Gate this pass leaves: tsc/biome green, **200 vitest — 193 pass, 7 fail** (the seven R5 holding tests, two
-  identical runs), **47 pytest**. No product file was touched and no existing assertion changed; the only
-  deleted lines in the commit are four import lines replaced by wider versions of themselves. One **green**
-  test was added too (two aborted starts of one name, cap 1 — pinning pass 4's promise-identity choice).
-  `test/listing.test.ts` is a new file, and it exists because the task registry is process-wide: R5-07 needs
-  a session whose only tracked task is the one under test, and it passed vacuously inside `resilience.test.ts`.
-- What pass 5's findings establish, one line each: a **joiner** on somebody else's channel creation gets no
-  abort handling at all — thread the signal into the join with `untilAborted(pending, signal, name)` and never
-  cancel the creator's creation (R5-01, measured: an aborted joiner is answered 8 869 ms later, at the
-  *creator's* ready timeout; pi's own per-run signal hides this today, `executeTool`/`run_subagent` will not);
-  a value captured **after** an await is not the value the call started with — `createChannel` must read
-  `quitEpoch` **before** `makeRoom`, or a quit during a slow retirement adopts the new daemon and answers a
-  dead session with `status: "completed"` (R5-02, and `close` being one-shot makes it worse, not better);
-  a model-facing field of the **wrong shape** must be rejected where it is read, not only bounded — a JSON
-  string in a history record's `definitions` has a `length` and no `map`, so one hand-written file deletes a
-  session's whole prompt section and leaves the previous session's stale text in memory (R5-03); a pointer an
-  answer sends the model to needs `existsSync` at the answer, since the retention sweep runs on every
-  `session_start` of a long-lived process and at 200 logs (R5-04); when the process table contradicts the
-  diagnosis, say what the table says — a daemon stopped with SIGSTOP is blamed on "code that blocks signals"
-  today, and `processGone` already parses that state (R5-05); a **limit's stated reason must be one the code
-  backs up** — `channelFileStem` digests every name over 40 characters or with an unsafe character, so stems
-  are ≤ ~51 whatever the name and the 200-char rule is *not* a file-name rule (R5-06; this also corrects pass
-  4's write-up, which claimed a 190-char spaced name stays verbatim at 201); and a listing sentence built
-  from a different source than the summary above it can contradict it — after a `bg_stop {kill: true}` empties
-  the registry mid-`bg_wait`, one answer says `1 task(s) finished: repl-…` **and** "No background tasks have
-  run in this session." (R5-07).
+- Audit loop state: **pass 5 (fixer) is complete — all seven findings fixed, the seven holding tests
+  green, four new green tests added. Next is pass 6 (tester): attack the pass-5 fixes.** Read
+  [docs/AUDIT.md](docs/AUDIT.md) §"Pass 5 fixes — 2026-11-01 (fixer)": per-finding write-ups (what
+  changed, what is still weak), and §"Handoff to pass 6 (tester)" for the attack list in order.
+  Gate this pass leaves: tsc/biome green, **204 vitest, 0 failures** (two identical full runs),
+  **47 pytest**, mutation script **67 anchors all matching** and every pass-5 mutation dying.
+  One test *line* changed, argued in AUDIT: pass 5's R5-02 asserted `existsSync(sideEffect)`, which the
+  retired channel's own legitimate cell makes true — it now asserts the cold marker is absent and the
+  hot one present. New test files/ids to know: `R5-01: and a joiner whose creator gives up…`,
+  `F4-01: and a daemon that spawns after the quit began walking…` (both `lifecycle.test.ts`),
+  `R5-03: and a record whose rendering throws…` and `R5-06: and the refusal gives the model the same
+  reason…` (both `prompt.test.ts`).
+- What pass 5's findings and fixes establish, one line each: **a joiner on somebody else's channel
+  creation must be given its own abort handling** — `getChannel`'s join is
+  `untilAborted(pending, signal, name, true)`, and a `ChannelJoinAbortedError` keeps the joiner's answer
+  from claiming it freed a slot it never held; the joiner must never cancel the creator's creation, close
+  its daemon, or release its slot (R5-01, fixed; measured before: an aborted joiner answered 8 869 ms
+  later, at the *creator's* ready timeout); **a value captured after an await is not the value the call
+  started with** — `createChannel` reads `quitEpoch` on entry, before `makeRoom`, or a quit during a slow
+  retirement adopts the new daemon and answers a dead session with `status: "completed"` (R5-02, fixed);
+  **a model-facing field of the wrong shape must be rejected where it is read** — a JSON string in a
+  history record's `definitions` has a `length` and no `map`, so `definitionHint` now checks
+  `Array.isArray`, and each remembered channel's line is built in a `try` so one unreadable record costs
+  its own line (R5-03, fixed: the section is rendered by code that is *total* over untrusted records, and
+  `session_start` assigns the stable part before reading any history file rather than swallowing throws);
+  **a pointer an answer sends the model to needs `existsSync` at the answer**, since the retention sweep
+  runs on every `session_start` of a long-lived process and at 200 logs (R5-04, fixed in `bgStop`'s
+  dropped-task branch); **when the process table contradicts the diagnosis, say what the table says** —
+  `processState` is now shared with `processGone` and `signalDiagnosis` names `T`/`t`/`D`/`Z` in the busy
+  answer, without ever escalating on its own (R5-05, fixed); **a limit's stated reason must be one the
+  code backs up** — `channelFileStem` digests every name over 40 characters or with an unsafe character,
+  so stems are ≤ ~51 whatever the name and the 200-character rule is *not* a file-name rule; both
+  sentences now say the name comes back to the model (R5-06, fixed — and pass 4's write-up was wrong about
+  the digest/length interaction); **a listing sentence built from a different source than the summary
+  above it can contradict it** — `taskSection(infos, droppedTasks.size)` never denies a task the same
+  answer just reported, while R4-09's accepted "no rows for killed tasks" stands (R5-07, fixed).
 - What pass 4's fixes established, one line each (write-ups in AUDIT): a model-facing field is bounded
   **where it is read**, not only where it is written — a history file may predate any bound, and no field of
   a hand-written record may reshape the prompt section (`historyChannelLabel` refuses to print a name it
@@ -64,7 +70,12 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   (the identity guard, green-pinned in pass 5), and a channel that is `ready` is never timed out — so a daemon
   the manager loses track of stays alive forever, which is how R5-02 was measured.
 - Real-`pi` smoke: the DEV.md prompt, a dash-named channel, `os._exit(3)`, and a `bg_stop {kill: true}`
-  (its answer ends with `Log: <path>`). To smoke an abort use `bash scripts/smoke-abort-start.sh` —
+  (its answer ends with `Log: <path>`). Pass 5's fixes added two checks that cost one run each: ask the
+  model to quote the `channel` parameter description verbatim (that is how a wrong sentence in the schema
+  is proven to be believed), and drop a hand-written `~/.pi/agent/replmode/history/<name>.jsonl` with
+  `"definitions": "df"` and look for `Extension error` — at HEAD it printed twice and the section vanished.
+  Note that **one history file yields one record** to the note (the newest usable), so each hostile record
+  needs its own file. To smoke an abort use `bash scripts/smoke-abort-start.sh` —
   throwaway `PI_CODING_AGENT_DIR`, `PI_REPLMODE_ENV_DIR` at a stub whose `bin/python` sleeps, `script -qec`
   for a pty, and the byte for Esc. **`pi -p` cannot smoke an abort**: SIGINT there is a hard kill (exit 130)
   that runs no `session_shutdown` and fires no abort — measured with an idle daemon that survived it.
@@ -95,21 +106,30 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   legibility choices, not derived; and **only the call that is starting a channel can free it** — `bg_stop`
   has no task id to take, so a wedged creation holds a slot until its own caller is cancelled (that is what
   R4-06 made possible) or the ready timeout fires, which the capacity refusal says out loud. Added by pass
-  4's fixes, and weak on purpose: `bg_wait`'s listing still forgets a task whose channel was killed (the
-  kill answer names the log instead, and `droppedTasks` remembers up to 200 such ids); the `onSpawned`
-  branch that closes a daemon spawned after a quit began walking is unpinned; `processGone` trusts the pid
-  the host spawned and is Linux-specific in its zombie check; the 200-character name rule is in the tool
-  schema, not in the prompt section; and the capacity refusal's "all N are busy" wording is still mixed when
-  some names are starting; and **a joiner's cancel does not free a wedged creation either** — only the call
-  that is starting it can (R5-01's fix will answer the joiner, not release the slot). Pass 5 also probed and
+  4's fixes, and weak on purpose: the `onSpawned` branch that closes a daemon spawned after a quit began
+  walking **is now pinned** (pass 5's fixes; the deterministic route is in AUDIT); `processGone` trusts the
+  pid the host spawned and is Linux-specific in its zombie check (so is `signalDiagnosis`, which shares its
+  state read and is handed the *daemon's* pid — a cell's child sitting in `T` is not diagnosed); the
+  200-character name rule is in the tool schema, not in the prompt section, and why the number is 200 is a
+  prompt-cost judgement the tests do not pin; the capacity refusal's "all N are busy" wording is still mixed
+  when some names are starting; and **a joiner's cancel does not free a wedged creation** — only the call
+  that is starting it can, and R5-01's fix says exactly that in the answer instead of implying otherwise.
+  Added by pass 5's fixes, and weak on purpose: `bg_wait`'s listing still gives no rows for tasks whose
+  channel went (R4-09's half-measure stands — the empty-listing *sentence* now counts them and points at
+  `bg_stop`), and that count comes from the process-wide `droppedTasks`, so after `/new` it can include the
+  previous session's drops (the sentence says "tracked", not "this session", to stay true); the R5-04 answer
+  still names a log it knows is gone, and says not-where rather than why; `session_start` does **not** catch
+  throws — the renderer is total instead, and `section = renderSection([])` before the notes is insurance no
+  test can reach, because nothing reachable can make it throw; the unreadable-record line names the channel
+  but quotes no fields; and `signalDiagnosis` reads the state at answer time, so a process continued in the
+  meantime gets the generic sentence. Pass 5 also probed and
   left alone: two daemons for one name can coexist for the length of a `close()` — measured at **4.5 s** for a
   daemon that ignores `shutdown` and SIGTERM — sharing one daemon log, history file and IPython profile, which
-  two pi processes can already do to each other; the `onSpawned` after-quit branch is still unpinned, and AUDIT
-  records the deterministic way to reach it (hold `ensureEnv` with a stale `<envDir>.lock`, quit, then remove
-  the lock); `droppedTasks`' 200-id cap restores the old retention sentence for a session that churns more
-  channels than that; `STRUCTURED_OUTPUT_MAX_BYTES` is exported and never used (`cut.text` is sliced at
-  1 048 576 *characters* and can never approach it); and `lostChannelNotes()` scans the history directory twice
-  per `session_start`. Pass 3's suggested cheap signal
+  two pi processes can already do to each other; `droppedTasks`' 200-id cap restores the old retention
+  sentence for a session that churns more channels than that; `STRUCTURED_OUTPUT_MAX_BYTES` is exported and
+  never used (`cut.text` is sliced at
+  1 048 576 *characters* and can never approach it). (`lostChannelNotes()` being called twice per
+  `session_start` was fixed by pass 5's R5-03 change.) Pass 3's suggested cheap signal
   for the unattributable case — read `/proc/<daemon>/task/*/children` at exec end and say "this cell left
   processes running" — is still argued, not implemented.
 - Pass 2 attacked pass 1's fixes; pass 3 attacked pass 2's; pass 4 attacked the pass-3 fixes, and eight of
@@ -130,23 +150,34 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   a file stem used as a channel key (R4-02), a start path that never reaches its own reporting (R4-03), a
   fixed branch of a three-branch function (R4-04, R4-09), an env value reported after being ignored (R4-05),
   an abort that is not threaded through the thing it cancels (R4-06), a rule that exists only in the error
-  that enforces it (R4-07), and a README claim the suite's `+5_000` slack had been hiding (R4-08).
-- Mutation testing is a tool now: `scripts/mutation-audit.sh`, ~70 lines, takes a label substring
-  (`bash scripts/mutation-audit.sh R3-0`); the full list is 55 mutations and **~20 minutes**, and **requires
-  a committed tree** (it reverts with `git checkout`). Its verdict is the *set of failing test names*
-  compared with a per-file baseline taken on a clean tree — an exit code says nothing while tests are red on
-  purpose — and it refuses to apply an anchor that does not typecheck. Anchors rot: pass 4 found three that
-  had stopped matching the code's shape (M4, `keepNewest`, R3-10) and had been silently skipped; re-find the
-  anchor, never delete the line. Pass 4's final run: **53 of 55 die, and the two survivors are the accepted
-  ones** — `flushLoose`'s `Exec.lateWrite` → `Exec.write` (both append in the only reachable case; the
-  *header* is a separate mutation that does die) and `failure()`'s choice of status (the enum has no
-  "rejected" value). Three traps this pass learned the hard way: a multi-line anchor must be **one**
-  single-quoted bash argument, so `bash -n scripts/mutation-audit.sh` and an anchor-checking dry run (a copy
-  of the script whose `run_mutation` only verifies the anchor) are worth running before the 20 minutes;
-  a mutation whose *testspec* names the wrong test file reads as a survival (the R4-06 guard inside the
-  channel lock lives in `runLocked`, not in the start path — its line had to move to `run.test.ts`); and a
-  test that awaits a call before checking whether a process is alive can be satisfied by a product timeout
-  doing the killing, which is how F4-01's first test escaped its own mutation.
+  that enforces it (R4-07), and a README claim the suite's `+5_000` slack had been hiding (R4-08). **Pass 5's
+  fixes landed all seven: R5-01, R5-02 and R5-03 changed behaviour, R5-04/05/06/07 changed answers.** Pass 6
+  attacks those fixes; the attack list is the last section of AUDIT's pass-5 write-up, and the thin places are
+  listed under "Added by pass 5's fixes, and weak on purpose" above.
+- Mutation testing is a tool now: `scripts/mutation-audit.sh`, ~90 lines, takes a label substring
+  (`bash scripts/mutation-audit.sh R3-0`); the full list is 66 mutations and **~50 minutes** (it is dominated
+  by the lifecycle/resilience files, which are ~45 s each, and each mutation runs one baseline plus one
+  mutated run of its file). It restores the mutated file
+  from a copy taken before the break — **not** with `git checkout`, which threw away uncommitted work — and a
+  signal now *stops* the script (a trap that only cleaned up let bash carry on with the backup directory
+  deleted: every remaining mutation got applied and none restored, and it ate an afternoon). Run
+  **`ANCHORS_ONLY=1 bash scripts/mutation-audit.sh`** first: seconds, checks all 67 anchors against the
+  source, and a stale anchor is otherwise silently skipped — pass 5's fixes rotted four anchors in one
+  sitting (`processGone`'s zombie line, both R4-07 prose anchors). Its verdict is the *set of failing test
+  names* compared with a per-file baseline taken on a clean tree — an exit code says nothing while tests are
+  red on purpose — and it refuses to apply an anchor that does not typecheck. Pass 5's final run:
+  **66 mutations, every anchor matching, 64 die, the two survivors the accepted ones** (`flushLoose`'
+s `lateWrite`→`write`, `failure()`'s status choice). Traps learned the hard way, still true: a multi-line anchor must be **one** single-quoted
+  bash argument (a missing closing quote there swallows the following `run_mutation` lines and the failure
+  only shows up as `bash -n` complaining), so run `bash -n scripts/mutation-audit.sh` and
+  `ANCHORS_ONLY=1 …` before the long run; a mutation whose *testspec* names the wrong test file reads as a
+  survival (the R4-06 guard inside the channel lock lives in `runLocked`, not in the start path — its line
+  had to move to `run.test.ts`); a test that awaits a call before checking whether a process is alive can be
+  satisfied by a product timeout doing the killing (F4-01's first test escaped its own mutation that way, and
+  R5-02's and the late-spawn pin both check liveness **before** awaiting, with the ready timeout far away);
+  and when a fix rewords a sentence, the mutation that deleted or inverted that sentence has to be re-anchored
+  in the same commit — four were stale after the pass-5 prose fixes, and a skipped anchor is silent in the
+  real run.
 - Things that are easy to get wrong and are now pinned by tests: an interrupt must reach a cell parked on
   an `await` (there is no `asyncio.Task.throw`; the interrupt goes onto the future the cell task waits
   for, with cancel as the escalation); the SIGINT *disposition* is restored at every exec boundary; the
@@ -170,17 +201,32 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   survives an oversized final line; a successful `run` result has no `isError` key at all; a cancelled call's
   answer carries `aborted: true` with `status: "dead"` and says nothing was sent; `Channel.close` is
   one-shot, `quit()` closes the `halfStarted` daemons and the quit epoch refuses to adopt a start that raced
-  it, and `getChannel` asks `processGone` before reusing a channel (F4-01, F4-02).
+  it, the epoch is read on entry to `createChannel` (before `makeRoom`, F4-01/R5-02), a daemon spawned after
+  the quit's walk is closed by `onSpawned` on sight (pinned via the `<envDir>.lock` recipe), and `getChannel`
+  asks `processGone` before reusing a channel (F4-01, F4-02); a call that *joins* somebody else's channel
+  creation waits through `untilAborted(…, joined=true)`, so its own cancel answers it promptly, and the two
+  answers differ — the joiner held neither the daemon nor the slot (R5-01); one history record cannot delete
+  the prompt section (shape-checked `definitions`, and an unreadable record prints as one line saying so);
+  every log path an answer sends the model to is `existsSync`-checked at the answer (R5-04, and the settled
+  `bg_stop` branch); the busy `bg_stop` answer quotes the process-table state when it is `T`/`t`/`D`/`Z` and
+  only then drops the "blocks signals" guess (R5-05); and `bg_wait`'s listing never contradicts its own
+  summary (R5-07).
 - Three rules that must not change: a timeout never kills a cell, the daemon never uses
   `asyncio.run()`, and a test is never weakened to make a fix pass — argue it in AUDIT.md instead. Never
   delete an assertion from a passing test either: pass 2 nearly lost one to an editing slip in
-  `test/lifecycle.test.ts` and caught it with `git diff | grep '^-'`. Three test lines have been *changed*
+  `test/lifecycle.test.ts` and caught it with `git diff | grep '^-'`. Four test lines have been *changed*
   (never loosened), each argued in AUDIT.md: pass 2's `expect(shown, …)` handed a string to `toBeLessThan`
   (which throws in vitest, so that R2-02 assertion had never run — it is `expect(shown.length, …)` now, same
   bound), pass 3's fixes changed R3-02's `expect(result.isError)` from `.toBe(false)` to `.toBeUndefined()`
   because the contract pinned green by `background.test.ts` is that a successful result carries no `isError`
   at all, and pass 4 widened one import in `test/prompt.test.ts` (`repoRoot`, `text as text2`) so a new test
-  could read the README — no assertion in that file was touched.
+  could read the README — no assertion in that file was touched. Pass 5's fixes changed one assertion line and
+  widened one import (`lifecycle.test.ts`: `rmSync`): R5-02's `expect(existsSync(sideEffect)).toBe(false)`
+  cannot be satisfied by any product, because the *retired* channel's legitimate cell creates that marker file
+  first (pass 5's own measurement says the file reads `r5-02-hot r5-02-cold `); it is now two assertions on the
+  file's *contents* — the cold marker absent, the hot one present — so the case proving it ran is pinned too.
+  Pass 5's fixes also added assertions to one holding test (the aborted joiner must not claim it freed a slot:
+  `not.toMatch(/free again|its daemon/)`), which is an addition, not a change.
 - Tests drive real processes only; where a daemon must misbehave (never ready, dies after answering,
   closes its protocol fd, dies on SIGINT, writes its complaint to the capture stream, emits a `fatal`
   frame) `test/lifecycle.test.ts` swaps in a **stub interpreter** via `PI_REPLMODE_ENV_DIR` — a dir with

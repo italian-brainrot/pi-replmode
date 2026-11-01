@@ -2696,3 +2696,347 @@ Things this pass held, so they are not re-derived: the one-shot `close`; the pro
 481-character agent dir, ≈52–54 KB with the maximum note pile-up); the 60/120/200/500 clip numbers; the
 `historyChannelLabel` refusal's usefulness; R4-02's digest rule; and the accepted list, including
 `droppedTasks`'s 200 cap and the cross-process name collision.
+---
+
+## Pass 5 fixes — 2026-11-01 (fixer)
+
+Gate at the start: `tsc`/`biome` green, **200 vitest — 193 pass, 7 fail** (the seven holding tests),
+47 pytest. Gate at the end: **green — `tsc`, `biome`, 204 vitest with 0 failures, 47 pytest**, and two
+full runs with the same result. All seven findings are fixed; **none of the seven holding tests was
+weakened**, and exactly one line in one of them was *changed* — argued under "One test changed (pass 5
+fixes)" below. Four tests were added, all green: a pin for the R5-01 join when the *creator* cancels
+(`lifecycle`), one for the refusal's copy of the name rule (`prompt`), one for a record whose rendering
+throws (`prompt`), and one for the `onSpawned` close-on-sight branch that pass 4 and pass 5 both left
+unpinned (`lifecycle`), reached by the deterministic route pass 5 recorded.
+
+The order was the handoff's: R5-03, R5-02, R5-01, R5-04, R5-07, R5-05, R5-06. The three behaviour fixes
+went first and each was mutation-checked before the next was touched; the four answer fixes followed.
+
+Real-`pi` smoke (throwaway `PI_CODING_AGENT_DIR`, provider `strata`, `qwen38-flash-next`, thinking on):
+the DEV.md two-call prompt answers 42; a session asked to quote its own prompt produced the section's
+first line — so the R5-03 restructuring of `session_start` still renders — and the `channel` parameter
+verbatim, including the new reason (*"A name is at most 200 characters: it is quoted back in results, in
+the history file, and in the prompt of every later session."*), which is how pass 5 proved the old
+sentence was believed; and a history file written by hand with `"definitions": "df"` — pass 5's own
+reproduction, which printed `Extension error (…): note.definitions.slice(...).map is not a function`
+twice at HEAD — now produces no error at all, the lost-channel note renders, and the section names both
+channels. One thing that smoke learned, worth knowing before writing the next history-file test: one
+history file contributes **one** record to the note (the newest usable one, R3-08's tie-break), so two
+hostile records appended to one file test only the newest. Put each record in its own file.
+
+### R5-03 — the read path checks the shape it reads, and a bad record costs one line
+
+`prompt.ts`:
+
+- `definitionHint` now starts from `const names: readonly unknown[] = Array.isArray(note.definitions) ?
+  note.definitions : []`, so a field that is not an array contributes no hint. Every bound R3-01 and
+  R4-01 put in that function survived: the same 6-name window, the same `oneLine(...,
+  DEFINITION_HINT_NAME_CHARS)` per name, the same `+N more` count — they just run off `names` now, and
+  the elements are still coerced with `String(…)` because the array itself is not trusted either. The
+  F3-04 wording of the rest of the line is untouched, which is what the holding test checks
+  (`r5-baddefs_marker` has to be in the section *with* its cell text).
+- The line for one remembered channel moved into `lostChannelLine`, whose body is a `try`. A record this
+  build cannot render at all now costs its own line — `  <name>: (a record this section could not read)`
+  — and nothing else. That is the insurance behind the shape guard: it is what stops the *next*
+  unanticipated field shape from being a section-shaped incident.
+- `index.ts`'s `session_start` assigns `section = renderSection([])` **before** it touches any history
+  file, and reads `lostChannelNotes()` once instead of twice (pass 5's noted double directory scan is
+  gone as a side effect).
+
+**Should `session_start` catch a throw at all? No — and that question is the wrong pair.** The two
+things R5-03 actually showed are (a) one record's field decided whether a session got a section, and (b)
+the section that survived was the *previous* session's, which is a lie rather than an absence. A blanket
+`try` in the handler fixes (b) by making the failure silent, and pi already reports handler errors
+without the model noticing — swallowing one more layer would hide the rendering bug that R5-03 is a
+sample of. So the fix is that the renderer is *total* over untrusted records (shape guards, plus a
+per-record `try`), and the handler keeps the invariant that costs nothing to keep: the stable part is in
+`section` before any file is read. If a future throw escapes anyway, pi says so, and the session has the
+contract instead of a stale note.
+
+**Still deliberately weak here:** the pre-assignment of the stable part is *unpinned* — with the renderer
+total there is no reachable way to make `session_start` throw, and faking one would need a seam the
+product does not have. The unreadable-record line names the channel and says it could not read the rest;
+it does not try to quote `status`/`elapsed`/`code`, which is where the throw came from. `historyChannelLabel`
+is called *outside* the `try` (it is total by construction — `typeof` check, then `oneLine` — and pinned
+that way by R4-01's two mutations; if it ever stops being total, the section is lost but the stale
+section is not). And the field ugliness pass 5 listed and did not file (`status: {}` printing
+`[object Object]`, `torn: "lots"` printing `+lots unreadable record`) is unchanged on purpose: those are
+legibility, not correctness, and each one is a guess about a file we did not write.
+
+Mutations: *a remembered `definitions` field of the wrong shape is trusted again* (dies on R5-03's
+holding test — the section loses the *good* record's line, which is what a `?? []`-shaped guard cannot
+do) and *one unreadable history record takes the whole section with it* (the `catch` rethrows; dies on
+the new pin).
+
+### R5-02 — the epoch is the session the call was made in
+
+`createChannel` takes `const epoch = this.quitEpoch` on entry, above `await this.makeRoom()`, with the
+reason written above it. One statement moved; nothing else in the file changed shape.
+
+Everything pass 4 said about that guard still holds and is still pinned: the epoch is per call and not a
+boolean (a `/reload` reuses the manager, and the nine lifecycle tests pass), `makeRoom` still frees the
+slot it retires, the F4-01 pair (`close` is one-shot per channel; `quit()` walks `halfStarted`) is green,
+and the start-failure wording is untouched. What changed is only which side of a quit a start that spent
+seconds in `makeRoom` belongs to — and the answer is now the same one pass 4 wrote for the abort: the
+call belongs to the session that made it.
+
+The mutation (*the quit epoch is taken after the room is made*) dies on R5-02's test. Pass 4's trap was
+checked rather than assumed: that test polls the daemon's death **before** awaiting the call, the stub's
+`ready` timeout is the shipped default (so nothing in the product times the daemon out within the poll's
+5 s), and a `ready` idle channel is never timed out — the only thing that can stop that daemon is the
+quit or the fix.
+
+**Still deliberately weak:** the window between `quit()`'s snapshot of `channels`/`halfStarted` and its
+walk still admits a daemon that spawns in the gap — that is the branch `onSpawned` closes on sight, now
+pinned (see "the branch pass 4 and pass 5 left unpinned"). `quit()` does not clear `starting`, by design
+(promises cannot be closed), so a call that begins during a quit is adopted by the next session, which
+is the intended reading of the epoch. And `makeRoom` can still be inside `channel.close()` for ~4.5 s for
+a daemon that ignores `shutdown` and SIGTERM — R5-02 made that window harmless rather than shorter.
+
+### R5-01 — a joiner waits with its own signal, and owns nothing else
+
+`getChannel`'s join is now `return untilAborted(pending, signal, name, true);` — the same helper the
+creator's own start uses, so an aborted joiner is answered at its own cancel instead of at the creator's
+ready timeout (measured at HEAD by pass 5: 8 869 ms in the test, ~2 min at the shipped default).
+
+The `joined` flag exists because a joiner's cancel is a smaller event than a creator's, and the answers
+must differ. `untilAborted` rejects with `ChannelJoinAbortedError` (new, in `channel.ts` beside the one
+it resembles) instead of `ChannelStartAbortedError`, and `run` picks its sentence from that:
+
+- joiner cancelled: *`call aborted while channel "x" was still starting: nothing was sent to it, and this
+  call held neither the daemon nor the slot — the call that is starting that channel was not cancelled,
+  so it carries on`*;
+- creator cancelled, joiner still watching: unchanged, still *`channel "x" could not start: the call that
+  was starting channel "x" was cancelled, so its daemon was closed and nothing was sent to it`* — the
+  creator's error travels through the joined promise, and pass 5's measured answer is now pinned by a
+  green test rather than by prose.
+
+What it must not break, verified: the creation is not cancelled (nothing in the join path can reach
+`startChannel`'s race — that one holds only the creator's signal), the `starting` slot is not released by
+a joiner (`release` is identity-guarded, and the join path never registers it), and the cell is still not
+sent on a cancelled call (the `runLocked` guard, pinned by pass 4's mutation in `run.test.ts`).
+
+Mutations: *a call that joined somebody else's start is handed the bare promise again* (the pre-fix
+line; dies on R5-01) and *a joiner's own cancel is described as freeing the creator's slot* (the two
+sentences swapped; dies on both R5-01 tests).
+
+**Still deliberately weak, and now said out loud in the answer:** a joiner's cancel frees nothing. Only
+the call that is starting a channel can free it — `bg_stop` has no task id to take, and a joiner has no
+ownership to give back, so a wedged creation holds its slot until its own caller is cancelled or the
+ready timeout fires. Pass 4 recorded that; pass 5 re-recorded it as the accepted consequence of R5-01's
+fix; this pass put the same sentence in the model's face. Two more: if the creator's start fails *and*
+the joiner's own signal happens to be aborted in the same tick, the joiner gets the "slot … is free
+again" sentence (pre-existing, and true of that case), and each join now allocates one extra promise and
+one listener that is detached when the wait ends.
+
+### R5-04 — a log pointer is checked at the answer, not only at the write
+
+`bgStop`'s dropped-task branch reads `existsSync(dropped.logPath)` and says *"The cell's output is in
+`<path>`, …"* or *"The cell's output was in `<path>` (the log file is no longer there), …"*. That is the
+settled branch's and the task listing's habit — the only pointer in the file that did not have it was
+this one, and pass 5 is right that the sweep makes it a lie: the manager (with `droppedTasks`) is a
+`globalThis` singleton, so every `/new`, `/resume` or `/reload` of a long-lived process runs
+`pruneRetention`, and `MAX_RETAINED_LOGS = 200` needs no age at all.
+
+R4-09's point is intact: the answer still attributes the removal to the channel going
+(`was killed with bg_stop {kill: true}, which removed that channel's tasks from this session`) and still
+never says "pruned after 3 days"; both R4-09 tests are green.
+
+**Still deliberately weak:** the missing-file branch still *names* the path (the listing does the same
+with `(no log: …)`), because a path that used to exist is a clue even when it is gone, and the answer
+does not claim to know why it went. Nothing re-checks the path when the kill answer itself prints
+`\nLog: <path>` — that one is written in the same tick as the deletion, so it is true at answering time
+and may age out afterwards like any other log. `droppedTasks`' 200-id cap is unchanged.
+
+Mutation: *the dropped-task answer promises a log the retention sweep has deleted* (the `existsSync`
+condition replaced by an always-true one; dies on R5-04).
+
+### R5-05 — the busy answer says what `/proc` says
+
+`processGone`'s state read moved out into `processState(pid)` (same last-`)` parsing, same
+Linux-specific `/proc`), and `processGone` is now "`!reachable` or state `Z`" — behaviour unchanged, and
+its R4-04 mutation anchor moved with it (re-found, not deleted). A new `signalDiagnosis(pid)` feeds the
+unresponsive-stop answer:
+
+- `T` / `t` — *"the process table says the Python process behind this channel is stopped (SIGSTOP, or a
+  job-control stop): it is running no code, and no signal reaches it until something continues it"*;
+- `D` — uninterruptible sleep;
+- `Z` — already gone, "no cell left running to stop";
+- anything else the table reports is quoted as `state <letter>`;
+- `R`, `S`, or no `/proc` to ask — empty, so the old sentence (*"Code that blocks signals, or a C
+  extension holding the GIL, can do that"*) is kept, because for a *running* process it is a fair guess.
+
+Measured for real (the stub daemon SIGSTOPs itself): `… is still running: it did not stop on SIGINT
+within 5s. the process table says the Python process behind this channel is stopped (SIGSTOP, or a
+job-control stop): …`. The generic sentence is replaced, not appended to — pass 5's finding was that the
+two contradict each other.
+
+Nothing escalates: `kill: true` is still the model's decision, the group kill still works on a stopped
+daemon, and the holding test's escalation half (kill → process gone → fresh channel) is what was measured
+around the fix.
+
+**Still deliberately weak:** the state is read when the answer is built, so a process that is continued
+in between gets the generic sentence; `signalDiagnosis` is handed `exec.channel.pid`, the *daemon's* pid,
+so a cell's child sitting in `T` is not diagnosed (the channel would be waiting on it, though); `Z` in
+this branch is nearly unreachable because a zombie normally takes the death path instead; and the whole
+thing is Linux-specific, exactly like `processGone`, whose doc comment says so.
+
+Mutation: *the busy answer ignores what the process table says and guesses anyway* (`signalDiagnosis`'s
+state forced to `undefined`; dies on R5-05).
+
+### R5-07 — the listing cannot deny the summary of its own answer
+
+`taskSection(infos, untracked)` gets `this.droppedTasks.size` from `waitResult`, and when the registry is
+empty but something was dropped, the sentence is *"No background tasks are tracked any more; N was/were
+dropped when their channel went, and bg_stop with the task ID names the log each one left."* With nothing
+ever dropped it is the old sentence, and `background.test.ts`'s "No background tasks are running." path
+is untouched.
+
+**Does R4-09's accepted half-measure still stand? Yes — and it is what this fix was kept inside.** The
+killed tasks are still *not* given rows: a row would show a status no exec carries any more and a log the
+model is invited to read but which the kill may have made irrelevant. What was fixed is the sentence that
+denied the task had ever run — the count of untracked ids is now in the sentence, and the id is still
+resolvable, by the R4-09 branch of `bg_stop`, which names the log if it exists and says when it does not.
+
+**Still deliberately weak:** `droppedTasks` is process-wide, so after a `/new` the count can include drops
+the *previous* session caused — the sentence talks about "tracked", not about "this session", to stay
+true. A session that churns more than 200 channels still loses the sentence for the oldest ids (the same
+cap pass 5 accepted for R4-09). And the summary half of the answer is unchanged: it is built from the
+execs the wait was watching, which is the only source that can know a task finished while the registry
+was forgetting it.
+
+Mutation: *the empty listing denies a task the same answer has just reported finished* (drop the
+`untracked` argument; dies on R5-07 in `test/listing.test.ts`).
+
+### R5-06 — two sentences that credited the filesystem for a promise it never made
+
+Correction to **pass 4's own write-up**, which pass 5 caught: it claimed a 190-character name with a
+space in it keeps a stem longer than the refusal calls safe. It does not. `channelFileStem` keeps a name
+verbatim only when it is already a usable file name **and** ≤ 40 characters; anything else becomes
+`readable(≤40)-<10 hex>`. Measured at HEAD: `main` → 4, `n` + 199 `y`s → 51, 190 `a`s + ` spaced name` →
+51. So no name this tool accepts produces a file name meaningfully longer than `main`'s, and the
+200-character rule was never a file-name rule.
+
+Both copies now say the reason the code backs up — the name comes back to the model:
+
+- the `channel` parameter description: *"A name is at most 200 characters: it is quoted back in results,
+  in the history file, and in the prompt of every later session."*;
+- the refusal: *"invalid channel name: N characters, and a name is 200 at most: the name comes back in
+  results, in the history file, and in the prompt of every later session."* — still naming the number
+  (R4-07's `/200/`) and still not forbidding a length the tool accepts (no "under 200").
+
+I did not tighten the digest rule instead: the stems are already ~51 characters whatever the name, so the
+filesystem needs no help, and shortening names further would trade `main`-style readability for nothing.
+
+The holding test pins the stems (≤ 51 for those three), the parameter sentence, and — newly — the refusal
+sentence (a green test, because pass 5's finding was two copies and a mutation on one of them should
+not survive).
+
+**Still deliberately weak:** why 200 and not 300 is a prompt-cost/legibility judgement, not a derivation
+(the test pins the *reason*, not the number); the rule lives in the tool schema rather than in the prompt
+section, which pass 4 chose deliberately and pass 5 accepted.
+
+Mutations: *the channel parameter blames file names for the name limit again* and *the refusal blames file
+names for the name limit again* (each dies on its own copy).
+
+### The branch pass 4 and pass 5 left unpinned, now pinned
+
+`onSpawned`'s close-on-sight — a daemon that spawns *after* the quit has walked the sets it knows about —
+is reachable without racing anything, by pass 5's recipe: point `PI_REPLMODE_ENV_DIR` at a directory with
+`bin/python` but no `.complete`, create `<envDir>.lock` (the single-flight build's own `mkdir` lock),
+start the call so it sits in the lock wait, emit `session_shutdown`, then write `.complete` and remove
+the lock. The build finishes, the daemon spawns into a session that has ended, and the only thing in the
+product that has ever held it is the spawn hook.
+
+The test is worth the eleven lines because the branch's absence is otherwise invisible: with the
+post-start epoch check in place, a *ready* daemon gets closed either way, so only a daemon that never
+answers `ready` can tell the two apart. It polls for the pid's death within 6 s while
+`PI_REPLMODE_READY_TIMEOUT_MS=30000`, so the ready timeout cannot be what killed it — pass 4's trap,
+checked rather than assumed. Ran four times, all identical (~1.5 s each).
+
+Mutation: *a daemon spawned after the quit began walking is not closed on sight* (dies on that test).
+
+### One test changed (pass 5 fixes)
+
+`test/lifecycle.test.ts`, one line inside R5-02's holding test:
+
+```js
+- expect(existsSync(sideEffect), "the cell of a call whose session ended ran anyway").toBe(false);
++ const ran = existsSync(sideEffect) ? readFileSync(sideEffect, "utf8") : "";
++ expect(ran, "the cell of a call whose session ended ran anyway").not.toContain("r5-02-cold");
++ expect(ran, "the channel retired to make room never ran its cell: the case did not run").toContain("r5-02-hot");
+```
+
+As written it cannot be satisfied by any product: the stub marks that file for every cell it runs, and the
+*retired* channel's cell — the legitimate one, run before the quit — creates it first. Pass 5's own
+measurement says so ("that file reads `r5-02-hot r5-02-cold `"); the assertion is what that sentence
+means. The replacement is strictly stronger: the cold marker must be absent **and** the hot marker
+present, so the test also fails if the case never ran. No other line in any of the seven tests changed,
+and no assertion was loosened: `git diff | grep '^-'` at each commit is accounted for in the commit
+messages (the deletions outside test files are sentences replaced by wider versions of themselves and
+mutation anchors moved with the code).
+
+### Pass 5's mutations, and the tooling that came out of them
+
+Ten new mutations (two each for R5-01, R5-03 and R5-06, one each for R5-02, R5-04, R5-05, R5-07 and
+the late-spawn pin). Each was checked individually while its fix was fresh, then the whole list was run
+again on a committed tree: **66 mutations, all anchors matched, 64 die, and the two survivors are the
+accepted ones** — `flushLoose`'s `lateWrite`→`write` and `failure()`'s choice of status. Nothing new
+survived; the re-anchored pass-3/pass-4 mutations (the zombie read, the two name-rule sentences, the
+parameter description) still die. The full run is ~50 minutes now, not ~20: the lifecycle and resilience
+files are ~45 s each and each mutation runs one baseline plus one mutated run of its file.
+
+`scripts/mutation-audit.sh` changed under the pressure of this pass, and DEV.md documents it:
+
+- **`ANCHORS_ONLY=1 bash scripts/mutation-audit.sh`** — every anchor against the current source, no
+  vitest, no tsc, ~10 seconds for 67 anchors. Run that before the long pass; a stale anchor is otherwise
+  *silently skipped*, and this pass produced four stale anchors in one sitting (the R4-04 zombie line,
+  both R4-07 prose anchors, and the R4-07 parameter anchor, which pass 4's own mutation had been deleting
+  by exact text and my rewording moved).
+- **Restores come from a `cp` of the file taken before the break, not from `git checkout`.** The audit
+  runs most often against a tree that is mid-fix; `git checkout -- <file>` was throwing that work away.
+- **A signal stops the script.** A `trap cleanup TERM` that only cleans up lets bash continue — with
+  `$WORK` deleted, every mutation after the signal was applied and none restored, and the tree came back
+  covered in breaks. The handler now `exit`s, and `restore_file` refuses loudly when the backup is
+  missing instead of doing nothing.
+
+### Handoff to pass 6 (tester)
+
+Attack the pass-5 fixes. The places where they are thin, in the order I would try them:
+
+1. **R5-01's join.** Does the joiner's `untilAborted` leak or double-answer anywhere: a joiner that is
+   aborted *after* the creation succeeded (the channel exists, the cell was about to be sent — check
+   `runLocked`'s guard still catches it and that the channel is left usable, not closed); three joiners
+   cancelled at once; a joiner aborted while `ensureEnv` is shared; `untilAborted`'s listener detachment
+   under a signal reused across many calls in one session (pass 4's leak note). And: is the joiner's
+   "the call that is starting that channel … carries on" sentence still true if that other call was
+   itself a joiner? (It cannot be — `starting` holds only the creator's promise — but check.)
+2. **R5-02's epoch position.** The epoch is now read before `makeRoom`, so a call that *waits* behind
+   another call's creation in `getChannel`… does `getChannel`'s join path even take an epoch? Should it?
+   Try a quit that lands between a joiner's `untilAborted` and the cell send, with the creator still
+   alive; and a quit during `makeRoom` where the retired channel is the *joining* call's own channel.
+3. **R5-03's total renderer.** The `try` is per record and the label is computed outside it. Feed
+   records where `channel` is an object, where `definitions` is an array of objects with `toString`,
+   where `elapsed`/`status`/`torn` are arrays or nested objects, and check the section's shape stays one
+   line per channel and that no line can break the list. Also: is `renderSection([])` before the notes
+   observable anywhere a model can see (the restart notification still throws?).
+4. **R5-05's diagnosis.** `signalDiagnosis` reads the channel's pid, not the stuck child's. Try a cell
+   whose *child* is in `T` while the daemon waits on it; a daemon that is `D` (hard to arrange — maybe an
+   NFS-ish read, or a full pipe); a process whose state changes between the SIGINT and the read; and the
+   `Z` branch (can a channel be unresponsive-and-zombie long enough to reach that sentence?).
+5. **R5-07's sentence.** The count comes from a process-wide `droppedTasks`: after `/new`, does the
+   sentence attribute the previous session's drops to the current one in a way a model can act on badly?
+   And the >200-churn case, if you can build it cheaply.
+6. **R5-04/R5-06** are sentences; the interesting attack is whether the new sentences are *true in the
+   worst case* — e.g. does `bg_stop`'s "was in `<path>`" survive a log that was never written at all (a
+   killed channel with an empty log), and is "quoted back in results" still the best reason now that the
+   name is also a `details.channel` field the model may never read.
+7. **The late-spawn pin** is the one new timing-sensitive test: try to make it flaky (many channels,
+   load, a `makeRoom` in the way), and check it does not leave an env build in flight for the rest of the
+   file.
+8. Held under attack this pass, so do not re-derive: the two answers of R5-01 (creator-vs-joiner
+   sentences, pinned by two tests and two mutations); the identity guard on `starting`; the one-shot
+   `close`; the F4-01 pair and its two mutations; `processGone`'s zombie read (its mutation moved and
+   still dies); R4-09's two branches; the 60/120/200/500 clip numbers; R4-02's digest rule; the stems'
+   ≤ 51 bound; and the accepted list, including the cross-process name collision, `STRUCTURED_OUTPUT_MAX_BYTES`
+   being dead, and `lostChannelNotes` now being called once per `session_start`.

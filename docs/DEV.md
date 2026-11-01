@@ -85,7 +85,7 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   Add the mutation to the script when you fix something — prose fixes get mutations too. Check the new
   anchor before the long run with `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` (seconds, runs no
   tests; a stale anchor is skipped silently by a real run), and pass a label substring (`… R3-0`)
-  while iterating; the whole list is about twenty minutes.
+  while iterating; the whole list is about fifty minutes, so iterate with a filter.
   Two things it guards against, both learned the hard way: a mutation is applied only if the tree still
   `tsc`s (an anchor that no longer matches the code's shape is skipped loudly rather than counted as a
   survival — three anchors had rotted that way), and a mutation counts as dead only when the **set of
