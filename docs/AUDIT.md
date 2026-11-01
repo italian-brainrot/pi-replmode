@@ -3040,3 +3040,251 @@ Attack the pass-5 fixes. The places where they are thin, in the order I would tr
    still dies); R4-09's two branches; the 60/120/200/500 clip numbers; R4-02's digest rule; the stems'
    ≤ 51 bound; and the accepted list, including the cross-process name collision, `STRUCTURED_OUTPUT_MAX_BYTES`
    being dead, and `lostChannelNotes` now being called once per `session_start`.
+
+---
+
+## Pass 6 audit — 2026-11-01 (tester)
+
+Gate inherited: `tsc`/`biome` green, 204 vitest with 0 failures, 47 pytest, 66 mutation anchors all
+matching with 64 dying. Gate left: `tsc`/`biome` green, **207 vitest — 204 pass, 3 fail** (the three
+holding tests, in two identical full runs, 55 s each), 47 pytest, and `ANCHORS_ONLY=1
+bash scripts/mutation-audit.sh` → all 66 anchors still match. **The full 66-mutation run was not
+repeated this pass**: pass 6 changed no product code, and the part of that script that rots when prose
+moves is the anchor check, which was run. Everything below is against HEAD `29e3ab6`, and no product
+file was touched.
+
+Three findings, all in the join path R5-01 opened or in the answer shape it reuses: one behaviour bug
+(a call in a live session is handed a channel creation that belongs to a session that has ended), and
+two answers whose structured view contradicts their own sentence. R5-03's total renderer held, the late
+spawn pin did not go flaky under load, and R5-04/R5-05/R5-06/R5-07 survived their worst cases as far as
+one pass can construct them. What pass 5's handoff called "the thin places" is where the two real ones
+turned up — items 1 and 2 of its list.
+
+### R6-01 — BUG — a call in a live session is handed the channel creation of a session that has ended
+
+`getChannel` joins whatever creation it finds in `starting`:
+
+```ts
+const pending = this.starting.get(name);
+if (pending) return untilAborted(pending, signal, name, true);
+```
+
+That lookup has no idea which session the creation belongs to, and `quit()` deliberately leaves
+`starting` alone. R5-02 gave every *start* an epoch; the *join* still takes none. So a call made after a
+session ended can be attached to a creation that is already doomed — and be answered with that dead
+session's sentence about itself.
+
+`PI_REPLMODE_KEEP_RUNNING=0` is the documented way to reach this without killing the process:
+`closeAll` calls `quit()` for *every* `/new` and `/resume` when that variable is `0`, the manager is a
+`globalThis` singleton, and the session that follows is live. (With the default, `quit()` runs only on
+reason `"quit"`, where the process exits behind it — so the honest reachability statement is "a supported
+setting, not the default one".)
+
+Measured (a scratch script: a stub interpreter, `PI_REPLMODE_ENV_DIR` at a dir with no `.complete` and
+a `<envDir>.lock` directory so call A sits in `acquireLock`'s 500 ms polls; `session_shutdown
+reason:"new"` → `quit()`; `session_start`; then two fresh calls for the same channel name; then the lock
+released):
+
+- session 1's own call: `channel "j-doomed" could not start: the session ended while this channel was
+  starting`, `details: {"channel":"j-doomed","status":"dead"}` — correct, that call owns the epoch;
+- session 2's call: **waited 535 ms** for that doomed creation and got the identical sentence and
+  `status: "dead"`. Its own session is demonstrably alive — the retry right after it answered
+  `[new channel "j-doomed": python 3.14.0, …]` and completed;
+- session 2's call that gave up: *`call aborted while channel "j-doomed" was still starting: nothing was
+  sent to it, and this call held neither the daemon nor the slot — the call that is starting that channel
+  was not cancelled, so it carries on`* — while the creation it was pointing the model at failed with
+  "the session ended" moments later. R5-01's new sentence is a promise about another call's future that
+  the code cannot back up once that other call belongs to a dead session.
+
+So one call produced two false statements (its session did not end; nothing "carries on"), and the name
+was unusable for the whole length of the doomed creation — for a real cold environment build that is the
+build, not half a second.
+
+**Holding test:** `test/lifecycle.test.ts`, `R6-01: a call made after a session ended is not part of
+that session` (the same `.lock` recipe, `KEEP_RUNNING=0`, `session_shutdown reason:"new"`, then a waiting
+joiner and an aborted joiner). It fails on the finding; its premise pins are green: the first session's
+call *does* say the session ended, the doomed daemon *is* closed on sight (within 10 s — my stub ignores
+the `shutdown` frame, so the close's SIGTERM at 3 s is what takes it), and a later call in the same
+process *does* get a `[new channel` banner.
+
+**What a fix must not break:** the creator's own answer (R4-06 pins `the slot its daemon held is free
+again`, R5-01's second test pins the joiner's `was cancelled` answer when the creator cancels); the
+one-shot `close`; `quit()`'s `halfStarted` walk and the close-on-sight hook (pinned); and the rule that
+`quit()` may not simply delete `starting` — the creation is still running and would install its daemon
+into the map the next session owns. The two candidate fixes have different costs and both are defensible:
+
+- *treat a stale creation as absent* (`starting` keyed with the epoch it began in, or dropped when its
+  start rejects), so the new session starts its own. Watch the measured consequence: two daemons for one
+  name can coexist for the length of a `close()` — 4.5 s for a daemon that ignores `shutdown` and SIGTERM
+  — sharing one daemon log, one history file and one IPython profile (pass 5 measured and accepted that
+  for two *pi processes*; this would make it one process doing it to itself);
+- *keep the join and tell the truth in the answer* ("the call that was starting that channel belonged to
+  a session that has ended: nothing was sent, ask again"). That fixes both sentences and leaves the name
+  blocked for the length of the doomed creation — which the answer would then have to say out loud.
+
+### R6-02 — PAPERCUT — R5-01's joiner answers `status: "dead"` about a channel that is alive
+
+`run` answers a cancelled joiner through `abortedResult`, which is R4-06's shape: `details.status` and
+`structuredContent.status` are `"dead"`. That status was chosen for a *creator* that had just had its own
+daemon closed by its own cancel. A joiner owns no daemon, and the channel it was waiting for is normally
+fine — its own sentence says so ("the call that is starting that channel … carries on").
+
+Measured (a scratch script; stub answers `ready` 1.5 s in and answers cells; creator never cancelled,
+joiner aborted at 700 ms): the joiner was answered 0 ms after its abort with
+
+```
+text:       call aborted while channel "j-live" was still starting: … carries on
+details:    {"channel":"j-live","status":"dead"}
+structured: {"status":"dead","channel":"j-live","aborted":true,…}
+```
+
+The creator's call then completed, and a third call on `j-live` met the **same daemon** (the test asserts
+`later.details.pid === creatorResult.details.pid`) — so at the moment the joiner was answered the channel
+was not dead and about a second later it demonstrably was not dead either. A model that reads
+`structuredContent.status` is told the channel is gone, which is exactly the thing it acts on (it stops
+trying to use it, or reports to the user that the channel died).
+
+**Holding test:** `test/lifecycle.test.ts`, `R6-02: an aborted joiner does not report the channel it was
+waiting for as dead`. The premise pins passed before the finding assertion: the joiner really was waiting
+on somebody else's start (`was still starting`), it was answered as an error, its cell never went on the
+wire (a marker file it would have written stays absent — `runLocked`'s guard held), the creator completed,
+and the later call met the same pid. Only the two status assertions fail.
+
+**What a fix must not break:** R4-06's pinned contract for a *cancelled creator* (`aborted: true` with
+`status: "dead"`, and `run.test.ts`'s `dead` assertion) — the branch R5-01 already splits for the text
+has to split for the status too. Pass 3's rule that a successful result carries no `isError` key, and the
+`RUN_OUTPUT` status enum, also apply.
+
+### R6-03 — PAPERCUT — the dropped-task answer's own channel field names a different channel
+
+`bgStop` reports the R4-09/R5-04 case by throwing, and `index.ts` builds the failure result with the
+channel the *tool* knows — for `bg_stop` and `bg_wait` that is a literal `"main"`
+(`failure(error, "main")`). So one result contains an answer about one channel and a structured view
+about another:
+
+```
+text:        unknown task: repl-xmqyg7xf. Its channel "j-drop" was killed with bg_stop {kill: true}, …
+details:     {"channel":"main","status":"dead"}
+structured:  {"status":"dead","channel":"main","error":"…"}
+```
+
+The same invention happens in the generic branch (`unknown task: repl-nope. … pruned after 3 days`),
+where no channel is involved at all. R5-04's fix made this answer check the log path it promises — the
+channel it *names* was left contradicting the object that carries the name.
+
+**Holding test:** `test/resilience.test.ts`, `R6-03: and the answer's channel field names the channel its
+own sentence names`, next to R4-09's and R5-04's tests (it asserts the sentence still names
+`"r-dropfield"` — green — and then that `details.channel` and `structuredContent.channel` agree — red,
+both read `"main"`).
+
+**What a fix must not break:** R4-09's two branches and their wording, R5-04's `existsSync` clause and
+the "no longer there" sentence, and the `RUN_OUTPUT` schema (`channel` is required, so "leave it out"
+means either a schema change or a value that is honest). A cheap shape: let `bgStop`'s dropped branch
+throw an error that carries the channel, and have `failure()` use it — while the generic "unknown task"
+branch should not claim a channel the call never named.
+
+### Re-checking pass 5's fixes — what held
+
+- **R5-03's "the renderer is total" claim: held, and so is the handler around it.** I went looking for a
+  reachable throw in `session_start` other than the one pass 5 fixed. `pruneRetention` — the only call
+  before `section = renderSection([])` — is total: `ensureDirs()` swallows every error per directory, and
+  `readdirSync`/`statSync`/`unlinkSync` are each in their own `try`. `lastHistoryByChannel`'s per-file
+  body is inside a `try`, `ts` is coerced to a string, `channel` is shape-checked before it is used as a
+  key, and the `notes.sort` comparator is total. Hostile records (`definitions` a JSON string, an array of
+  objects, an array of 100 000 strings → `+99994 more`, nested arrays, `torn: "lots"`, numeric `ts`, a
+  5 MB `code`) all render to one line each. There is no `await` between the two `section =` assignments,
+  so nothing can observe the interval; `ctx.ui.notify`, the only call after them, cannot take the section
+  with it. A record filed under a **live** channel's name never reaches the section: the liveness check in
+  `lostChannelNotes` drops it first, so a history file cannot report a running channel as lost.
+- **R5-01's join, the parts pass 5 listed.** A joiner aborted *after* the creation succeeded: answered at
+  its own cancel, and `runLocked`'s guard caught the cell (no frame reached the daemon — pinned in
+  R6-02's test) and left the channel live for the creator. Two joiners on one creation in a live session:
+  both answered at their own cancel (that is R6-01's setup; the joining itself behaved). Re-read, not
+  measured: the join registers no `release`, cannot reach `startChannel`'s race, and needs no slot; the
+  wrapper attaches handlers to the creator's promise, so a rejected creation never becomes an unhandled
+  rejection; `abortWatch`'s listener is detached when the wait ends either way.
+- **The late-spawn pin (pass 5's new timing-sensitive test): not flaky.** Four runs of
+  `test/lifecycle.test.ts` under a 24-way CPU load (see the tooling note below — **and read the trap**):
+  31/31 each time, no flakes, and the file leaves no environment build in flight afterwards
+  (`buildEnv` finishes and clears `inflight` even when the daemon it spawned was closed on sight).
+- **R5-05.** The `Z` entry in `signalDiagnosis` is unreachable, exactly as the fixer said: a zombie
+  daemon's channel takes the exit path, which settles its execs, so `bgStop` never reaches the busy
+  branch — the entry is dead prose, not false prose, and no test can reach it. The `S` fallback stays the
+  right guess for the only realistic busy-branch cases (a cell that set `SIG_IGN`, C code holding the GIL).
+  The "a cell's *child* in `T` is not diagnosed" weakness is unreachable in the direction that matters: a
+  daemon waiting on a stopped child *does* take SIGINT (PEP 475 re-raises after the handler), so the cell
+  stops and the busy branch never runs.
+- **R5-04.** `Channel.begin` opens the exec log with `openSync(logPath, "w")`, so every exec has a log the
+  moment it exists — an empty one still satisfies "the cell's output is in `<path>`", and the past tense
+  in the missing-file branch is never a claim about a file that never existed.
+- **R5-06.** Both sentences re-read. Worth recording so the next pass does not file it: "in the prompt of
+  every later session" is only true for channels that are *gone* (live ones are excluded) and only for the
+  newest `lostChannelNotes(8)` — a name can miss the prompt entirely. It is a reason for a bound, not a
+  promise about one name, so it is not filed.
+- **R5-07.** The cross-session version of the sentence was re-read rather than filed. After a `/new` in a
+  long-lived process, a `bg_wait` with an empty registry does say `No background tasks are tracked any
+  more; N were dropped when their channel went, and bg_stop with the task ID names the log each one left`
+  about drops this session never caused — but the ids are not in the answer, so the model cannot actually
+  take the action it is pointed at; the harm is confusion, not a wrong file read, and the wording says
+  "tracked", not "this session". Pass 5 accepted the count; this pass found no way to make it mislead a
+  model into a wrong action.
+
+### Probed, measured, and not filed (pass 6)
+
+- **A call that has its channel and is queued behind another cell, when the channel goes.** Measured
+  (a scratch script: the creator holds the lock with an 8 s cell, the second call has its channel and is
+  queued, `session_shutdown reason:"new"` with `KEEP_RUNNING=0`): the queued call answers
+  `the Python process behind channel "j-queued" ended (exit code unknown, signal SIGTERM)` with
+  `status: "dead"`. Nowhere does it say its cell was never sent, although `Channel.begin` threw before
+  `send` and the marker file the cell would have written never appeared — and R4-06 established that this is
+  exactly what an answer must say. Reachability is narrow, which is why it is not filed as a finding: the
+  cap's retirement cannot hit a queued call (it only retires channels with nothing running, and a
+  backgrounded task makes new calls meet `ChannelBusyError` first), and a quit that lets the session live
+  on needs `KEEP_RUNNING=0`. If the fixer is already in `getChannel`/`runLocked` for R6-01, a
+  `if (channel.closed) return this.abortedResult(name, "…the channel had already gone: nothing was
+  sent…")` guard in `runLocked` closes it, next to the `signal?.aborted` one.
+- **`PI_REPLMODE_ENV_DIR` at a directory that exists but has no `.complete`** makes `buildEnv` run
+  `uv venv` on the existing directory, and the model's start-failure answer is `uv venv failed for …:
+  A directory already exists at: …` — which reads like a bug in the tool. This bit me writing the R6-01
+  test (a stub env dir needs its `.complete` unless the point is to hold the lock). Recorded in DEV.md
+  rather than as a finding; a clearer error would be nice but the situation is operator-shaped.
+- **The `T`-state answer stays actionable** (checked, no finding): it names the state, and `details.pid`
+  is on the busy answer, so the model can `os.kill(pid, signal.SIGCONT)` from another channel; the group
+  kill still reaches a stopped daemon (R5-05's test escalates that way).
+
+### Tooling: the CPU-load harness, and a leak that cost the machine 55 minutes
+
+To answer handoff item 7 I ran `test/lifecycle.test.ts` four times under 24 CPU spinners. The harness
+matters more than the result: `SPINNERS=($!)` captures **one** pid, not the 24 job pids, so
+`kill "${SPINNERS[@]}"` at the end of such a script kills one spinner and orphans 23 to PID 1. That
+happened in this repo's session today: 23 busy-loops burned **17.5 core-hours** over ~55 minutes
+(load average 31 on a 24-core box) before the user noticed and a sibling pi session found and killed
+them. Use the DEV.md recipe instead: `trap 'kill $(jobs -p) 2>/dev/null' EXIT INT TERM` *before*
+spawning, and check `pgrep -c` after. Nothing is left running as pass 6 ends (0 matching processes, the
+box at ~1 % busy).
+
+### Handoff to the fixer (pass 6)
+
+In my order of preference. The first two are the same call site (`getChannel`'s join and the answer
+`run` builds from it); the third is a different file.
+
+1. **R6-01** (`test/lifecycle.test.ts`) — the join must not hand a live session a creation from an ended
+   one, and must not answer it with the dead session's sentence. Pick one of the two routes in the
+   finding's write-up and say *why* in the answer; if you take "start our own", measure the two-daemons-
+   one-name window you have created (it was 4.5 s for a stubborn daemon) and decide out loud whether that
+   is cheaper than the blocked name. Do not "fix" it by clearing `starting` in `quit()`.
+2. **R6-02** (same file) — a cancelled joiner's `status` must be true for a channel that is not dead.
+   Split the status the way R5-01 already splits the text; leave the cancelled *creator*'s `dead` alone.
+3. **R6-03** (`test/resilience.test.ts`) — an answer from `bg_stop`/`bg_wait` must not name a channel it
+   is not about. `bgStop`'s dropped branch knows the channel; the "never heard of that id" branch should
+   not claim one.
+4. While you are in `runLocked`: the queued-call-meets-a-closed-channel answer above (measured, not
+   pinned). It wants the same "nothing was sent" sentence R4-06 made for a cancelled call.
+5. Re-run the full 66 mutations after the fixes (the anchor check is already green at pass 6's end); if
+   R6-01's fix changes the join, give it a mutation — the join currently has two, and neither of them is
+   about epochs.
+
+And for the next tester, from what I re-checked and did not file: R5-03's renderer totality is
+load-bearing and provable (I enumerated the handler's calls); `signalDiagnosis`'s `Z` branch is
+unreachable; the `Channel.begin` log is opened eagerly, so R5-04's past tense is safe; and pass 5's
+late-spawn pin is solid under load.

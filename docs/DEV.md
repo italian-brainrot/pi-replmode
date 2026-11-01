@@ -76,6 +76,27 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   closes its own descriptors): point `PI_REPLMODE_ENV_DIR` at a directory holding `.complete` and an
   executable `bin/python` script, and the host spawns that instead. `test/lifecycle.test.ts` does it —
   the host code under test is completely real, only the peer is a stub.
+  Two edges of that trick. The directory needs `.complete`: without it `buildEnv` decides the environment
+  must be built and runs `uv venv` on the existing directory, and the model's start-failure answer becomes
+  `uv venv failed for …: A directory already exists at: …` (measured, and it cost me a debugging detour).
+  If the point *is* to hold the call inside `ensureEnv`, leave `.complete` away and create a directory
+  named `<envDir>.lock` — that is the single-flight build's own `mkdir` lock, polled every 500 ms — then
+  write `.complete` and remove the lock to let the build finish. That is how the "daemon spawned after the
+  quit began walking" branch is reached deterministically.
+- **Measuring a timing-sensitive test needs CPU load, and a load harness leaks if you are careless.**
+  `SPINNERS=($!)` captures **one** pid, not the job pids: `for i in $(seq 24); do (while :; do :; done) &
+  done` followed by `kill "${SPINNERS[@]}"` kills one spinner and orphans 23 to PID 1, each pinned at a
+  core. That happened in this project and burned 17.5 core-hours before anyone noticed. Do this instead,
+  and check afterwards with `pgrep -c loadrun || true`:
+
+  ```bash
+  trap 'kill $(jobs -p) 2>/dev/null' EXIT INT TERM
+  for i in $(seq "$(nproc)"); do (while :; do :; done) & done
+  for run in 1 2 3 4; do npx vitest --run test/lifecycle.test.ts; done
+  ```
+
+  Four loaded runs of `lifecycle.test.ts` is the check pass 6 used for its timing-sensitive tests: 31/31
+  each time, no flakes.
 - **Is a fix actually pinned?** `bash scripts/mutation-audit.sh` applies one deliberate break to a fixed
   defect at a time, runs the test file that should notice, and restores the file from a copy taken
   before the break (it no longer reverts with `git checkout`, which used to eat uncommitted work).
@@ -194,6 +215,15 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   start that began before a quit and finishes during it is closed rather than adopted, because the map it
   would be adopted into is one the quit has just cleared. The epoch, not a flag — the manager outlives
   sessions, so a flag would poison the next one (F4-01).
+- **A call that *joins* somebody else's channel creation owns nothing** — not the daemon, not the
+  `starting` slot, not the cap. That is what R5-01's `untilAborted(…, joined = true)` and
+  `ChannelJoinAbortedError` are for: the joiner's cancel ends its own wait and nothing else, and its
+  answer must not claim it freed a slot it never held. `getChannel`'s join, however, takes **no quit
+  epoch** (open finding R6-01): a creation that can no longer succeed — the session that started it has
+  ended — is still handed to the next session's call, which is then answered with the dead session's
+  sentence. Keep that in mind before treating `starting` as a plain name→promise map, and never "fix" it
+  by clearing `starting` from `quit()`: the creation is still running and would install its daemon into
+  the map the new session owns.
 - **A channel is only a channel while its process is.** `channel.closed` turns true when node is *told*
   about a death, which can lag the death itself, so `getChannel` asks `processGone` (a zombie counts as
   gone) before handing a caller a channel, and the settled-task branch of `bg_stop` asks the same question

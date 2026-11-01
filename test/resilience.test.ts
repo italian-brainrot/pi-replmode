@@ -254,6 +254,35 @@ describe("killing a channel", () => {
     expect(pointsAtTheMissingFile, `the answer sends the model to read ${logPath}, which the sweep deleted: ${shown}`).toBe(false);
   });
 
+  it("R6-03: and the answer's channel field names the channel its own sentence names", async () => {
+    // R5-04 made this answer check the log path it points at, and R4-09 made it name the channel whose
+    // kill removed the task. The sentence is right; the other two views of the same result are not.
+    // `bgStop` reports this case by throwing, and the tool wrapper builds the failure result with the
+    // channel it has — for `bg_stop` that is a hardcoded `"main"`. Measured at HEAD, one result:
+    //   text      … Its channel "j-drop" was killed with bg_stop {kill: true} …
+    //   details   {"channel":"main","status":"dead"}
+    //   structured {"channel":"main","status":"dead",…}
+    // A model that reads `structuredContent.channel` is told a channel called "main" is dead, when the
+    // answer is about a different channel entirely.
+    const task = await run("import time\nprint('a cell worth finding')\ntime.sleep(30)", { channel: "r-dropfield", timeout: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await bgStop(task.details.id, { kill: true });
+
+    const again = await bgStop(task.details.id);
+    const shown = text(again);
+    expect(again.isError, `a stop for a task its channel's kill removed was not an error: ${shown}`).toBe(true);
+    // The case is still the one R4-09 filed for: the sentence knows which channel it is about.
+    expect(shown, `the dropped-task answer does not name the channel it is about: ${shown}`).toContain('"r-dropfield"');
+    expect(
+      again.details?.channel,
+      `the answer is about channel "r-dropfield" but its details say ${JSON.stringify(again.details?.channel)}: ${shown}`,
+    ).toBe("r-dropfield");
+    expect(
+      again.structuredContent?.channel,
+      `the answer is about channel "r-dropfield" but its structuredContent says ${JSON.stringify(again.structuredContent?.channel)}: ${shown}`,
+    ).toBe("r-dropfield");
+  });
+
   it("R1-10: takes the processes that its cell started down with it", async () => {
     // The escalation the model is offered when a task will not stop: `kill: true` says it ends
     // every cell in the channel. The daemon exits on the shutdown frame, so the group-kill

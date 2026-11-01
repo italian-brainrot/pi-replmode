@@ -10,19 +10,54 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
 - Status: M1 (core) and M2 (channels, timeouts→background, bg_wait/bg_stop, reload re-adoption) are
   done and covered by real-process tests (pytest + vitest). M3 = display/images, `pi.read_image`,
   `pi.ask`, `pi.run_subagent` over a `call`/`call_reply` pump — not started.
-- Audit loop state: **pass 5 (fixer) is complete — all seven findings fixed, the seven holding tests
-  green, four new green tests added. Next is pass 6 (tester): attack the pass-5 fixes.** Read
-  [docs/AUDIT.md](docs/AUDIT.md) §"Pass 5 fixes — 2026-11-01 (fixer)": per-finding write-ups (what
-  changed, what is still weak), and §"Handoff to pass 6 (tester)" for the attack list in order.
-  Gate this pass leaves: tsc/biome green, **204 vitest, 0 failures** (two identical full runs),
-  **47 pytest**, mutation script **66 anchors, all matching, 64 of 66 die** (the two survivors are the
-  accepted ones).
-  One test *line* changed, argued in AUDIT: pass 5's R5-02 asserted `existsSync(sideEffect)`, which the
-  retired channel's own legitimate cell makes true — it now asserts the cold marker is absent and the
-  hot one present. New test files/ids to know: `R5-01: and a joiner whose creator gives up…`,
-  `F4-01: and a daemon that spawns after the quit began walking…` (both `lifecycle.test.ts`),
-  `R5-03: and a record whose rendering throws…` and `R5-06: and the refusal gives the model the same
-  reason…` (both `prompt.test.ts`).
+- Audit loop state: **pass 6 (tester) is complete — three findings filed (R6-01, R6-02, R6-03), each with
+  a holding test that stays red. Next is pass 6 (fixer).** Read [docs/AUDIT.md](docs/AUDIT.md)
+  §"Pass 6 audit — 2026-11-01 (tester)": per-finding write-ups (mechanism, measured reproduction, what the
+  fix must not break), §"Re-checking pass 5's fixes — what held", §"Probed, measured, and not filed", and
+  §"Handoff to the fixer (pass 6)" for the order of preference. Gate this pass leaves: tsc/biome green,
+  **207 vitest — 204 pass, 3 fail on purpose** (two identical full runs, only timings differed), **47
+  pytest**, `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **66 anchors match**. The **full 66-mutation
+  run was not repeated by pass 6** (no product code changed; the anchor check is the part that rots) — the
+  fixer owes it after the fixes, and owes R6-01's fix a mutation of its own (the join's two mutations are
+  both about the answer, neither about epochs).
+  New test ids: `R6-01: a call made after a session ended is not part of that session` and `R6-02: an
+  aborted joiner does not report the channel it was waiting for as dead` (both `lifecycle.test.ts`, both in
+  the new describe "a call that joins a channel creation which cannot succeed"), and `R6-03: and the
+  answer's channel field names the channel its own sentence names` (`resilience.test.ts`, in "killing a
+  channel"). Pass 6 changed no test assertion and no product file; it added three tests.
+- What pass 6's findings and measurement establish, one line each: **a join is not an owner, and it is not
+  an epoch either** — `getChannel` joins whatever is in `starting` regardless of which session started it,
+  so with `PI_REPLMODE_KEEP_RUNNING=0` (which makes every `/new` and `/resume` run `quit()`) a call in a
+  live session waits 535 ms for a doomed creation and is answered with the dead session's sentence,
+  `the session ended while this channel was starting`, and its aborted sibling is told the other call
+  "carries on" with a creation that failed moments later (R6-01, red; the fix must not clear `starting`
+  from `quit()`, and the "start our own" route re-opens the measured 4.5 s two-daemons-one-name window);
+  **reusing an answer shape reuses its claims** — a cancelled *joiner* is answered by R4-06's
+  `abortedResult`, so it reports `status: "dead"` in both structured views about a channel that completed
+  and was met again by pid a second later, contradicting its own sentence (R6-02, red); **an answer built
+  by `throw` inherits the tool's channel, not the answer's** — `failure(error, "main")` gives `bg_stop`'s
+  dropped-task answer `details.channel`/`structuredContent.channel` = `"main"` while its text names the
+  killed channel, and the generic "unknown task" branch invents `"main"` for an id that never existed
+  (R6-03, red).
+- What pass 6 held under attack, so it is not re-derived: **R5-03's renderer really is total, and so is
+  the handler around it** (`ensureDirs` swallows per-directory errors, so `pruneRetention` cannot throw;
+  `lastHistoryByChannel`'s per-file body is in a `try`, `ts` is coerced, `channel` is shape-checked before
+  it becomes a key; hostile records — `definitions` a string / an array of objects / 100 000 entries →
+  `+99994 more`, nested arrays, `torn: "lots"`, numeric `ts`, a 5 MB `code` — each cost one line; there is
+  no `await` between the two `section =` assignments; and a record filed under a **live** channel's name
+  never reaches the section, because `lostChannelNotes` drops live channels first); pass 5's late-spawn pin
+  is **not flaky** (4/4 loaded runs of `lifecycle.test.ts`, 31/31 each) and leaves no env build in flight;
+  `signalDiagnosis`'s `Z` entry is unreachable dead prose (the exit path settles the exec first), and a
+  cell's child in `T` never reaches the busy branch at all (PEP 475 re-raises after the handler, so the
+  cell dies on SIGINT); `Channel.begin` opens the exec log eagerly, so R5-04's past tense can never be
+  about a file that did not exist; and R5-07's process-wide count is worded "tracked", which stays true
+  after a `/new` — the ids are not in the answer, so no model can take the wrong action from it.
+  Probed, measured, **not filed** (details and the reproduction in AUDIT): a call that has its channel and
+  is queued behind another cell when the channel goes is answered with the bare death note —
+  `the Python process behind channel "x" ended (exit code unknown, signal SIGTERM)` — and never says its
+  cell was never sent, though `Channel.begin` threw before `send`; reachability needs a quit the session
+  survives (`KEEP_RUNNING=0`), because the cap's retirement cannot hit a queued call. `runLocked` wants a
+  `channel.closed` guard next to its `signal?.aborted` one.
 - What pass 5's findings and fixes establish, one line each: **a joiner on somebody else's channel
   creation must be given its own abort handling** — `getChannel`'s join is
   `untilAborted(pending, signal, name, true)`, and a `ChannelJoinAbortedError` keeps the joiner's answer
@@ -167,8 +202,10 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   sitting (`processGone`'s zombie line, both R4-07 prose anchors). Its verdict is the *set of failing test
   names* compared with a per-file baseline taken on a clean tree — an exit code says nothing while tests are
   red on purpose — and it refuses to apply an anchor that does not typecheck. Pass 5's final run:
-  **66 mutations, every anchor matching, 64 die, the two survivors the accepted ones** (`flushLoose`'
-s `lateWrite`→`write`, `failure()`'s status choice). Traps learned the hard way, still true: a multi-line anchor must be **one** single-quoted
+  **66 mutations, every anchor matching, 64 die, the two survivors the accepted ones** (`flushLoose`'s
+  `lateWrite`→`write`, `failure()`'s status choice). Pass 6 (tester) re-ran only the anchor check — all 66
+  still match after its test-only changes — and left the ~50-minute full run to the pass-6 fixer, who owes
+  it plus a mutation for whatever R6-01's fix turns out to be. Traps learned the hard way, still true: a multi-line anchor must be **one** single-quoted
   bash argument (a missing closing quote there swallows the following `run_mutation` lines and the failure
   only shows up as `bash -n` complaining), so run `bash -n scripts/mutation-audit.sh` and
   `ANCHORS_ONLY=1 …` before the long run; a mutation whose *testspec* names the wrong test file reads as a
@@ -227,7 +264,8 @@ s `lateWrite`→`write`, `failure()`'s status choice). Traps learned the hard wa
   first (pass 5's own measurement says the file reads `r5-02-hot r5-02-cold `); it is now two assertions on the
   file's *contents* — the cold marker absent, the hot one present — so the case proving it ran is pinned too.
   Pass 5's fixes also added assertions to one holding test (the aborted joiner must not claim it freed a slot:
-  `not.toMatch(/free again|its daemon/)`), which is an addition, not a change.
+  `not.toMatch(/free again|its daemon/)`), which is an addition, not a change. Pass 6 (tester) changed no
+  assertion anywhere and added three tests of its own.
 - Tests drive real processes only; where a daemon must misbehave (never ready, dies after answering,
   closes its protocol fd, dies on SIGINT, writes its complaint to the capture stream, emits a `fatal`
   frame) `test/lifecycle.test.ts` swaps in a **stub interpreter** via `PI_REPLMODE_ENV_DIR` — a dir with
@@ -242,3 +280,17 @@ s `lateWrite`→`write`, `failure()`'s status choice). Traps learned the hard wa
   a file, `vi.resetModules()` + a second `loadExtension({agentDir})` is how you simulate a reload — without
   the reset the module (whose paths are fixed at import) is reused and your temp dir is not where anything
   goes. Timing-sensitive suites: re-run any flake twice and report it.
+- **If you need CPU load to time a test, `trap 'kill $(jobs -p) 2>/dev/null' EXIT INT TERM` first.**
+  `SPINNERS=($!)` captures one pid, not the 24 job pids, so the "kill the spinners at the end" recipe
+  orphans 23 busy-loops to PID 1: it happened in this project and burned **17.5 core-hours** (load average
+  31 on 24 cores) before a sibling pi session found and killed them. Check `pgrep -c` after any load run.
+- A stub env dir needs its `.complete`: without it `buildEnv` runs `uv venv` on the existing directory and
+  the start failure the model sees is `uv venv failed for …: A directory already exists at: …`. To hold a
+  call inside `ensureEnv` instead, leave `.complete` away and `mkdir <envDir>.lock` (the single-flight
+  build's own lock, polled at 500 ms), then write `.complete` and remove the lock — that is how the
+  late-spawn branch is reached without racing anything (DEV.md has the recipe).
+- **`closeAll` only calls `quit()` when `reason === "quit"` or `PI_REPLMODE_KEEP_RUNNING=0`** — so with the
+  default, `/new`, `/resume` and `/reload` do **not** bump the quit epoch, and the F4-01/R5-02 epoch
+  machinery plus `droppedTasks`-across-boundaries behaviour are only reachable in a live process with
+  `KEEP_RUNNING=0` set. Reachable, documented, and not the default: say which of the three a finding needs
+  (pass 6's R6-01 names it in its own write-up).

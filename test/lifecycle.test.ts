@@ -1114,3 +1114,201 @@ time.sleep(600)
     }
   });
 });
+
+describe("a call that joins a channel creation which cannot succeed", () => {
+  // R5-01 made a *joining* call cancellable, and R5-02 made a start belong to the session that made it.
+  // What neither one touched is the join itself: `getChannel` looks up `starting` and hands over whatever
+  // creation it finds there, with no idea which session that creation belongs to. So a call made after a
+  // session ended can be handed the creation of a session that no longer exists, and be answered with
+  // that session's sentence about itself. `PI_REPLMODE_KEEP_RUNNING=0` is the documented way to make
+  // `quit()` run at a boundary other than process exit — `closeAll` calls it for every `/new` and
+  // `/resume` — and the process and its manager carry on into a new session, which is what makes the
+  // call's own session live. Measured at HEAD: the second session's call waited 535 ms for the doomed
+  // creation and came back with `channel "l-joindoomed" could not start: the session ended while this
+  // channel was starting` (`status: "dead"`), and its aborted sibling was told that the other call
+  // "carries on" with a creation that failed with exactly that sentence moments later.
+  it("R6-01: a call made after a session ended is not part of that session", async () => {
+    const envDir = join(ext.agentDir, "stub-env", "join-doomed");
+    const pidDir = join(ext.agentDir, "join-doomed-pids");
+    rmSync(pidDir, { recursive: true, force: true });
+    mkdirSync(pidDir, { recursive: true });
+    mkdirSync(join(envDir, "bin"), { recursive: true });
+    const script = `import json, os, sys, time
+channel = [a for a in sys.argv if a.startswith("--channel=")][0].split("=", 1)[1]
+open(${JSON.stringify(`${pidDir}/`)} + channel + ".pid", "w").write(str(os.getpid()))
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-joindoomed")}\n`)})
+sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    frame = json.loads(line)
+    if frame.get("t") == "execute":
+        sys.stdout.write(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}) + "\\n")
+        sys.stdout.flush()
+`;
+    writeFileSync(join(envDir, "bin", "python"), `#!/usr/bin/env python3\n${script}`, { mode: 0o755 });
+    // An environment that is not built yet, and one somebody else appears to be building: the first
+    // call sits in `acquireLock`'s 500ms polls, so no daemon exists and its creation stays in flight.
+    rmSync(join(envDir, ".complete"), { force: true });
+    mkdirSync(`${envDir}.lock`);
+
+    const saved = { ...process.env };
+    let first: Promise<any> | undefined;
+    let joined: Promise<any> | undefined;
+    let gaveUp: Promise<any> | undefined;
+    let doomedPid = 0;
+    try {
+      process.env.PI_REPLMODE_ENV_DIR = envDir;
+      process.env.PI_REPLMODE_KEEP_RUNNING = "0";
+      process.env.PI_REPLMODE_READY_TIMEOUT_MS = "30000";
+
+      first = ext.callTool("run", { code: "print('session one')", channel: "l-joindoomed", timeout: 30 });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      // The session ends underneath that call, and this time the process goes on to have another one.
+      await ext.emit({ type: "session_shutdown", reason: "new" });
+      await ext.emit({ type: "session_start", reason: "new" }, { hasUI: true });
+
+      // Two fresh calls in the session that just began, both for the name the dead session was starting.
+      joined = ext.callTool("run", { code: "print('session two')", channel: "l-joindoomed", timeout: 30 });
+      const controller = new AbortController();
+      gaveUp = ext.callTool(
+        "run",
+        { code: "print('session two, giving up')", channel: "l-joindoomed", timeout: 30 },
+        { signal: controller.signal },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Let the environment build finish: the doomed creation now spawns its daemon, and the spawn hook
+      // is the only thing holding it.
+      writeFileSync(join(envDir, ".complete"), JSON.stringify({ hash: "000000000000", base: "python3", version: "3" }), "utf8");
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+      controller.abort();
+
+      await waitFor(
+        () => {
+          try {
+            doomedPid = Number(readFileSync(join(pidDir, "l-joindoomed.pid"), "utf8"));
+          } catch {
+            doomedPid = 0;
+          }
+          return Number.isInteger(doomedPid) && doomedPid > 0;
+        },
+        20_000,
+        "the doomed creation to spawn its daemon: the case did not run",
+      );
+      try {
+        // Nothing else can stop this daemon: the ready timeout is 30s away, and the only thing that ever
+        // held it is the spawn hook. Asked here rather than after the calls settle, so a daemon that
+        // outlived its session is not rescued by something else in the file.
+        await waitFor(() => !isPidAlive(doomedPid), 10_000, "the doomed daemon to be stopped");
+      } catch {
+        // Reported by the assertion below.
+      }
+    } finally {
+      for (const key of ["PI_REPLMODE_ENV_DIR", "PI_REPLMODE_KEEP_RUNNING", "PI_REPLMODE_READY_TIMEOUT_MS"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key]!;
+      }
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+      if (doomedPid > 0 && isPidAlive(doomedPid)) process.kill(doomedPid, "SIGKILL");
+    }
+
+    const a = await first!;
+    const b = await joined!;
+    const c = await gaveUp!;
+
+    // The case ran: the first session's own call is the one whose session ended, and the doomed daemon
+    // was closed on sight rather than left running.
+    expect(a.isError, "the call whose session ended reported a success").toBe(true);
+    const firstText = text(a);
+    expect(firstText, `the first session's call did not report its session ending: ${firstText}`).toMatch(/session ended/);
+    expect(isPidAlive(doomedPid), `the daemon of the doomed creation (pid ${doomedPid}) outlived it`).toBe(false);
+
+    // And the process has a live session, which is the whole point: a call made now gets a channel of its
+    // own and runs in it.
+    const later = await ext.callTool("run", { code: "print('the session is still here')", channel: "l-joinlive", timeout: 30 });
+    expect(later.isError, `the process had no live session left to exercise the case: ${text(later)}`).toBeUndefined();
+    expect(text(later), "a call made after the boundary did not get a fresh channel").toContain("[new channel");
+
+    const secondText = text(b);
+    const claimsItsOwnSessionEnded = secondText.includes("the session ended while this channel was starting");
+    expect(
+      claimsItsOwnSessionEnded,
+      `a call made by a session that is demonstrably still running was answered with the sentence meant for the call whose session ended: ${secondText}`,
+    ).toBe(false);
+
+    const gaveUpText = text(c);
+    const promisedAnotherCall = gaveUpText.includes("carries on");
+    expect(
+      promisedAnotherCall && /session ended/.test(firstText),
+      `the joiner was told another call carries on with starting that channel, while that creation was already doomed: ${gaveUpText}`,
+    ).toBe(false);
+  });
+
+  it("R6-02: an aborted joiner does not report the channel it was waiting for as dead", async () => {
+    // R5-01's joiner is answered by `abortedResult`, whose `status` is the one R4-06 chose for a *creator*
+    // that had just had its own daemon closed: `"dead"`. A joiner owns no daemon, and the channel it was
+    // waiting for is normally fine. Measured here: the joiner is answered in under a second with
+    // `details.status: "dead"` and `structuredContent.status: "dead"` while its own sentence says the
+    // creation "carries on" — the creator's call then completes, and a third call runs on the same daemon
+    // (same pid) seconds later.
+    const script = `import json, os, sys, time
+time.sleep(2.0)
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-joinalive2")}\n`)})
+sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    frame = json.loads(line)
+    if frame.get("t") == "execute":
+        sys.stdout.write(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}) + "\\n")
+        sys.stdout.flush()
+`;
+    const marker = join(ext.agentDir, "r6-02-cell.txt");
+    rmSync(marker, { force: true });
+    const joiner = new AbortController();
+    let joinerResult: any;
+    let creatorResult: any;
+    await withStub("joiner-channel-alive", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
+      const creator = ext.callTool(
+        "run",
+        { code: "keepme = 41", channel: "l-joinalive2", timeout: 30 },
+        { signal: new AbortController().signal },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const joining = ext.callTool(
+        "run",
+        { code: `open(${JSON.stringify(marker)}, "w").write("ran")`, channel: "l-joinalive2", timeout: 30 },
+        { signal: joiner.signal },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      joiner.abort();
+      joinerResult = await joining;
+      creatorResult = await creator;
+    });
+
+    // The case ran: the second call really was waiting on somebody else's creation, it gave up, and its
+    // cell never went on the wire.
+    const shown = text(joinerResult);
+    expect(joinerResult.isError, "the aborted joiner reported a success").toBe(true);
+    expect(shown, `the second call did not join an in-flight start: ${shown}`).toContain("was still starting");
+    expect(existsSync(marker), `the aborted joiner sent its cell anyway: ${shown}`).toBe(false);
+
+    // And the channel it walked away from is alive: the creator's call completed, and a later call meets
+    // the same daemon rather than a new one.
+    expect(creatorResult.isError, `the call that was starting the channel failed: ${text(creatorResult)}`).toBeUndefined();
+    const later = await ext.callTool("run", { code: "print('still here')", channel: "l-joinalive2", timeout: 30 });
+    expect(later.isError, "a later call on that channel failed: the channel did not stay alive").toBeUndefined();
+    expect(later.details?.pid, "a later call met a different daemon: the channel did not stay alive").toBe(creatorResult.details?.pid);
+
+    expect(
+      joinerResult.details?.status,
+      `the joiner's answer reports the channel dead while its own sentence says the creation carries on, and the daemon is live (pid ${creatorResult.details?.pid}): ${JSON.stringify(joinerResult.details)}`,
+    ).not.toBe("dead");
+    expect(
+      joinerResult.structuredContent?.status,
+      `the same answer's structured view reports the channel dead: ${JSON.stringify(joinerResult.structuredContent)}`,
+    ).not.toBe("dead");
+  });
+});
