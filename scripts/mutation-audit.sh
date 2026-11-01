@@ -8,22 +8,49 @@
 # deleting the line.
 #
 # Usage: bash scripts/mutation-audit.sh [label-substring]   (a filter, because a full pass is minutes)
+#        ANCHORS_ONLY=1 bash scripts/mutation-audit.sh      (check every anchor, run nothing: seconds)
 set -u
 cd /home/qq/distrobox/ubuntu/Projects/pi-replmode
 
 FILTER="${1:-}"
+# ANCHORS_ONLY=1 checks that every anchor still matches the source and stops: a stale anchor is skipped
+# silently by a real run (pass 4 found three that had rotted), and finding out after 20 minutes is
+# expensive. It runs no vitest and no tsc — the real run refuses a mutation that does not compile.
+ANCHORS_ONLY="${ANCHORS_ONLY:-}"
 WORK=$(mktemp -d)
 MUTATED=""
 SURVIVED=()
 NOTICED=0
 TOTAL=0
-cleanup() { [ -n "$MUTATED" ] && git checkout -- $MUTATED; rm -rf "$WORK"; }
+BADANCHOR=0
+# The mutated file is restored from a copy taken before it was touched, never with `git checkout`: the
+# audit runs most often against a tree that is mid-fix and therefore uncommitted, and checking out HEAD
+# over it throws that work away.
+cleanup() { [ -n "$MUTATED" ] && restore_file; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
 
 # Which test names fail in a file, one per line. The count is not enough: while the audit loop is
 # running, some tests are red on purpose, so "something failed" says nothing about whether the
 # mutation was noticed. A mutation dies when the *set of failing test names* changes.
 failing_names() { grep -E "^[[:space:]]+× " "$1" 2>/dev/null | sed "s/^[[:space:]]*× //; s/[[:space:]]*[0-9]*ms[[:space:]]*$//" | sort; }
+
+# Apply one mutation: `<anchor>\n---MUTATE---\n<replacement>` against the file. Exit 2 when the anchor
+# is not in the source, which the caller reports rather than treating as a survival.
+apply_mutation() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, pathlib
+path, src = pathlib.Path(sys.argv[1]), sys.argv[2]
+text = path.read_text()
+old, new = src.split("\n---MUTATE---\n")
+if old not in text:
+    print("!! anchor not found:", old[:60]); sys.exit(2)
+path.write_text(text.replace(old, new, 1))
+PYEOF
+}
+
+restore_file() {
+  [ -f "$WORK/orig" ] && cp "$WORK/orig" "$MUTATED" && rm -f "$WORK/orig"
+}
 
 declare -A BASELINE
 baseline() {
@@ -37,27 +64,31 @@ baseline() {
 run_mutation() {
   local label="$1" file="$2" py="$3" testspec="$4"
   if [ -n "$FILTER" ] && [[ "$label" != *"$FILTER"* ]]; then return; fi
+  if [ -n "$ANCHORS_ONLY" ]; then
+    MUTATED="$file"
+    cp "$file" "$WORK/orig"
+    if apply_mutation "$file" "$py"; then
+      restore_file
+      echo "anchor ok: $label"
+    else
+      BADANCHOR=$((BADANCHOR + 1))
+    fi
+    MUTATED=""
+    return
+  fi
   echo "=================================================="
   echo "MUTATION ${label}"
   # The baseline has to be taken while the tree is clean — taking it after the mutation is applied
   # compares the mutated run against itself and reports every mutation as survived.
   baseline "$testspec"
-  python3 - "$file" "$py" <<'EOF'
-import sys, pathlib
-path, src = pathlib.Path(sys.argv[1]), sys.argv[2]
-text = path.read_text()
-old, new = src.split("\n---MUTATE---\n")
-if old not in text:
-    print("!! anchor not found:", old[:60]); sys.exit(2)
-path.write_text(text.replace(old, new, 1))
-EOF
-  if [ $? -ne 0 ]; then echo "  (skipped: anchor)"; git checkout -- "$file"; return; fi
   MUTATED="$file"
+  cp "$file" "$WORK/orig"
+  if ! apply_mutation "$file" "$py"; then echo "  (skipped: anchor)"; restore_file; MUTATED=""; return; fi
   # A mutation that does not compile is not a mutation: it proves nothing, and it wastes the run.
   if ! npx tsc --noEmit > "$WORK/tsc.txt" 2>&1; then
     echo "  !! THE MUTATION DOES NOT COMPILE — fix the anchor, this is not a survival:"
     head -5 "$WORK/tsc.txt"
-    git checkout -- "$file"; MUTATED=""; return
+    restore_file; MUTATED=""; return
   fi
   npx vitest --run "$testspec" > "$WORK/run.txt" 2>&1
   local before after
@@ -73,7 +104,7 @@ EOF
     comm -13 <(printf '%s' "$before") <(printf '%s' "$after") | grep -v "^$" | sed 's/^/    × /'
     grep -E "^[[:space:]]+Error|Test Files " "$WORK/run.txt" | head -3 | sed 's/^/    /'
   fi
-  git checkout -- "$file"
+  restore_file
   MUTATED=""
 }
 
@@ -387,7 +418,25 @@ run_mutation "R3-09 the line total comes from the cut rather than from the file"
 ---MUTATE---
       const totalLines = cut.totalLines;' "test/limits.test.ts"
 
+# ── pass 5's fixes ───────────────────────────────────────────────────────────
+
+run_mutation "R5-03 a remembered definitions field of the wrong shape is trusted again" src/prompt.ts '  const names: readonly unknown[] = Array.isArray(note.definitions) ? note.definitions : [];
+---MUTATE---
+  const names: readonly unknown[] = (note.definitions ?? []) as readonly unknown[];' "test/prompt.test.ts"
+
+run_mutation "R5-03 one unreadable history record takes the whole section with it" src/prompt.ts '  } catch {
+    return `  ${label}: (a record this section could not read)`;
+  }
+---MUTATE---
+  } catch (error) {
+    throw error;
+  }' "test/prompt.test.ts"
+
 echo "=================================================="
+if [ -n "$ANCHORS_ONLY" ]; then
+  echo "ANCHOR CHECK ONLY — bad anchors: $BADANCHOR"
+  exit $((BADANCHOR > 0 ? 1 : 0))
+fi
 echo "MUTATIONS RUN: $TOTAL — noticed: $NOTICED — SURVIVED: ${#SURVIVED[@]}"
 for s in "${SURVIVED[@]}"; do echo "  survived: $s"; done
 git status --short

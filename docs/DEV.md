@@ -45,8 +45,10 @@ scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so
                    definition of where the environment lives)
 scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
                    "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
-                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 55 mutations /
-                   ~20 minutes (it typechecks each mutation and re-runs a baseline per test file)
+                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is ~60 mutations /
+                   ~20 minutes (it typechecks each mutation and re-runs a baseline per test file).
+                   `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` checks that every anchor still
+                   matches the source and runs nothing: do that first, it takes seconds
 scripts/smoke-abort-start.sh  the real-pi abort smoke: a pty, the interactive TUI, and the byte for Esc
                    (SIGINT to `pi -p` is a hard kill that runs no shutdown, so nothing else can reach this)
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
@@ -75,13 +77,15 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   executable `bin/python` script, and the host spawns that instead. `test/lifecycle.test.ts` does it —
   the host code under test is completely real, only the peer is a stub.
 - **Is a fix actually pinned?** `bash scripts/mutation-audit.sh` applies one deliberate break to a fixed
-  defect at a time, runs the test file that should notice, and reverts with `git checkout`. A mutation
-  that changes nothing means the fix has no test behind it — pass 3 found two that way (the `evalue`
-  clipping, and `flushLoose` going through `Exec.lateWrite`), and the pass-3 fixes found three of their
+  defect at a time, runs the test file that should notice, and restores the file from a copy taken
+  before the break (it no longer reverts with `git checkout`, which used to eat uncommitted work).
+  A mutation that changes nothing means the fix has no test behind it — pass 3 found two that way (the
+  `evalue` clipping, and `flushLoose` going through `Exec.lateWrite`), and the pass-3 fixes found three of their
   own (the capacity wording, `bg_stop`'s "variables", and two copies of one bound masking each other).
-  Add the mutation to the script when you fix something — prose fixes get mutations too. The script
-  reverts with `git checkout`, so **commit before running it**, and pass a label substring (`… R3-0`)
-  while iterating; the whole list is about fourteen minutes.
+  Add the mutation to the script when you fix something — prose fixes get mutations too. Check the new
+  anchor before the long run with `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` (seconds, runs no
+  tests; a stale anchor is skipped silently by a real run), and pass a label substring (`… R3-0`)
+  while iterating; the whole list is about twenty minutes.
   Two things it guards against, both learned the hard way: a mutation is applied only if the tree still
   `tsc`s (an anchor that no longer matches the code's shape is skipped loudly rather than counted as a
   survival — three anchors had rotted that way), and a mutation counts as dead only when the **set of

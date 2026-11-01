@@ -13,7 +13,9 @@
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type { HistoryNote } from "../src/manager.ts";
 import { channelFileStem } from "../src/names.ts";
+import { lostChannelsLines } from "../src/prompt.ts";
 import { type LoadedExtension, loadExtension, repoRoot, text as text2 } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
@@ -332,6 +334,41 @@ describe("a history record the section cannot read", () => {
     } finally {
       for (const file of files) rmSync(file, { force: true });
     }
+  });
+
+  it("R5-03: and a record whose rendering throws costs its own line, not the section", () => {
+    // The shape guards cover the field shapes a JSON file can hold. This is the insurance behind them:
+    // the note is built out of files this build did not necessarily write, so one record that defeats
+    // every guard must still cost only its own line. A getter that throws stands in for a renderer that
+    // meets a field shape it never anticipated — the case the guards above exist for.
+    const note = (channel: string, extra: Record<string, unknown> = {}): HistoryNote =>
+      ({
+        ts: "2026-01-03T00:00:00.000Z",
+        id: `repl-${channel}`,
+        channel,
+        status: "completed",
+        elapsed: 1.5,
+        code: `${channel}_marker = 1`,
+        ...extra,
+      }) as HistoryNote;
+    const unreadable: HistoryNote = {
+      ts: "2026-01-03T00:00:00.000Z",
+      id: "repl-r5-unreadable",
+      channel: "r5-unreadable",
+      status: "completed",
+      elapsed: 1.5,
+      code: "r5-unreadable_marker = 1",
+      // A getter, so the throw happens when the line is built rather than when the record is made.
+      get definitions(): string[] {
+        throw new TypeError("a field shape this renderer did not anticipate");
+      },
+    };
+
+    const shown = lostChannelsLines([note("r5-readable"), unreadable]).join("\n");
+    expect(shown, "a record that renders vanished along with the whole note").toContain("r5-readable_marker");
+    expect(shown, "the record that could not be rendered is not reported as unreadable").toContain("could not read");
+    expect(shown, "the unreadable record's channel is not named, so the note cannot be acted on").toContain("r5-unreadable");
+    expect(shown, "the record next to the unreadable one lost its own wording").toContain("last cell completed in 1.5s");
   });
 });
 

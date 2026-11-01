@@ -165,8 +165,13 @@ export default function (pi: ExtensionAPI): void {
     // A new session boundary re-reads what earlier processes left behind. Live channels are this
     // process's own and are not reported as lost.
     manager.pruneRetention();
-    section = renderSection(manager.lostChannelNotes());
+    // The stable part is assigned *before* anything reads the history files, so a throw from anywhere
+    // below leaves the session with the contract instead of with the previous session's section — pi
+    // reports a handler error without the model noticing that the extension's section is missing, and a
+    // stale section names channels that are live again while omitting the ones that went (R5-03).
+    section = renderSection([]);
     const notes = manager.lostChannelNotes();
+    section = renderSection(notes);
     if (notes.length > 0 && ctx.hasUI) {
       // Quoted through the same bound as the section: this is the other place a remembered name reaches
       // a model, and it reads the same history files (R4-01).

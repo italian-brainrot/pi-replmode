@@ -65,12 +65,27 @@ export function lostChannelsLines(notes: HistoryNote[]): string[] {
   return [
     "",
     "These channels ran in an earlier pi process and are gone now — their variables were lost:",
-    ...notes.map(
-      (note) =>
-        `  ${historyChannelLabel(note)}: last cell ${quoted(note.status, HISTORY_STATUS_HINT_CHARS)} in ${formatDuration(note.elapsed)} \u2014 ${quoted(note.code, HISTORY_CODE_HINT_CHARS)}${definitionHint(note)}${tornHint(note)}`,
-    ),
+    ...notes.map((note) => lostChannelLine(note)),
     "Nothing from that listing is bound; re-create what you need instead of assuming it is there.",
   ];
+}
+
+/**
+ * One remembered channel, as one line of the section.
+ *
+ * The line is built inside a `try` because the record it reads came from a file this build did not
+ * necessarily write: a `TypeError` from here escapes `session_start`, pi reports handler errors without
+ * ending the session, and what the model gets is no `replmode` section at all — or, in a process that
+ * rendered one before, the *previous* session's, which names channels that are live again and omits the
+ * ones that went since. One unreadable record costs its own line and nothing else (R5-03).
+ */
+function lostChannelLine(note: HistoryNote): string {
+  const label = historyChannelLabel(note);
+  try {
+    return `  ${label}: last cell ${quoted(note.status, HISTORY_STATUS_HINT_CHARS)} in ${formatDuration(note.elapsed)} \u2014 ${quoted(note.code, HISTORY_CODE_HINT_CHARS)}${definitionHint(note)}${tornHint(note)}`;
+  } catch {
+    return `  ${label}: (a record this section could not read)`;
+  }
 }
 
 /**
@@ -94,14 +109,19 @@ function quoted(value: unknown, limit: number): string {
 }
 
 function definitionHint(note: HistoryNote): string {
-  if (!note.definitions?.length) return "";
+  // The field's *shape* is checked here, not only at the write (R4-01's lesson, R5-03's crash): a JSON
+  // string has a `length` and a `slice` but no `map`, so the old truthiness test let one hand-written
+  // record throw out of the whole section. A field that is not an array contributes no hint; the rest
+  // of the line still says what the cell was.
+  const names: readonly unknown[] = Array.isArray(note.definitions) ? note.definitions : [];
+  if (names.length === 0) return "";
   // Shortened where it is quoted: these names came out of a history file written by some earlier
   // process, and this text goes out with every request of every later session (R3-01).
-  const shown = note.definitions
+  const shown = names
     .slice(0, 6)
     .map((name) => oneLine(typeof name === "string" ? name : String(name), DEFINITION_HINT_NAME_CHARS))
     .join(", ");
-  const more = note.definitions.length > 6 ? `, +${note.definitions.length - 6} more` : "";
+  const more = names.length > 6 ? `, +${names.length - 6} more` : "";
   return ` (defined: ${shown}${more})`;
 }
 
