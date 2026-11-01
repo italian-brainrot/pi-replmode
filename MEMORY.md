@@ -266,6 +266,10 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   Pass 5's fixes also added assertions to one holding test (the aborted joiner must not claim it freed a slot:
   `not.toMatch(/free again|its daemon/)`), which is an addition, not a change. Pass 6 (tester) changed no
   assertion anywhere and added three tests of its own.
+- **Housekeeping the suite never does:** `/tmp/replmode-agent-*` dirs from failed/aborted test runs and
+  probe scripts accumulate (pass 6 cleared 119 of them plus a 1.1 GB stray venv `/tmp/scratch-env`); they
+  are disposable — `find /tmp -maxdepth 1 -name 'replmode-agent-*' -mmin +30 -delete`. The real Python env
+  is in `~/.cache/pi-replmode/`, never in `/tmp`. And vitest 5 has no `--reporter=basic` (startup error).
 - Tests drive real processes only; where a daemon must misbehave (never ready, dies after answering,
   closes its protocol fd, dies on SIGINT, writes its complaint to the capture stream, emits a `fatal`
   frame) `test/lifecycle.test.ts` swaps in a **stub interpreter** via `PI_REPLMODE_ENV_DIR` — a dir with

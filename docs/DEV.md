@@ -83,6 +83,16 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   named `<envDir>.lock` — that is the single-flight build's own `mkdir` lock, polled every 500 ms — then
   write `.complete` and remove the lock to let the build finish. That is how the "daemon spawned after the
   quit began walking" branch is reached deterministically.
+- **The scratch space these tests use is disposable, and it accumulates.** Every `loadExtension` makes a
+  `/tmp/replmode-agent-XXXX/` and most of them are removed by `dispose()`; failed runs, aborted runs and
+  hand-written probe scripts leave the rest behind. Nothing pins those paths, so this is safe and worth
+  running when `/tmp` looks fat: `find /tmp -maxdepth 1 -name 'replmode-agent-*' -mmin +30 -delete`. Pass 6
+  found 119 of them plus a 1.1 GB `/tmp/scratch-env` venv and 30 MB of probe agent dirs from earlier
+  sessions (~1 GB freed). The environment that actually matters is not in `/tmp`: it is
+  `${XDG_CACHE_HOME:-~/.cache}/pi-replmode/py-env-<hash>`.
+- **vitest 5 has no `basic` reporter.** `npx vitest --run test/lifecycle.test.ts --reporter=basic` fails at
+  startup with "Failed to load custom Reporter"; the default reporter already prints per-test lines, and
+  `grep -E "×|✓|Tests |Test Files"` is what pass 6 filtered it with.
 - **Measuring a timing-sensitive test needs CPU load, and a load harness leaks if you are careless.**
   `SPINNERS=($!)` captures **one** pid, not the job pids: `for i in $(seq 24); do (while :; do :; done) &
   done` followed by `kill "${SPINNERS[@]}"` kills one spinner and orphans 23 to PID 1, each pinned at a
