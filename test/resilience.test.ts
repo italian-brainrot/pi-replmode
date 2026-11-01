@@ -10,7 +10,7 @@
  * expected to fail until it is fixed.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, utimesSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { isPidAlive, type LoadedExtension, loadExtension, text, waitFor } from "./helpers/extension.ts";
 
@@ -225,6 +225,35 @@ describe("killing a channel", () => {
     expect(shown, `the answer does not say what happened to the task: ${shown}`).toMatch(/channel|closed|kill|gone/);
   });
 
+  it("R5-04: and the log that answer sends the model to is one the retention sweep has left alone", async () => {
+    // Every other place in this code that names a log checks it first: the settled `bg_stop` branch only
+    // prints "Log:" when `existsSync` says the file is there, and the task listing prints
+    // "(no log: <path>)" rather than pretending. The R4-09 answer is the one that quotes a path and
+    // asserts the output is in it, unconditionally. It does not have to be: `pruneRetention` runs at
+    // every session boundary — including the `/new`, `/resume` and `/reload` of a process that has been
+    // running long enough for `droppedTasks` to still hold the id, since the manager is a `globalThis`
+    // singleton that survives exactly those boundaries — and it unlinks logs older than three days, or
+    // anything past the newest 200. Age one log and cross a boundary, and the sentence is now a lie the
+    // model pays for with a FileNotFoundError.
+    const task = await run("import time\nprint('the output somebody will ask for')\ntime.sleep(30)", { channel: "r-dropline", timeout: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await bgStop(task.details.id, { kill: true });
+    const logPath = task.details.logPath!;
+    expect(existsSync(logPath), "the killed task left no log behind: the case cannot be exercised here").toBe(true);
+
+    // The sweep's own criterion, applied honestly rather than a mock of it.
+    const old = new Date(Date.now() - 4 * 86_400_000);
+    utimesSync(logPath, old, old);
+    await ext.emit({ type: "session_start", reason: "new" }, { hasUI: true });
+    expect(existsSync(logPath), "the retention sweep did not delete the aged log: the case is not being exercised").toBe(false);
+
+    const shown = text(await bgStop(task.details.id));
+    // Either the answer points at a file that is there, or it says the log is gone. Naming the path and
+    // promising the output is in it is the one combination that must not appear.
+    const pointsAtTheMissingFile = shown.includes(logPath) && !/no longer|pruned|deleted|missing|gone|was in/i.test(shown);
+    expect(pointsAtTheMissingFile, `the answer sends the model to read ${logPath}, which the sweep deleted: ${shown}`).toBe(false);
+  });
+
   it("R1-10: takes the processes that its cell started down with it", async () => {
     // The escalation the model is offered when a task will not stop: `kill: true` says it ends
     // every cell in the channel. The daemon exits on the shutdown frame, so the group-kill
@@ -348,5 +377,43 @@ describe("killing a channel", () => {
     const escaped = isPidAlive(childPid);
     process.kill(childPid, "SIGKILL"); // do not leave it for the next test
     expect(escaped, "the group kill now reaches processes outside the channel's group: update the docs").toBe(true);
+  });
+});
+
+describe("a channel whose process cannot take a signal", () => {
+  it("R5-05: does not blame the cell for a process the process table says is stopped", async () => {
+    // A cell can stop the very daemon running it — `os.kill(os.getpid(), signal.SIGSTOP)`, a `kill -STOP`
+    // on its own process group from a `!` command, a job-control helper that pauses the world. The
+    // channel then answers nothing again: the cell detaches at its timeout, the channel reports itself
+    // busy, and `bg_stop`'s SIGINT sits queued forever. That answer explains itself with a fixed
+    // sentence — "Code that blocks signals, or a C extension holding the GIL, can do that" — and neither
+    // is what is happening: a stopped process has not blocked anything, it is not executing, and no
+    // signal reaches it until somebody continues it. The host already knows: `processGone` reads
+    // `/proc/<pid>/stat` for exactly this channel and throws the state away the moment it has it. What
+    // is pinned is only that the explanation must not name a cause the process table contradicts.
+    const stopped = await run("import os, signal\nos.kill(os.getpid(), signal.SIGSTOP)\nprint('never printed')", {
+      channel: "r-stopped",
+      timeout: 5,
+    });
+    expect(stopped.details.status, "the cell that stopped its own daemon was not detached").toBe("running");
+    const pid = stopped.details.pid!;
+    // Read the state the host reads, so the finding is about the diagnosis rather than about whether a
+    // stopped process is a real thing: `T` in /proc means stopped, and that is what the tool cannot say.
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    expect(state, "this cell did not leave its daemon in the stopped state: the case is not being exercised").toBe("T");
+
+    const attempt = await bgStop(stopped.details.id);
+    const shown = text(attempt);
+    expect(attempt.isError, "a stop that reached nothing was reported as a success").toBe(true);
+    expect(shown, "the stopped channel was not reported as still running").toContain("still running");
+    expect(shown, `the answer names a cause the process table contradicts (the daemon's state is T): ${shown}`).toMatch(
+      /SIGSTOP|stopped process|process is stopped|state T|cannot (?:be )?interrupted/i,
+    );
+
+    // The escalation has to still work, and nothing may outlive the test.
+    const killed = await bgStop(stopped.details.id, { kill: true });
+    expect(text(killed)).toContain("killed");
+    await waitFor(() => !isPidAlive(pid), 15_000, "the stopped daemon to be taken down by the group kill");
   });
 });

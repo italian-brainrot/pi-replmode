@@ -10,16 +10,36 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
 - Status: M1 (core) and M2 (channels, timeouts→background, bg_wait/bg_stop, reload re-adoption) are
   done and covered by real-process tests (pytest + vitest). M3 = display/images, `pi.read_image`,
   `pi.ask`, `pi.run_subagent` over a `call`/`call_reply` pump — not started.
-- Audit loop state: **passes 1–4 are complete — a tester and a fixer each. Pass 4's nine findings
-  (R4-01…R4-09) are fixed, and the suite is green: 192 vitest, 47 pytest, `tsc`, `biome`.** Next is
-  **pass 5 (tester): attack the pass-4 fixes.** Read [docs/AUDIT.md](docs/AUDIT.md) §"Pass 4 fixes —
-  2026-11-01 (fixer)": every write-up says where that fix is deliberately weak, and §"Handoff to pass 5
-  (tester)" lists eight targets in order, three of them places the fixer chose the cheap side on purpose.
-  Pass 4 also produced two fixer-found defects, each with its own tests: **F4-01** (a `quit()` could not
-  see a channel that was still starting) and **F4-02** (a call arriving in the window after a daemon died
-  was handed the dead channel — it was a suite flake before it was understood as a bug). One tester-written
-  test line was *changed*, never loosened, argued under §"One test changed (pass 4 fixes)". Never weaken a
-  test; *adding* an assertion is how an unpinned fix gets pinned.
+- Audit loop state: **pass 5 (tester) is complete — seven findings, all with holding tests that stay red.**
+  Next is **pass 5 (fixer)**. Read [docs/AUDIT.md](docs/AUDIT.md) §"Pass 5 audit — 2026-11-02 (tester)":
+  per-finding write-ups with the measured reproduction, and §"Handoff to the fixer (pass 5)" lists the seven
+  in order (**R5-03 → R5-02 → R5-01 → R5-04 → R5-07 → R5-05 → R5-06**), each with the mutation to add.
+  Gate this pass leaves: tsc/biome green, **200 vitest — 193 pass, 7 fail** (the seven R5 holding tests, two
+  identical runs), **47 pytest**. No product file was touched and no existing assertion changed; the only
+  deleted lines in the commit are four import lines replaced by wider versions of themselves. One **green**
+  test was added too (two aborted starts of one name, cap 1 — pinning pass 4's promise-identity choice).
+  `test/listing.test.ts` is a new file, and it exists because the task registry is process-wide: R5-07 needs
+  a session whose only tracked task is the one under test, and it passed vacuously inside `resilience.test.ts`.
+- What pass 5's findings establish, one line each: a **joiner** on somebody else's channel creation gets no
+  abort handling at all — thread the signal into the join with `untilAborted(pending, signal, name)` and never
+  cancel the creator's creation (R5-01, measured: an aborted joiner is answered 8 869 ms later, at the
+  *creator's* ready timeout; pi's own per-run signal hides this today, `executeTool`/`run_subagent` will not);
+  a value captured **after** an await is not the value the call started with — `createChannel` must read
+  `quitEpoch` **before** `makeRoom`, or a quit during a slow retirement adopts the new daemon and answers a
+  dead session with `status: "completed"` (R5-02, and `close` being one-shot makes it worse, not better);
+  a model-facing field of the **wrong shape** must be rejected where it is read, not only bounded — a JSON
+  string in a history record's `definitions` has a `length` and no `map`, so one hand-written file deletes a
+  session's whole prompt section and leaves the previous session's stale text in memory (R5-03); a pointer an
+  answer sends the model to needs `existsSync` at the answer, since the retention sweep runs on every
+  `session_start` of a long-lived process and at 200 logs (R5-04); when the process table contradicts the
+  diagnosis, say what the table says — a daemon stopped with SIGSTOP is blamed on "code that blocks signals"
+  today, and `processGone` already parses that state (R5-05); a **limit's stated reason must be one the code
+  backs up** — `channelFileStem` digests every name over 40 characters or with an unsafe character, so stems
+  are ≤ ~51 whatever the name and the 200-char rule is *not* a file-name rule (R5-06; this also corrects pass
+  4's write-up, which claimed a 190-char spaced name stays verbatim at 201); and a listing sentence built
+  from a different source than the summary above it can contradict it — after a `bg_stop {kill: true}` empties
+  the registry mid-`bg_wait`, one answer says `1 task(s) finished: repl-…` **and** "No background tasks have
+  run in this session." (R5-07).
 - What pass 4's fixes established, one line each (write-ups in AUDIT): a model-facing field is bounded
   **where it is read**, not only where it is written — a history file may predate any bound, and no field of
   a hand-written record may reshape the prompt section (`historyChannelLabel` refuses to print a name it
@@ -40,7 +60,9 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   `onSpawned` hook) and refuses to adopt a daemon that finished after the quit it raced — a **quit epoch**,
   deliberately not a boolean, because the manager outlives sessions. `getChannel` asks `processGone(pid)`
   (a zombie reads as gone) before handing out a channel, because `channel.closed` lags a death by an event
-  loop turn.
+  loop turn. Two aborted starts of one name under a cap of 1 each release their own slot and their own daemon
+  (the identity guard, green-pinned in pass 5), and a channel that is `ready` is never timed out — so a daemon
+  the manager loses track of stays alive forever, which is how R5-02 was measured.
 - Real-`pi` smoke: the DEV.md prompt, a dash-named channel, `os._exit(3)`, and a `bg_stop {kill: true}`
   (its answer ends with `Log: <path>`). To smoke an abort use `bash scripts/smoke-abort-start.sh` —
   throwaway `PI_CODING_AGENT_DIR`, `PI_REPLMODE_ENV_DIR` at a stub whose `bin/python` sleeps, `script -qec`
@@ -78,11 +100,29 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   branch that closes a daemon spawned after a quit began walking is unpinned; `processGone` trusts the pid
   the host spawned and is Linux-specific in its zombie check; the 200-character name rule is in the tool
   schema, not in the prompt section; and the capacity refusal's "all N are busy" wording is still mixed when
-  some names are starting. Pass 3's suggested cheap signal
+  some names are starting; and **a joiner's cancel does not free a wedged creation either** — only the call
+  that is starting it can (R5-01's fix will answer the joiner, not release the slot). Pass 5 also probed and
+  left alone: two daemons for one name can coexist for the length of a `close()` — measured at **4.5 s** for a
+  daemon that ignores `shutdown` and SIGTERM — sharing one daemon log, history file and IPython profile, which
+  two pi processes can already do to each other; the `onSpawned` after-quit branch is still unpinned, and AUDIT
+  records the deterministic way to reach it (hold `ensureEnv` with a stale `<envDir>.lock`, quit, then remove
+  the lock); `droppedTasks`' 200-id cap restores the old retention sentence for a session that churns more
+  channels than that; `STRUCTURED_OUTPUT_MAX_BYTES` is exported and never used (`cut.text` is sliced at
+  1 048 576 *characters* and can never approach it); and `lostChannelNotes()` scans the history directory twice
+  per `session_start`. Pass 3's suggested cheap signal
   for the unattributable case — read `/proc/<daemon>/task/*/children` at exec end and say "this cell left
   processes running" — is still argued, not implemented.
 - Pass 2 attacked pass 1's fixes; pass 3 attacked pass 2's; pass 4 attacked the pass-3 fixes, and eight of
-  its nine findings landed there. Held under attack and re-pinned: the interrupt design (both paths), the
+  its nine findings landed there; **pass 5 attacked the pass-4 fixes and landed seven (R5-01…R5-07), three of
+  them inside pass-4 fixes** — a signal never threaded into a *join*, a value captured after an await (the quit
+  epoch must be read before `makeRoom`), and a guard that trusted `length` on a field whose shape it did not
+  check. Held under attack and re-pinned: the one-shot `close`; the promise-identity guard on the `starting`
+  slot, now green-pinned for two aborted starts of one name under a cap of 1; `processGone`'s liveness read
+  against a stopped process, a recycled pid and a reload-adopted channel (nothing found — R5-05 is the
+  *diagnosis*, not the liveness read); `startFailureReported`; the `historyChannelLabel` refusal (the section
+  stays useful with the name refused); R4-02's digest rule and its `torn` wording; and the `+5_000` slack,
+  measured this time rather than spot-checked (worst legitimate answer 47 553 characters with a 481-character
+  agent dir, ≈52–54 KB with the maximum note pile-up, so it breaks only past ~800-character agent-dir paths). Held under attack and re-pinned: the interrupt design (both paths), the
   group kill and its process-group exception, the cap arithmetic (a cap of 1, and failed starts releasing a
   slot), the out-of-band note, the traceback budget, windowed truncation coordinates, the name encoder's
   shape (property test), the history-file upgrade path, R3-02's argv, R3-06's prose, R3-09's two units, and
@@ -147,8 +187,11 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   `.complete` plus an executable `bin/python`. Beware: the stub's script lives in a template literal, so
   any tool that re-indents the test file's lines breaks the stub with an `IndentationError`.
   `PI_REPLMODE_READY_TIMEOUT_MS` and `PI_REPLMODE_REQUIREMENTS` exist so those paths are reachable at all.
-  `npx pytest` does not work (no such package) — use `npm run py:test -- [pytest args]`, and `npm run fmt`
-  before expecting biome to pass. One manager and one agent dir per vitest **file**; inside a file,
-  `vi.resetModules()` + a second `loadExtension({agentDir})` is how you simulate a reload — without the
-  reset the module (whose paths are fixed at import) is reused and your temp dir is not where anything
+  A stub's self-reported pid file must be polled **for the parsed pid**, not for existence (`open()` creates it
+  before the number lands; an empty read reads as a dead daemon). A scratch `npx tsx` script that uses the
+  manager must end with `await getManager().quit()` or `process.exit(0)` — live children keep node alive and
+  the script looks hung. `npx pytest` does not work (no such package) — use `npm run py:test -- [pytest args]`,
+  and `npm run fmt` before expecting biome to pass. One manager and one agent dir per vitest **file**; inside
+  a file, `vi.resetModules()` + a second `loadExtension({agentDir})` is how you simulate a reload — without
+  the reset the module (whose paths are fixed at import) is reused and your temp dir is not where anything
   goes. Timing-sensitive suites: re-run any flake twice and report it.

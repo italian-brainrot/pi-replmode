@@ -10,9 +10,10 @@
  * run in the order they build up state.
  */
 
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { channelFileStem } from "../src/names.ts";
 import { type LoadedExtension, loadExtension, repoRoot, text as text2 } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
@@ -242,6 +243,95 @@ describe("the rule a channel name has to obey", () => {
     const shown = text2(refused);
     expect(shown, "the refusal does not say which limit it is enforcing").toMatch(/200/);
     expect(shown, `the refusal forbids a length the tool accepts: ${shown}`).not.toMatch(/under 200/);
+  });
+
+  it("R5-06: and the reason it gives for the limit is one the code can actually back up", () => {
+    // The rule is where pass 4 put it, and the wording of both copies blames the file names — the
+    // parameter says a name is 200 characters at most "because it names the log and history files of
+    // that channel", and the refusal adds "and an IPython profile". That is not what the code does.
+    // `channelFileStem` keeps a name verbatim only while it is already a usable file name *and* no
+    // longer than 40 characters; anything else gets a 10-character digest, so a name with a space in it
+    // — at any length — and a name of 200 characters all become stems of at most 51 characters. The
+    // daemon log, the history file and the IPython profile are the same length for a 4-character channel
+    // and a 200-character one, so no name this tool refuses would have overflowed a path. The limit is
+    // real, and its real reason is the one written above the refusal in `manager.ts`: the name is quoted
+    // in results, in the history file, and in the prompt section of every later session. A wrong reason
+    // on a model-facing surface is a model reasoning from a false premise.
+    const parameters = ext.tools.get("run")!.parameters as { properties: { channel?: { description?: string } } };
+    const description = parameters.properties?.channel?.description ?? "";
+
+    // The fact the sentence gets wrong, pinned on its own: if stems ever do grow with the name, the
+    // sentence becomes defensible and this assertion is the thing to change (with a note here).
+    const stems = ["main", `n${"y".repeat(199)}`, `${"a".repeat(190)} spaced name`].map(channelFileStem);
+    expect(
+      Math.max(...stems.map((stem) => stem.length)),
+      `a 200-character name produces a stem of ${Math.max(...stems.map((stem) => stem.length))} characters, so name length is not what file names are bounded by`,
+    ).toBeLessThanOrEqual(51);
+
+    // What is required of the sentence: name the reason that is true — the name comes back, in this
+    // session's answers and in later sessions' prompts. (The exact words are the fixer's.)
+    expect(description, `the description still credits file names for the limit: ${description}`).toMatch(
+      /quoted|prompt|every later session|comes back/i,
+    );
+  });
+});
+
+describe("a history record the section cannot read", () => {
+  it("R5-03: a field of the wrong shape does not decide whether the session gets a prompt section", async () => {
+    // The read path already distrusts the file: a record that is not an object is skipped, `status` and
+    // `code` go through `quoted`, every remembered definition is coerced with `String(…)` before it is
+    // clipped — that last one was a crash of exactly this shape, fixed in the pass-4 round for
+    // `definitions: [1, 2]`. What is still enough to throw is `definitions` being a *string*: it has a
+    // `length` and a `slice`, so it passes the truthiness test, and it has no `map`. One `TypeError` from
+    // `lostChannelsLines` escapes `session_start` before `section` is assigned, and pi's handler loop
+    // swallows it — so what a session gets is not a section with a bad line in it but no section at all
+    // (or, in a process that rendered one before, the *previous* session's section, which is a different
+    // kind of lie: it names channels that are no longer lost and omits the ones that are).
+    const dir = historyDir();
+    const record = (channel: string, extra: Record<string, unknown> = {}) =>
+      `${JSON.stringify({
+        ts: "2026-01-03T00:00:00.000Z",
+        id: `repl-${channel}`,
+        channel,
+        status: "completed",
+        elapsed: 2.5,
+        code: `${channel}_marker = 1`,
+        ...extra,
+      })}\n`;
+    const files = [join(dir, "r5-good.jsonl"), join(dir, "r5-baddefs.jsonl")];
+    try {
+      writeFileSync(files[0]!, record("r5-good", { definitions: ["fine"] }), "utf8");
+      writeFileSync(files[1]!, record("r5-baddefs", { definitions: "df" }), "utf8");
+
+      // A second load of the extension in the same agent dir, i.e. what `/reload` does to the module while
+      // the manager and its channels stay: this instance has never rendered a section, so it shows what a
+      // session that starts against this history file gets.
+      vi.resetModules();
+      const fresh = await loadExtension({ agentDir: ext.agentDir });
+      try {
+        let thrown: string | undefined;
+        try {
+          await fresh.emit({ type: "session_start", reason: "startup" }, { hasUI: true });
+        } catch (error) {
+          // pi wraps every handler call in a try/catch and reports the error; the session goes on without
+          // ever learning that the extension's section is missing.
+          thrown = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+        }
+        expect(thrown, "a remembered `definitions` field that is a string still throws out of session_start").toBeUndefined();
+
+        const sections: Record<string, string> = {};
+        await fresh.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
+        const shown = sections.replmode ?? "";
+        expect(shown, "the session got no replmode section at all").toContain("stateful IPython REPL");
+        expect(shown, "the channel with a well-formed record is not reported").toContain("r5-good_marker");
+        expect(shown, "the channel whose record has a string in `definitions` is not reported").toContain("r5-baddefs_marker");
+      } finally {
+        await fresh.emit({ type: "session_shutdown", reason: "quit" });
+        fresh.dispose();
+      }
+    } finally {
+      for (const file of files) rmSync(file, { force: true });
+    }
   });
 });
 

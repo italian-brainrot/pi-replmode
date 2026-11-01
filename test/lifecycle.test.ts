@@ -11,7 +11,7 @@
  * pass-3 audit of the pass-2 fixes uses the same stub-interpreter trick; its ids are R3-nn.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MAX_OUTPUT_CHARS } from "../src/format.ts";
@@ -541,6 +541,105 @@ time.sleep(600)
     });
     expect(Date.now() - started, "an aborted start waited for the ready timeout instead of for the abort").toBeLessThan(10_000);
   });
+
+  it("R4-06: and two aborted starts of one name leave no daemon and no held slot", async () => {
+    // Pass 4 released the `starting` slot by promise identity, so an aborted creation can only ever
+    // delete its own entry — which is what makes a *second* call on the same name safe to start while the
+    // first one's daemon is still going down. This pins the pair: two cancels in a row on one name, under
+    // a cap of 1, with a daemon that would sit at the ready timeout for half a minute if nothing closed
+    // it. Both daemons have to be gone afterwards, and the name has to be usable again — which it only is
+    // if neither abort left a slot behind.
+    const pidDir = join(ext.agentDir, "twice-aborted");
+    mkdirSync(pidDir, { recursive: true });
+    const script = `import os, sys, time
+channel = [a for a in sys.argv if a.startswith("--channel=")][0].split("=", 1)[1]
+open(${JSON.stringify(`${pidDir}/`)} + channel + "." + str(os.getpid()), "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    const savedCap = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "1";
+    const first = new AbortController();
+    const second = new AbortController();
+    let _firstAnswer: any;
+    let _secondAnswer: any;
+    try {
+      await withStub("twice-aborted", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
+        const a = ext.callTool("run", { code: "print('first')", channel: "l-twice" }, { signal: first.signal });
+        await waitFor(() => readdirSync(pidDir).length > 0, 15_000, "the first stub daemon to exist");
+        first.abort();
+        _firstAnswer = await a;
+
+        const b = ext.callTool("run", { code: "print('second')", channel: "l-twice" }, { signal: second.signal });
+        await waitFor(() => readdirSync(pidDir).length > 1, 15_000, "the second stub daemon to exist");
+        second.abort();
+        _secondAnswer = await b;
+      });
+    } finally {
+      if (savedCap === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = savedCap;
+    }
+
+    for (const entry of readdirSync(pidDir)) {
+      const pid = Number(entry.split(".").at(-1));
+      await waitFor(() => !isPidAlive(pid), 20_000, `the daemon of an aborted start (${pid}) to be taken down with it`);
+    }
+    expect(readdirSync(pidDir).length, "neither aborted start got as far as a daemon: the case did not run").toBe(2);
+
+    const third = await ext.callTool("run", { code: "print('room after two aborted starts')", channel: "l-twice" });
+    expect(third.isError, `a name two calls were cancelled on cannot be used again: ${text(third)}`).toBeUndefined();
+    expect(text(third)).toContain("room after two aborted starts");
+  });
+
+  it("R5-01: a call that joined somebody else's in-flight start can still be cancelled", async () => {
+    // R4-06 made the *creator* of a channel cancellable by threading its own AbortSignal into the start.
+    // A second call on the same name never sees its own signal: `getChannel` hands it the creator's
+    // promise and returns, so the `try/finally` that races the abort — and the `run`-level branch that
+    // turns a cancelled start into an "aborted" answer — are both on the creator's side only. Pressing
+    // Esc on that call therefore does nothing at all: it is answered when the *creator's* start finishes,
+    // which with the default ready timeout means two minutes for a daemon that is never coming up. That
+    // is the exact symptom R4-06 was filed for, one await away from where its fix lives.
+    const pidFile = join(ext.agentDir, "joiner-abort.pid");
+    const script = `import os, time
+open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
+time.sleep(600)
+`;
+    const creatorSignal = new AbortController().signal;
+    let joinerResult: any;
+    let creatorResult: any;
+    let waitedMs = 0;
+    let stuck = false;
+    await withStub("joiner-abort", script, { PI_REPLMODE_READY_TIMEOUT_MS: "9000" }, async () => {
+      // The creator is never cancelled: it is the daemon that wedges, and it holds the creation open.
+      const creator = ext.callTool("run", { code: "print('the creator')", channel: "l-joinabort" }, { signal: creatorSignal });
+      await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
+
+      const controller = new AbortController();
+      const joiner = ext.callTool("run", { code: "print('the joiner')", channel: "l-joinabort" }, { signal: controller.signal });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      controller.abort();
+
+      const started = Date.now();
+      const settled: { result: any } | undefined = await Promise.race([
+        joiner.then((result: any) => ({ result })),
+        new Promise<{ result: any } | undefined>((resolve) => setTimeout(() => resolve(undefined), 4_000)),
+      ]);
+      waitedMs = Date.now() - started;
+      stuck = settled === undefined;
+      joinerResult = settled?.result;
+      creatorResult = await creator;
+    });
+
+    const stubPid = Number(readFileSync(pidFile, "utf8"));
+    await waitFor(() => !isPidAlive(stubPid), 20_000, "the wedged daemon to be taken down");
+
+    expect(stuck, `a call aborted while it waited on another call's channel creation was still unanswered after ${waitedMs}ms`).toBe(false);
+    expect(waitedMs, "an aborted joiner waited for somebody else's start instead of for its own abort").toBeLessThan(4_000);
+    expect(joinerResult.isError, "the aborted joiner somehow succeeded").toBe(true);
+    expect(text(joinerResult), `the aborted joiner did not say it was aborted: ${text(joinerResult)}`).toContain("aborted");
+    // The joiner's cancel is its own: the call that owns the creation is still answered on its own terms
+    // (cancelled, or a start failure — what matters is that its cell never ran).
+    expect(creatorResult.isError, "the call that owned the creation was reported as a success").toBe(true);
+  });
 });
 
 describe("a daemon that dies before its first output boundary", () => {
@@ -766,6 +865,91 @@ time.sleep(600)
     expect(quitMs, "the quit waited for the ready timeout instead of closing the daemon").toBeLessThan(5_000);
     expect(result.isError, "the call the quit interrupted answered as if it had run").toBe(true);
     expect(text(result), `the answer blames something other than the ending session: ${text(result)}`).toMatch(/session ended/);
+  });
+
+  it("R5-02: a session that ends while the call is retiring a channel still owns that call", async () => {
+    // F4-01's guard is a *captured* epoch, and it is captured after `await this.makeRoom()`. A call that
+    // is in that await — the cap is reached, so the idlest channel is being taken down, which takes as
+    // long as that daemon takes to die — therefore belongs, as far as the guard can see, to the session
+    // that starts after the quit rather than the one that asked for it. The quit's own list of daemons
+    // cannot contain a process that has not been spawned yet, and the check that would have caught the
+    // finished daemon is the one that was skipped, so the cell goes on the wire to a session that has
+    // ended and its daemon is filed into the map the quit just cleared. Reached at all because the
+    // retirement is not instantaneous: a daemon that does not answer `shutdown` and ignores SIGTERM keeps
+    // `makeRoom` waiting for four and a half seconds, which is a comfortable window for a `/quit`.
+    const pidDir = join(ext.agentDir, "r5-02");
+    mkdirSync(pidDir, { recursive: true });
+    const sideEffect = join(ext.agentDir, "r5-02-ran.txt");
+    const script = `import json, os, signal, sys, time
+channel = [a for a in sys.argv if a.startswith("--channel=")][0].split("=", 1)[1]
+open(${JSON.stringify(`${pidDir}/`)} + channel + ".pid", "w").write(str(os.getpid()))
+signal.signal(signal.SIGTERM, lambda *a: None)
+print(${JSON.stringify(readyFrame("r5-02"))}, flush=True)
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    frame = json.loads(line)
+    if frame.get("t") == "execute":
+        # the stub's stand-in for "the cell ran, and a cell has side effects"
+        open(${JSON.stringify(sideEffect)}, "a").write(channel + " ")
+        print(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}), flush=True)
+    elif channel.endswith("-cold"):
+        os._exit(0)
+time.sleep(600)
+`;
+    const savedCap = process.env.PI_REPLMODE_MAX_CHANNELS;
+    process.env.PI_REPLMODE_MAX_CHANNELS = "1";
+    let coldPid = 0;
+    let result: any;
+    try {
+      // A clean slate: with a cap of 1 the retirement below has to be the channel this test started.
+      await ext.emit({ type: "session_shutdown", reason: "quit" });
+      await withStub("quit-during-make-room", script, {}, async () => {
+        await ext.callTool("run", { code: "print('the channel that will be retired')", channel: "r5-02-hot" });
+        await waitFor(() => existsSync(join(pidDir, "r5-02-hot.pid")), 15_000, "the first stub daemon to exist");
+
+        const retiring = ext.callTool("run", {
+          code: `open(${JSON.stringify(sideEffect)}, "w").write("ran")`,
+          channel: "r5-02-cold",
+          timeout: 20,
+        });
+        // makeRoom is inside `await channel.close()` now: `hot` ignores `shutdown` and SIGTERM, so that
+        // await is still running when the session ends underneath it.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await ext.emit({ type: "session_shutdown", reason: "quit" });
+
+        await waitFor(
+          () => {
+            try {
+              coldPid = Number(readFileSync(join(pidDir, "r5-02-cold.pid"), "utf8"));
+            } catch {
+              coldPid = 0;
+            }
+            return Number.isInteger(coldPid) && coldPid > 0;
+          },
+          15_000,
+          "the second stub daemon to record its pid",
+        );
+        // Nothing else in the product can take this daemon down: it is ready, it answers its cell, and
+        // an idle channel is never timed out. Only the quit — or the fix — can have stopped it, and the
+        // wait is short enough that a channel still sitting in the map is reported rather than rescued.
+        try {
+          await waitFor(() => !isPidAlive(coldPid), 5_000, "the quit to stop the daemon spawned after it began");
+        } catch {
+          // Reported by the assertion below.
+        }
+        result = await retiring;
+      });
+    } finally {
+      if (savedCap === undefined) delete process.env.PI_REPLMODE_MAX_CHANNELS;
+      else process.env.PI_REPLMODE_MAX_CHANNELS = savedCap;
+    }
+
+    expect(coldPid, "the second stub daemon never wrote its pid").toBeGreaterThan(0);
+    expect(isPidAlive(coldPid), "a daemon this call spawned after its session ended is still running").toBe(false);
+    expect(existsSync(sideEffect), "the cell of a call whose session ended ran anyway").toBe(false);
+    expect(text(result), `the call was answered as if its session were still there: ${text(result)}`).toMatch(/session ended/);
   });
 
   it("F4-01: and a daemon that becomes ready during the quit is not handed to the next session", async () => {

@@ -64,6 +64,9 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   script**: ESM imports are hoisted, so `paths.ts` has already resolved `getAgentDir()` by the time the
   first line of your script runs, and a scratch script that means to use a temp dir will quietly write
   channels into the real `~/.pi/agent/replmode/` instead. `PI_CODING_AGENT_DIR=/tmp/x npx tsx scratch.ts`.
+  **And end the script with `await getManager().quit()`** (or `process.exit(0)`): the manager holds live
+  child processes, node keeps its event loop alive while they run, and a script that has printed everything
+  you asked for will sit there holding its daemons until you interrupt it.
 - Reproduce a protocol question in Python alone:
   `python -m replmode --channel debug --log /tmp/debug.log` inside the env from `npm run py:env`,
   then write frame JSON lines to its stdin.
@@ -230,7 +233,10 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   cell or as the loop, and both are correct). A full-suite run is loaded enough that node can trail a
   child's death by more than one poll interval: `bg_stop` on a task whose channel died an instant earlier
   was flaky for exactly that reason, which is why `bgStop` asks `processGone` rather than trusting
-  `channel.closed` alone.
+  `channel.closed` alone. The same trap in the other direction: a stub daemon announces itself by writing a
+  pid file, and `waitFor(() => existsSync(pidFile))` can sample it in the gap between `open()` creating it
+  and the pid being written into it — an empty read then looks like a dead daemon. Poll for the parsed
+  number instead, so a wait ends only on a pid that was actually reported.
 - **Temp litter**: a full vitest run leaves a few dozen `/tmp/replmode-agent-*` and `/tmp/replmode-cwd-*`
   directories behind (a few MB in total) — `loadExtension` removes the agent dir it created itself, but
   `names.test.ts` shares one across its tests via `makeTempDir` and no file removes that one, and the cwd

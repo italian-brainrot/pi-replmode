@@ -2310,3 +2310,389 @@ a manager shutdown, is one close), the identity guard on the `starting` slot and
 removed when the wait ends, `startFailureReported` being set before the never-ready kill, the raw name as
 the liveness key, the `+5_000` slack, the 60/120/200/500 clip numbers, the accepted list, the `torn`
 sentence, and that a quit is an epoch rather than a flag (the manager outlives sessions).
+
+---
+
+## Pass 5 audit — 2026-11-02 (tester)
+
+Pass 5 attacks the pass-4 fixes. The inherited gate was re-measured before anything was touched: tsc and
+biome green, **192 vitest with 0 failures**, **47 pytest**, and the mutation script as pass 4 left it
+(53 of 55 die; the two survivors are the accepted ones).
+
+What this pass leaves: tsc and biome green, **200 vitest — 193 pass, 7 fail**, all seven failures being
+this pass's holding tests (R5-01…R5-07), and two full runs were identical; **47 pytest** unchanged, since
+nothing under `python/` was touched. No product file was modified. Nothing existing was deleted or
+weakened: `git diff | grep '^-'` at commit time shows four import lines replaced by wider versions of
+themselves and nothing else. Seven red tests were added, plus one **green** one —
+`R4-06: and two aborted starts of one name leave no daemon and no held slot` (`lifecycle.test.ts`) —
+because pass 4 chose promise identity for the `starting` slot and left that choice unpinned: under a cap of
+1, two calls on one name are cancelled one after the other, both stub daemons have to be gone, and the name
+has to work again. It does.
+
+Seven findings, in the order the fixer should take them.
+
+### R5-01 — BUG — a call that joined somebody else's channel creation cannot be cancelled
+
+**What was attacked.** Pass 5's handoff item 1, third bullet: "abort the *joining* second call while the
+first one keeps waiting". Pass 4 threaded the abort into channel creation for the call that *starts* a
+channel and said out loud that it did nothing for a joiner. It is worse than "nothing": a joiner's signal is
+not wired to anything at all.
+
+**Mechanism.** `getChannel` hands the creator's pending promise to every caller that arrives while a start
+is in flight — the same promise, with the creator's `try/finally` around it and no watch on the joiner's
+signal. `run`'s catch can only turn a cancellation into an answer once the awaited promise settles, so a
+cancelled joiner sits silent until the *creator's* wait ends.
+
+**Reproduction** (`lifecycle.test.ts`, "R5-01"). A stub interpreter that spawns and then never reports
+`ready`, `PI_REPLMODE_READY_TIMEOUT_MS=9000` so nothing can settle on its own inside the test. Call A
+(no signal) starts `l-joinabort`; once the daemon exists, call B goes to the same name with its own
+`AbortController`; B is aborted; four seconds later B is still unanswered and A is still running.
+
+**Measured.** B's answer arrives **8 869 ms** after its abort — i.e. at A's ready timeout, not at B's abort —
+and only then does it read correctly (`call aborted while channel "l-joinabort" was still starting: …`,
+`status: "dead"`, nothing sent). With the shipped default, `DEFAULT_READY_TIMEOUT_MS = 120_000`, that is two
+minutes of nothing for a caller that cancelled.
+
+**Where this bites, honestly.** Within one pi *run* every tool call shares one signal: `Agent.abort()`
+aborts one controller, and the tool loop passes that signal to each call. So a real Esc cancels A and B
+together and both are answered promptly — the live pi session is not affected today. The case needs two
+calls on one channel with *different* signals, which is exactly what `ExtensionAPI.executeTool` gives an
+extension (its own `signal`, documented as "cooperate with the agent's abort lifecycle") and what this
+project's own M3 plan will make routine: `run_subagent` runs in the same process against the process-wide
+manager, so a subagent cancelled while its parent's channel is still starting is the same shape. The
+tool's contract is that its `signal` means something; a caller that honours the contract gets silence.
+
+**The fix, and what it must not break.** Wrap the join in the same helper the creator uses —
+`untilAborted(pending, signal, name)` — so the joiner gets its own answer at its own cancel. It must **not**
+cancel or dispose the creation it is watching (another call owns that), must not release the `starting` slot
+(the creator's teardown still does, by identity), and must not send the cell — the existing guard inside
+`runLocked` already covers the last part and is pinned by pass 4's `run.test.ts` mutation.
+
+**Probed in the same probe and left alone:** when it is the *creator* that cancels, the joiner is answered
+promptly with `channel "l-joinabort" could not start: the call that was starting channel "l-joinabort" was
+cancelled, so its daemon was closed and nothing was sent to it`, and a third call on that name works
+immediately (`isError` absent, output as asked). A joiner losing its channel to a stranger's cancel is
+defensible; in pi a whole-run Esc aborts both calls anyway. Note that this is also the answer the *fix* will
+have to keep producing for a joiner that is still waiting when the creator gives up.
+
+### R5-02 — BUG — F4-01's quit epoch is captured after `makeRoom`, so a quit during a retirement adopts the daemon and runs the cell
+
+**What was attacked.** Handoff item 2. The epoch is right in shape and wrong in position:
+
+```ts
+private async createChannel(channel: string, signal?: AbortSignal): Promise<Channel> {
+  await this.makeRoom();          // ← may spend seconds closing another channel
+  const epoch = this.quitEpoch;   // ← captured *after* that
+```
+
+A start that was already inside `makeRoom` when the session ended captures the *post*-quit epoch. So
+`onSpawned` files the new daemon into `halfStarted` (epoch match), `quit()`'s `while` loop never sees it, the
+post-start `this.quitEpoch === epoch` check passes, the daemon is adopted into the map that the quit just
+cleared, and the cell is sent.
+
+**Reproduction** (`lifecycle.test.ts`, "R5-02"). Cap of 1; a stub that answers `ready`, answers cells, and
+**ignores `shutdown` and SIGTERM**, so retiring it costs 3 s of waiting for a reply that cannot come plus
+1.5 s before `SIGKILL` — the same shape as a real daemon whose event loop is stuck (a cell that finished but
+left C code holding the GIL, a magic in a tight loop, anything writing to a full pipe; the fixer's own note
+that "close is slow, not skipped" is what makes the window reachable rather than theoretical). Channel
+`r5-02-hot` is live; a call on `r5-02-cold` starts and immediately retires hot; 300 ms later the process
+emits `session_shutdown { reason: "quit" }`; the quit resolves — it is awaiting that same one-shot close —
+and the cold daemon is spawned *after* it.
+
+**Measured at HEAD** (reported by the test's own machinery, not a separate script). Five seconds after the
+quit resolved, the cold daemon was still alive (nothing else can stop it: it is `ready`, and idle channels are
+not timed out); its cell had run — the stub appends its channel name to a file that stands in for a real
+side effect, and that file reads `r5-02-hot r5-02-cold `; and the call that belongs to a session that has
+ended returned an ordinary completion, `isError` absent and `details.status: "completed"`:
+
+```
+[new channel "r5-02-cold": python 3.14.0, ipython 9.0.0, cwd /, pid 0, started in 1ms]
+
+(no output)
+```
+
+(The banner's fields are the stub's own invented `ready` frame; what matters is that a session which no
+longer exists was told its cell completed.) `Channel.close` being one-shot makes this strictly worse for the
+daemon and no better: the retirement closed it once, so the quit's `closeMany(halfStarted)` skips it.
+
+**Fix.** One line: take `const epoch = this.quitEpoch` on entry to `createChannel`, before `makeRoom`. The
+call belongs to the session that made it, which is the same rule pass 4 wrote for the abort.
+
+**Must not break:** that a start which *begins* after a quit is still adopted — the epoch, not a boolean
+(pass 4 broke nine lifecycle tests learning this); that `makeRoom` still frees the slot for the new start;
+the F4-01 pair (`Channel.close` one-shot, `halfStarted` in `quit()`); and the wording of the start-failure
+answers.
+
+### R5-03 — BUG — one history record decides whether a session gets a prompt section
+
+**What was attacked.** Handoff item 5's parenthetical: "`session_start` is unprotected against a throw from
+anywhere in `lostChannelsLines`". It is not hypothetical, and the field that does it is one pass 4 already
+touched.
+
+**Mechanism.** `definitionHint` distrusts the *elements* of `note.definitions` (R3-01) and the *presence*
+(R4-01: `note.definitions?.length`), then calls `note.definitions.slice(0, 6).map(…)`. A JSON **string** has
+a `length` and a `slice` and no `map`; so does an object with a `length` key. The `TypeError` escapes
+`session_start` before `section` is assigned.
+
+**Reproduction at the layer that matters** (run by hand, not as a test): a throwaway `PI_CODING_AGENT_DIR`,
+`~/.pi/agent/replmode/history/smokebad.jsonl` containing one record with `"definitions": "df"`, then
+`pi --no-session --no-context-files --no-builtin-tools -p "…"`. The session printed, twice:
+
+```
+Extension error (/home/qq/.../pi-replmode/src/index.ts): note.definitions.slice(...).map is not a function
+```
+
+and the model, asked to quote the first line of its `<replmode>` section, could not: there is no section —
+`session_start` threw before `section` was assigned, and `before_agent_start` throws again on every turn.
+The control run (same prompt, same temp HOME, a clean history directory) answered
+`Everything runs in a stateful IPython REPL (`run`), not one command per call.`.
+
+Beyond one session's behaviour: in a process that had already rendered a section, `section` keeps the
+*previous* session's text, so the failure mode is not only a missing section but a **stale** one — naming
+channels that are live again and omitting the ones that went since.
+
+**Holding test** (`prompt.test.ts`, "R5-03"): hand-written records through the manager's own paths — one
+with `definitions: "df"` (a JSON string) and one with `definitions: { length: 3 }` — each emitted into a
+fresh session, and `session_start`'s error must be absent (`pi` records it in the message list; the test
+captures it the way the extension does). It also pins the section text: `last cell completed in 1.5s` must
+still be there even when the hint cannot be built. The crash today is asserted directly, as a captured
+`TypeError: note.definitions.slice(...).map is not a function`.
+
+**The only shapes that reach it.** The record comes from `JSON.parse`, so no field can have a hostile
+`toString`, and every other field I threw at it degrades rather than throws: `elapsed: null` prints `?`,
+`elapsed: "three days"` prints `three days`, `status: {}` prints `[object Object]`, `torn: "lots"` prints
+`+lots unreadable record`, and a long `code` is still clipped. Those are ugly, not dangerous — filed
+nowhere. The fix belongs on the **read** path (a file may predate any write-side bound, R4-01's own lesson).
+
+### R5-04 — PAPERCUT — R4-09's dropped-task answer points at a log the retention sweep deleted
+
+**What was attacked.** Handoff item 4's second half: the "retention-sweep-follows-the-pointer case".
+
+**Mechanism.** R4-09 made the killed task's log pointer conditional on `this.opts.logFile` only. Every other
+pointer in the codebase checks existence — `settledTaskResult` (`The cell's output was in ${…}` /
+`(the log file is no longer there)`), `taskInfos` (`(no log: …)`) — and this is the one that does not.
+
+**Reproduction** (`resilience.test.ts`, "R5-04"): a cell backgrounded on `r-dropline`, the channel killed
+with `bg_stop { kill: true }` (which is what puts the id in `droppedTasks`), the log then aged four days with
+`utimesSync`, a `session_start` (the real `pruneRetention`, not a hand-delete), then `bg_stop` with that id.
+Measured answer, verbatim:
+
+```
+unknown task: repl-fnhuf5y8. Its channel "r-dropline" was killed with bg_stop {kill: true}, which removed
+that channel's tasks from this session. The cell's output is in
+/tmp/replmode-agent-OA171s/replmode/exec/repl-fnhuf5y8.log, and the channel's variables went with it.
+```
+
+and that path no longer exists; the assertion fails as "the answer sends the model to read
+/tmp/…/repl-fnhuf5y8.log, which the sweep deleted".
+
+**Why it is reachable and not exotic.** The manager — and with it `droppedTasks` — is process-wide, so this
+is what a long-lived pi process does to itself: `/new`, `/resume` or `/fork` emits `session_start`, and
+anything older than `LOG_RETENTION_DAYS = 3` goes. The second trigger needs no restart at all:
+`MAX_RETAINED_LOGS = 200`, so a busy session's oldest logs go on any `session_start` regardless of age.
+
+**Fix.** The same `existsSync` branch the settled path already has, or wording that does not promise the
+file. Must not re-break R4-09's actual point: the answer must still refuse to blame the retention window
+("state went with it" is about the channel, and the fixer's rule still holds).
+
+### R5-05 — PAPERCUT — the diagnosis for a channel that will not stop names a cause the process table contradicts
+
+**What was attacked.** Handoff item 3's first clause: "try to make a live channel read as gone". It does
+not, and that half holds — but the *other* half of the same code says something false.
+
+**Reproduction** (`resilience.test.ts`, "R5-05"). A cell whose last line is `os.kill(os.getpid(),
+signal.SIGSTOP)`: the `run` call detaches at its timeout, the next call is refused with the busy answer
+(correct, and the test pins it), and `bg_stop` waits its 5 s and answers
+
+```
+task repl-8ythr1py is still running: it did not stop on SIGINT within 5s. Code that blocks signals, or a C
+extension holding the GIL, can do that. bg_stop with kill: true takes the whole channel down to stop it,
+which loses that channel's variables.
+```
+
+while the test asserts from `/proc/<pid>/stat` that the daemon's state is `T` — stopped by SIGSTOP, which is
+why nothing was logged after the signal, not "code that blocks signals". `processGone`, fifteen lines away
+in the same file, already parses that field and keeps only `Z`.
+
+**Measured around it, so the picture is complete and the answer is not exaggerated.** The escalation works:
+`bg_stop { kill: true }` returned in 4.5 s with "killed … its state went with it", the `Log:` path it names
+exists, the process was gone 2 s later, and the next call started a fresh channel. One lag worth recording:
+`isPidAlive(pid)` was still true immediately after the "killed" answer, because `closeOnce` ends with the
+`SIGKILL` rather than with the reap — harmless, since the channel is out of the map before the signal is
+sent, and nothing reads that map for liveness.
+
+**Fix.** `processGone`'s read already has the state; disclose it in the busy answer ("the process is
+stopped — SIGSTOP, no signal reaches it until it is continued"). It must **not** escalate into a kill on its
+own: a timeout never kills a cell, and `kill: true` stays the model's decision.
+
+### R5-06 — PAPERCUT — the reason the model is given for the 200-character name rule is false
+
+**What was attacked.** Handoff item 7's second half: "check the digest/length interaction". Pass 4's
+write-up is wrong, and the sentence it defends is wrong too.
+
+**Correction first.** Pass 4 wrote that a 190-character name with a space in it is accepted "and its *stem*
+is longer than what the refusal calls safe" — that the names are not digested. They are: `channelFileStem`
+keeps a name verbatim only if it is already a usable file name **and** at most 40 characters; anything else
+becomes `readable(≤40)-<10-char digest>`. Measured: `main` → 4 characters, `n` + 199 `y`s → **51**,
+190 `a`s plus a space → **51**. So no name this tool accepts produces a file name longer than the one a
+4-character channel produces.
+
+**The finding.** Both model-facing copies of the rule credit the filesystem. The parameter description
+(shipped in the tool schema): *"A name is at most 200 characters: it names the log and history files of that
+channel."* The refusal: *"…it names a channel, a log file and an IPython profile."* Neither is what the code
+does, and the true reason is sitting in the comment above the check in `manager.ts`: the name is quoted in
+results, in the history file, and in the prompt section of every later session. That is also the only reason
+a model can reason with — a model that believes the file-name story will conclude that a 199-character name
+is safe because 255 bytes is a common PATH_MAX component, and the code does not agree.
+
+Measured for item 7's first half (so this finding is about the sentence, not the place): the schema reaches
+models verbatim. A real session (`pi --no-builtin-tools -p`, throwaway agent dir) quoting its own tool
+description produced *"A name is at most 200 characters: it names the log and history files of that
+channel."* So the wrong sentence is believed.
+
+**Holding test** (`prompt.test.ts`, "R5-06"): the three stems above must all be ≤ 51 characters (that
+assertion is the fact the sentence gets wrong — if stems ever do grow with the name, it is the line to
+change, and the comment says so), and the description must mention a reason the code backs up
+(`/quoted|prompt|every later session|comes back/i`). The refusal's copy of the sentence is in the same
+family; the fixer should fix both.
+
+### R5-07 — PAPERCUT — one `bg_wait` answer reports a finished task and denies that any task ran
+
+**What was attacked.** Handoff item 4's first clause — R4-09's accepted half-measure, "the listing still
+forgets killed tasks". The accepted cost was an omission. In one reachable case it is a contradiction.
+
+**Mechanism.** `bg_wait` builds its **summary** from the execs it was watching, and its **listing** from
+`taskInfos()`, i.e. the registry. `shutdownChannel` removes the killed channel's tasks from the registry
+while the wait is in flight. If that task was the session's only tracked task, the listing falls to its
+"never any" branch.
+
+**Reproduction** (`test/listing.test.ts`, new file — the registry belongs to the process-wide manager, and
+vitest gives one manager per file, so the empty-registry state is only reachable in a file that has not
+already backgrounded its own cells; the test passed vacuously when it lived in `resilience.test.ts`, whose
+earlier tests fill the registry, and was moved rather than fudged). Measured at HEAD, one result:
+
+```
+1 task(s) finished: repl-9omew2fq.
+
+No background tasks have run in this session.
+```
+
+**Fix, cheaply.** Either soften that sentence when the summary names ids, or have the listing fall back to
+`droppedTasks` for the killed ones (which R4-09 already remembers). It must not undo R4-09's other half:
+the killed task must not be listed as `killed` with a log line the model cannot act on if that is still the
+accepted shape — this finding is only about the sentence that denies the task existed.
+
+### Re-checking pass 4's fixes — what held
+
+- **One-shot `close`**: held everywhere I could reach it (a never-ready start failure followed by a manager
+  shutdown stops one daemon, and no answer arrives after the quit).
+- **The identity guard on the `starting` slot**: held, and now pinned green (see the new test above). An
+  aborted start does not release the slot a *later* start of the same name is holding.
+- **`processGone` before handing out a channel** (F4-02): held. I tried to make a live channel read as gone
+  three ways. A **stopped** process is still alive to `kill(pid, 0)` and is not a `Z`, so it is handed out
+  (which is right; the diagnosis is R5-05). A **recycled pid** cannot be reached: the pid in the record is
+  one node itself spawned, and nothing in this project reuses a pid while its own child is unreaped. A
+  **reload** keeps the same manager and its map, so an adopted channel never takes the pid-file path at all.
+- **`startFailureReported` set before the never-ready kill**: held; no double answer, no `shutdown` frame
+  after EOF.
+- **`quitting` + `halfStarted` + the epoch**: the machinery is right and the bug found here (R5-02) is its
+  *position*, not its shape. The branch pass 4 left unpinned is still unpinned, and I did not write a test
+  for it (see below).
+- **`historyChannelLabel`'s refusal** (R4-01): held against the section's shape — see "Probed" for what the
+  section still says with the name refused.
+- **The read-path bounds** (R3-01/R4-01): held for every field except the one that throws (R5-03).
+
+### Probed and left alone
+
+- **Two daemons for one name at once** is reachable by design, and pass 4 chose to accept the overlap
+  window; I measured how long it can be: a `close()` for a daemon that ignores `shutdown` and SIGTERM runs
+  **4.5 s** (3 s + 1.5 s). During that window a second daemon for the same name can exist, sharing the
+  daemon log, the history file and the IPython profile directory. Not filed: two *pi processes* can already
+  do this to each other (nothing coordinates channel names across processes), so it is not a new hazard
+  class, and R2-04's docs already say IPython profile sharing is unsupported.
+- **The `onSpawned` branch that closes a daemon spawned after a quit began walking** — pass 4's declared
+  blind spot. I found a deterministic way to reach it and did not write the test, because the test would be
+  more fragile than the pin is worth: hold `ensureEnv` by leaving a stale lock file at `<envDir>.lock` (the
+  single-flight build waits on `acquireLock`), emit the quit while it waits, then remove the lock so the
+  build completes and the daemon spawns into a session that has ended. Recorded here so the fixer can pin it
+  with a mutation instead of an extra test if they want.
+- **R4-02's silence, measured** (scratch, not a test): a history file whose *newest* record parses but has
+  no `channel` reports the older record and counts the newer one —
+  `(+1 unreadable record after it)`. A file whose records are all name-less disappears from the note
+  entirely. Both are what the fix says it does; "unreadable" is a stretch for a record that was read
+  perfectly and simply has no name, and no name can be recovered from a digest (R3-03). Nothing to change
+  beyond that word, if the fixer likes.
+- **R4-01's placeholder is still useful**: with the name refused the section reads
+  `(a channel whose name this section cannot print): last cell completed in 1.5s — worked = 1`, which is the
+  actionable part — and the model cannot `run` that channel name anyway, which is the point of refusing it.
+  Two such channels are indistinguishable; accepted.
+- **The size question (item 8), measured rather than spot-checked.** Worst legitimate answers, with a
+  deliberately long `PI_CODING_AGENT_DIR` (481 characters, which appears twice in some answers): finished
+  cell **47 553** characters (`structuredContent.output` 37 244), fresh-channel banner **40 869**, dead
+  channel **41 011**. Truncation cases come back *under* the limit because `truncateMiddle` is handed
+  `MAX_OUTPUT_CHARS − tracebackBudget` and reserves another 100 inside that, and both cuts snap to line
+  boundaries. The real worst case is a capture that just fits (≈49 999, so no truncation) plus the note
+  pile-up on top: banner for a 200-character name, 25 × 60 defined-names note, the out-of-band sentence,
+  and a long output-file pointer — about **52–54 KB**, inside the suite's `+5_000`. The slack stops holding
+  only when the agent-dir path grows past roughly 800 characters, and the README's refusal to bound the
+  limit "over the whole message" is what pays for that. Not filed.
+- **`STRUCTURED_OUTPUT_MAX_BYTES` (1 MB) is exported and never used**: `finishedResult`/`deadResult` slice
+  `cut.text` at `1_048_576` *characters*, and `cut.text` can never approach it. pi's own bash tool caps
+  structured output at 1 MB of bytes. Dead constant; not filed (delete it or use it).
+- **`lostChannelNotes()` is called twice per `session_start`** (the section and the `<lost-pi-namespace>`
+  block), each doing its own directory scan. Cost, not correctness; not filed.
+- **`droppedTasks` capped at 200**: a session that churns more than 200 channels gets the old
+  "the retention window cannot explain this" sentence back for the oldest ids. Argued, not reproduced —
+  reaching it means creating ~200 channels, and the failure mode is the *pre-R4-09* wording, which pass 4
+  already argued is honest when the window really is the only explanation.
+
+### One test changed (pass 5)
+
+None. Every line the pass added is new; the only *movement* was the R5-07 case, which I wrote into
+`resilience.test.ts`, watched it pass vacuously there (the file's earlier tests fill the task registry, so
+the listing was non-empty and the false sentence never appeared), and moved it to its own file
+`test/listing.test.ts` rather than arrange the registry by hand. Nothing that was green before this pass is
+green for a weaker reason now.
+
+### Handoff to the fixer (pass 5)
+
+Take them in this order; the first three are the ones that change behaviour, the rest are answers.
+
+1. **R5-03** — a hand-written history record can delete a session's entire `<replmode>` section and leave a
+   stale one behind. Guard `definitions` where it is read, keep every bound that R3-01 and R4-01 put there,
+   and keep the F3-04-pinned wording for the rest of the line. Add a mutation that removes the new guard and
+   watch `prompt.test.ts`'s R5-03 die on it. While there, decide whether a throw from `session_start` should
+   be caught at all: one bad file should cost a section, not the section *and* the next N turns of prompts.
+2. **R5-02** — move `const epoch = this.quitEpoch` above `await this.makeRoom()` in `createChannel`. Keep the
+   epoch-per-call-not-flag property (a `/reload` reuses the manager), keep `makeRoom` freeing the slot, keep
+   the F4-01 pair green. Add the mutation (move the capture back after `makeRoom`) and make sure R5-02 dies on
+   it — and that it dies while the quit is still the only thing that could have stopped the daemon, which is
+   the trap pass 4 fell into with F4-01's test.
+3. **R5-01** — thread the joiner's own signal into its wait (`untilAborted(pending, signal, name)` at the
+   join site in `getChannel`). Do not cancel the creator's creation, do not release its slot, do not send the
+   cell. Mutation: hand the joiner the bare `pending` again; the new lifecycle test must die on it. Expect to
+   re-measure the answer wording — a cancelled joiner's text should not claim it stopped the daemon.
+4. **R5-04** — the dropped-task log pointer needs the same `existsSync` branch the settled path has, and a
+   mutation that removes it.
+5. **R5-07** — the listing sentence. Cheapest honest fix: only print "No background tasks have run in this
+   session." when nothing in the same answer names an id; better: list what `droppedTasks` remembers, with
+   the same wording `bg_stop` uses for it. Decide, and say in the write-up whether the accepted half-measure
+   ("the listing forgets killed tasks") still stands after your fix — R5-07's mutation should be the one that
+   reintroduces the contradiction.
+6. **R5-05** — say what the process table says. `processGone` already reads the state; surface `T` (and any
+   non-`R/S` state worth naming) in the busy answer. Do not kill without being told. Mutation: make the busy
+   path re-read the state and ignore it; R5-05 must die.
+7. **R5-06** — two sentences, one in the `run` schema's `channel` description and one in `startChannel`'s
+   refusal. Say the true reason (the name comes back at the model — in results, and in every later session's
+   prompt). The stems are bounded at ~51 characters by `channelFileStem` whatever the name; if you disagree
+   and want the filesystem reason to be true instead, then make the names actually shorter (tighten the
+   digest rule), because right now the sentence and the code disagree in the code's favour. Mutation: put the
+   old sentence back.
+
+Things this pass held, so they are not re-derived: the one-shot `close`; the promise-identity guard on the
+`starting` slot (now pinned green, including two aborted starts of one name under a cap of 1);
+`processGone`'s liveness read against stopped processes, recycled pids and reload-adopted channels;
+`startFailureReported`; the `+5_000` slack (measured worst legitimate answer: 47 553 characters with a
+481-character agent dir, ≈52–54 KB with the maximum note pile-up); the 60/120/200/500 clip numbers; the
+`historyChannelLabel` refusal's usefulness; R4-02's digest rule; and the accepted list, including
+`droppedTasks`'s 200 cap and the cross-process name collision.
