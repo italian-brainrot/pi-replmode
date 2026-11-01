@@ -747,18 +747,23 @@ open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))
 time.sleep(600)
 `;
     let call: Promise<any> | undefined;
+    let stubPid = 0;
+    let quitMs = 0;
     await withStub("quit-mid-start", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
       call = ext.callTool("run", { code: "print(1)", channel: "l-quitstart" }, { signal: new AbortController().signal });
       await waitFor(() => existsSync(pidFile), 15_000, "the starting daemon to record its pid");
       const shutting = Date.now();
       await ext.emit({ type: "session_shutdown", reason: "quit" });
-      expect(Date.now() - shutting, "the quit waited for the ready timeout instead of closing the daemon").toBeLessThan(5_000);
+      quitMs = Date.now() - shutting;
+      // Asked here, not after the call settles: a quit that ignored this daemon would still see it die
+      // ~30s later when the ready timeout stops it, and the test would pass while proving nothing.
+      stubPid = Number(readFileSync(pidFile, "utf8"));
+      await waitFor(() => !isPidAlive(stubPid), 5_000, "a quit to stop the daemon that was still starting");
     });
 
     const result = await call!;
-    const stubPid = Number(readFileSync(pidFile, "utf8"));
     expect(stubPid, "the stub daemon never wrote its pid").toBeGreaterThan(0);
-    await waitFor(() => !isPidAlive(stubPid), 20_000, "a quit to stop the daemon that was still starting");
+    expect(quitMs, "the quit waited for the ready timeout instead of closing the daemon").toBeLessThan(5_000);
     expect(result.isError, "the call the quit interrupted answered as if it had run").toBe(true);
     expect(text(result), `the answer blames something other than the ending session: ${text(result)}`).toMatch(/session ended/);
   });

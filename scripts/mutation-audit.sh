@@ -297,13 +297,13 @@ run_mutation "R4-06 an aborted start leaves its daemon running" src/channel.ts '
   } finally {
     timeout.cancel();' "test/lifecycle.test.ts"
 
-run_mutation "R4-09 the kill answer names no log, and the listing has already forgotten the cell" src/manager.ts '              `so its variables are gone.${alive ? "" : " (the channel was already gone)"}` +
+run_mutation "R4-09 the kill answer names no log, and the listing has already forgotten the cell" src/manager.ts ' +
               // The kill is the last thing the model will be told about this cell: closing the channel
               // takes the task out of the listing, so the answer has to carry the log the way a plain
               // stop does (R4-09).
-              `\nLog: ${exec.logPath}`,
+              `\nLog: ${exec.logPath}`
 ---MUTATE---
-              `so its variables are gone.${alive ? "" : " (the channel was already gone)"}`,', "test/resilience.test.ts"
+' "test/resilience.test.ts"
 
 run_mutation "R4-09 a task removed by its channel closing is blamed on the retention window" src/manager.ts '      this.droppedTasks.set(id, { channel: name, logPath: exec.logPath, why });
 ---MUTATE---

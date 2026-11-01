@@ -6,7 +6,7 @@
  * limit that hands the model a log path and a global instead of a truncation.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
@@ -205,6 +205,30 @@ describe("aborting a call", () => {
 
     const after = await run("print(kept)", { channel: "t-abort" });
     expect(text(after)).toContain("7");
+  });
+
+  it("R4-06: a call cancelled while it waits for a busy channel never puts its cell on the wire", async () => {
+    // Nothing about a start is involved here: the channel is live, and the call is queued behind another
+    // call on it. The guard that matters is the one taken *after* the lock — a call that reaches its turn
+    // and sends anyway has run a cell its user cancelled, and the start path cannot see that case at all.
+    const marker = join(ext.agentDir, "queued-abort.txt");
+    const holder = run("import time\nheld = 1\ntime.sleep(4)\nprint('holder done')", { channel: "t-queued", timeout: 30 });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const controller = new AbortController();
+    const queued = run(
+      `open(${JSON.stringify(marker)}, "w").write("ran")`,
+      { channel: "t-queued", timeout: 30 },
+      { signal: controller.signal },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    controller.abort();
+
+    const [first, second] = await Promise.all([holder, queued]);
+    expect(text(first), "the cell that was holding the channel did not finish").toContain("holder done");
+    const shown = text(second);
+    expect(second.isError, `the cancelled queued call answered as if it had run: ${shown}`).toBe(true);
+    expect(shown, `the cancelled queued call does not say it was cancelled: ${shown}`).toMatch(/aborted/);
+    expect(existsSync(marker), "the cancelled call wrote its file, so its cell ran").toBe(false);
   });
 });
 
