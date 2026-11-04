@@ -3527,9 +3527,14 @@ In the order I would try them:
    new one under the same name: the queued call holds the old `Channel` object, so it should get the
    "already gone" answer — check it never runs a cell on a daemon it was never handed, and check the
    ordering against `busyTask()` and `withLock`.
-5. **R6-03's shape.** Anything else that fills a field an answer is not about (`details.channel` is gone
-   from two places; check `pi`'s own renderers/UI do not assume it), and whether `status: "running"` on
-   the doomed refusal can send a model to `bg_wait`/`bg_stop` for a task that does not exist.
+5. **R6-03's shape.** Anything else that fills a field an answer is not about — the same question one level
+   up: which other fields does a refusal fill because the code path happens to have a value handy?
+   `details.channel` is gone from two places, and pi's own rendering was checked (a `--mode json` run shows
+   `details` with no `channel` key reaching pi's event stream without complaint — the recipe is in DEV.md,
+   and it is the way to check a field claim without paraphrasing it through a model). What is **not** checked
+   and might be a finding: whether `status: "running"` on the doomed refusal sends a model to `bg_wait` or
+   `bg_stop` for a task that does not exist, and what those two answers then say about a name that has no
+   task and no channel.
 6. **The mutation pass is done** — 77 anchors, 75 die, the 2 accepted survivors. If you file anything,
    add its mutation in the same commit as your holding test, and run `ANCHORS_ONLY=1` *before* the long
    sweep, never after. If you change product code that an old anchor sits in, expect that anchor to rot:
@@ -3538,5 +3543,8 @@ In the order I would try them:
    mutations); the identity guard on `starting` (now `{promise, doomed}` — the guard still compares promise
    identity); `quit()`'s `halfStarted` walk and the close-on-sight hook; the one-shot `close`; the
    epoch-before-`makeRoom` rule (R5-02's anchor moved nowhere); R4-09's two branches and R5-04's
-   `existsSync`; the whole prompt-section renderer totality argument (pass 6's re-check stands); and the
-   accepted list, including the cross-process name collision.
+   `existsSync`; the whole prompt-section renderer totality argument (pass 6's re-check stands); that a
+   doomed creation can never be adopted even if it runs to completion (the epoch check in `createChannel`
+   closes it, which is why "refuse the join" cannot race a creation that turns out fine); that pi renders a
+   `details` object with no `channel` key; and the accepted list, including the cross-process name
+   collision.

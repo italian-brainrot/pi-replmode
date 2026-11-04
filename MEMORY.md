@@ -41,7 +41,8 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   keeps `dead` (pinned); **an answer's `channel` field must name the channel its own sentence names** —
   `ChannelNamedError` carries it where there is one, `failure()` omits the field where there is none,
   `ReplDetails.channel` is optional, and `bg_wait`'s details no longer quote one channel for an answer whose
-  rows name one each; `run`'s answers always name theirs and `RUN_OUTPUT` still requires the field; **a queued
+  rows name one each (`pi --mode json` confirms a `details` with no `channel` key reaches pi's event stream
+  without complaint); `run`'s answers always name theirs and `RUN_OUTPUT` still requires the field; **a queued
   call whose channel went says nothing was sent** — `runLocked` checks `channel.closed` *before*
   `signal?.aborted`, because the cancel sentence claims the channel kept its state, and the guard is not
   `processGone` because a cell really was in the pipe before node is told.
