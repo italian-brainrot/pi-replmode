@@ -121,6 +121,10 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   throwaway `PI_CODING_AGENT_DIR`, `PI_REPLMODE_ENV_DIR` at a stub whose `bin/python` sleeps, `script -qec`
   for a pty, and the byte for Esc. **`pi -p` cannot smoke an abort**: SIGINT there is a hard kill (exit 130)
   that runs no `session_shutdown` and fires no abort — measured with an idle daemon that survived it.
+  When the claim under test is about a result's *fields*, use `pi --mode json -p '…'` and read the
+  `tool_execution_end` events (`details`, `structuredContent`) rather than asking the model what it got; pass
+  6 used that for R6-03, chaining `run`(background) → `bg_wait` → `bg_stop {kill}` → `bg_stop` again to walk
+  the stopped, dropped and unknown-task branches in one run.
 - What pass 4 held under attack, so it is not re-derived: R3-02's one-token argv (every hostile name shape
   end to end, NUL refused by node before argparse), R3-03's injectivity (now a property test: a stem the
   digest branch emits always looks digested, so a fixed point is unreachable; `x-00000000000` staying

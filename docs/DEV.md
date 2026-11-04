@@ -150,6 +150,17 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   `signal.signal(signal.SIGINT, lambda *a: os._exit(7))` and stop it: the answer must say the channel went
   with the cell, and since R4-09 that answer ends with `Log: <path>`.
 
+  **Ask for `--mode json` when the claim under test is about a result's fields**, because "tell me what the
+  tool returned" routes the truth through a model that paraphrases it. `pi --no-builtin-tools --mode json -p
+  '…'` prints one JSON event per line; the `tool_execution_end` events carry the real `content`, `details`
+  and `structuredContent`, so `grep`/`jq` for those is how you check that a field is present, absent, or
+  named honestly. Pass 6 used it for R6-03: `bg_stop` on an id this process never heard of must name no
+  channel at all, and a `bg_wait` listing must not claim one channel for an answer whose rows name one each
+  — both now return `details` with no `channel` key, and pi renders that without complaint. Chaining four
+  calls in one prompt (`run` in the background, `bg_wait` with a short timeout, `bg_stop {kill: true}`, then
+  `bg_stop` of the same id again) exercises the stopped, dropped and unknown-task branches in one run, and it
+  is the only way to see `details` at all for a branch the suite reaches with stubs.
+
   The aborted-start smoke does not work with `-p`: SIGINT in print mode is a hard kill — no
   `session_shutdown` runs and no abort fires (measured: an idle daemon survives SIGINT and is closed only
   by a clean exit). `scripts/smoke-abort-start.sh` does it in the real interactive TUI under a pty, typing

@@ -3476,6 +3476,20 @@ this, so the next pass does not lose an hour to it. A rejected mutation is not c
 75 above is the full pass of 75 that ran in one sweep plus these two verified separately afterwards — the
 tree was unchanged between them (only the script's two anchors moved).
 
+### Real-pi smoke (pass 6), and what it saw
+
+`pi --no-builtin-tools --mode json -p '…'` against a throwaway agent dir, reading the `tool_execution_end`
+events instead of asking a model to describe its own tool result. Two runs:
+
+- `bg_stop {task_id: "bg-nope-000"}` → `unknown task: bg-nope-000. …`, with `details: {"status": "dead"}` and
+  no `channel` key in either structured view. That is R6-03's third branch in the real harness; before the
+  fix the same call carried `channel: "main"`.
+- `run` in the background → `bg_wait {timeout: 5}` → `bg_stop {kill: true}` → `bg_stop` of the same id again:
+  the listing's `details` carries per-task rows, each naming its own channel, and no channel for the answer
+  itself; the killed answer names `main` and ends with its `Log:` path; the last call takes the dropped-task
+  branch and names `main` in both views because that is the channel its sentence names. No `Extension error`
+  anywhere, so nothing in pi's own rendering assumes the field.
+
 ### Two tools this pass added
 
 - `test/anchors.test.ts` parses `scripts/mutation-audit.sh` and fails the ordinary suite when an anchor no
