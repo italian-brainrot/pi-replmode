@@ -289,6 +289,26 @@ export class ChannelJoinAbortedError extends Error {
   }
 }
 
+/**
+ * The creation a joining call walked into belongs to a session that has ended (R6-01).
+ *
+ * `quit()` cannot cancel an in-flight start — it has a promise, not a handle — so the creation carries on
+ * and answers *its own* caller with "the session ended while this channel was starting". Handing that
+ * failure to a call in the session that came after the quit would tell a live session its own session
+ * ended, and would hold the channel name hostage to a creation that cannot succeed. So a doomed creation
+ * is refused to joiners, in its own words, while it runs out.
+ */
+export class ChannelStartDoomedError extends Error {
+  constructor(readonly channel: string) {
+    super(
+      `channel "${channel}" is being started by a call that belongs to a session that has ended, so that start cannot ` +
+        `finish: nothing was sent by this call, and the name stays held until that other call gives up. Ask again then, or use ` +
+        "another channel name.",
+    );
+    this.name = "ChannelStartDoomedError";
+  }
+}
+
 export class ChannelBusyError extends Error {
   constructor(
     readonly channel: string,

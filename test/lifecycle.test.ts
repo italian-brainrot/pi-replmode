@@ -1311,4 +1311,206 @@ while True:
       `the same answer's structured view reports the channel dead: ${JSON.stringify(joinerResult.structuredContent)}`,
     ).not.toBe("dead");
   });
+
+  it("R6-01: the joiner is refused in its own words, and the name is free once the doomed start is done", async () => {
+    // A refused join is a new answer, and it inherits the obligations of the defect it replaces: it must
+    // not claim this call's session ended, it must say the call sent nothing, and anything it tells the
+    // model to do has to be possible — so this pins the refusal's words *and* that the name is usable
+    // afterwards by the very session that was refused.
+    //
+    // The doomed creation is held with no daemon at all, by the environment-lock recipe. That is also the
+    // shape the window really has: `quit()` awaits the close of every daemon it can see, so a doomed
+    // creation whose daemon had already spawned is dead, and its slot released, by the time the next
+    // session gets to ask. Worth knowing before trying to write this test any other way.
+    const envDir = join(ext.agentDir, "stub-env", "join-refused");
+    rmSync(envDir, { recursive: true, force: true });
+    mkdirSync(join(envDir, "bin"), { recursive: true });
+    const script = `import json, sys
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-joinrefused")}\n`)})
+sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    frame = json.loads(line)
+    if frame.get("t") == "execute":
+        sys.stdout.write(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}) + "\\n")
+        sys.stdout.flush()
+`;
+    writeFileSync(join(envDir, "bin", "python"), `#!/usr/bin/env python3\n${script}`, { mode: 0o755 });
+    rmSync(join(envDir, ".complete"), { force: true });
+    mkdirSync(`${envDir}.lock`);
+
+    const saved = { ...process.env };
+    let creatorResult: any;
+    let joinerResult: any;
+    let later: any;
+    try {
+      process.env.PI_REPLMODE_ENV_DIR = envDir;
+      process.env.PI_REPLMODE_KEEP_RUNNING = "0";
+      process.env.PI_REPLMODE_READY_TIMEOUT_MS = "30000";
+
+      // A start in flight when the session ends: no daemon, no way to get one yet, and no call coming to
+      // cancel the one that owns it.
+      const creator = ext.callTool("run", { code: "print('session one')", channel: "l-joinrefused", timeout: 30 });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await ext.emit({ type: "session_shutdown", reason: "new" });
+      await ext.emit({ type: "session_start", reason: "new" }, { hasUI: true });
+
+      // The session that follows is live, and asks for the same name while the doomed creation is still
+      // in flight. It is answered at once, about its own call.
+      joinerResult = await ext.callTool("run", { code: "print('session two')", channel: "l-joinrefused", timeout: 30 });
+
+      // Let that creation finish being doomed: the build it was waiting on appears, it spawns a daemon its
+      // session has no use for, and that is the end of it.
+      writeFileSync(join(envDir, ".complete"), JSON.stringify({ hash: "000000000000", base: "python3", version: "3" }), "utf8");
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+      creatorResult = await creator;
+
+      // The case ran: the call that owns the creation is the one whose session ended.
+      expect(creatorResult.isError, "the call whose session ended reported a success").toBe(true);
+      expect(text(creatorResult), `the owner of the doomed creation was not told its session ended: ${text(creatorResult)}`).toMatch(
+        /session ended/,
+      );
+
+      const shown = text(joinerResult);
+      expect(joinerResult.isError, `a call refused a doomed start reported a success: ${shown}`).toBe(true);
+      expect(shown, `a live session was answered with another session's sentence about itself: ${shown}`).not.toMatch(
+        /session ended while this channel was starting/,
+      );
+      expect(shown, `the refusal does not say whose creation the name is held by: ${shown}`).toMatch(/session that has ended/);
+      expect(shown, `the refusal does not say this call sent nothing: ${shown}`).toMatch(/nothing was sent/);
+      expect(shown, `the refusal promises the model something about another call's future: ${shown}`).not.toMatch(/carries on|will /);
+      expect(
+        joinerResult.details?.status,
+        `a name held by work in flight is reported dead in details: ${JSON.stringify(joinerResult.details)}`,
+      ).not.toBe("dead");
+      expect(
+        joinerResult.structuredContent?.status,
+        `and in structuredContent: ${JSON.stringify(joinerResult.structuredContent)}`,
+      ).not.toBe("dead");
+
+      // What the answer tells the model to do, done: the same session, the same name, a channel of its own.
+      later = await ext.callTool("run", { code: "print('the name is free again')", channel: "l-joinrefused", timeout: 30 });
+    } finally {
+      for (const key of ["PI_REPLMODE_ENV_DIR", "PI_REPLMODE_KEEP_RUNNING", "PI_REPLMODE_READY_TIMEOUT_MS"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key]!;
+      }
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+    }
+
+    expect(later.isError, `the name stayed blocked after the doomed start answered its own caller: ${text(later)}`).toBeUndefined();
+    expect(text(later), "a later call did not get a channel of its own under that name").toContain("[new channel");
+    // The stub answers `exec_end` without writing anything, so the run's own status is the evidence that
+    // the cell went to a working daemon rather than to a name that was still blocked.
+    expect(later.details?.status, `the later call's cell never completed: ${text(later)}`).toBe("completed");
+  });
+
+  it("R6-01 (measured by pass 6): and a joiner that gives up is told who can free the channel, not what the other call will do", async () => {
+    // The other sentence pass 6 found false: R5-01 answered an aborted joiner with "…the call that is
+    // starting that channel was not cancelled, so it carries on", and in the doomed-start case that
+    // creation failed seconds later. A joiner's cancel can state its own facts — nothing was sent, this
+    // call held neither the daemon nor the slot, and only the call that owns them can give them up — and
+    // no more. The scenario here is the ordinary one (the creation goes on to succeed), so the pin is not
+    // "the forecast was wrong this time" but "the answer makes no forecast".
+    const script = `import json, sys, time
+time.sleep(1.5)
+sys.stdout.write(${JSON.stringify(`${readyFrame("l-joinwords")}\n`)})
+sys.stdout.flush()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    frame = json.loads(line)
+    if frame.get("t") == "execute":
+        sys.stdout.write(json.dumps({"t": "exec_end", "id": frame["id"], "ok": True, "status": "ok", "elapsed": 0.01}) + "\\n")
+        sys.stdout.flush()
+`;
+    const joiner = new AbortController();
+    let joinerResult: any;
+    let creatorResult: any;
+    await withStub("joiner-own-words", script, { PI_REPLMODE_READY_TIMEOUT_MS: "30000" }, async () => {
+      const creator = ext.callTool(
+        "run",
+        { code: "keepme = 41", channel: "l-joinwords", timeout: 30 },
+        { signal: new AbortController().signal },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const joining = ext.callTool("run", { code: "print('never sent')", channel: "l-joinwords", timeout: 30 }, { signal: joiner.signal });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      joiner.abort();
+      joinerResult = await joining;
+      creatorResult = await creator;
+    });
+
+    const shown = text(joinerResult);
+    expect(joinerResult.isError, "the aborted joiner reported a success").toBe(true);
+    expect(shown, `the second call did not join an in-flight start: ${shown}`).toContain("was still starting");
+    expect(shown, `the aborted joiner does not say its cell was never sent: ${shown}`).toContain("nothing was sent");
+    expect(shown, `the joiner's answer forecasts what the call that owns the creation goes on to do: ${shown}`).not.toMatch(
+      /carries on|was not cancelled|will /,
+    );
+    // The creation did go on fine — which is exactly the part the answer no longer claims for itself.
+    expect(creatorResult.isError, `the call that was starting the channel failed: ${text(creatorResult)}`).toBeUndefined();
+  });
+});
+
+describe("a doomed creation, and the rest of the session", () => {
+  it("R6-01: and the capacity refusal does not tell the model to cancel a start nobody can cancel", async () => {
+    // The other way a live session meets a doomed creation: it still occupies its slot (R2-03), so a call
+    // for a *different* name is refused — and that refusal used to end "wait for the call that is starting
+    // to finish, or cancel it". There is no call left anywhere that could cancel it. R3-04 filed this
+    // sentence for pointing at a tool call that cannot work; R6-01 put a second occupant in that needs it.
+    const envDir = join(ext.agentDir, "stub-env", "join-doomed-cap");
+    rmSync(envDir, { recursive: true, force: true });
+    mkdirSync(join(envDir, "bin"), { recursive: true });
+    writeFileSync(join(envDir, "bin", "python"), "#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n", { mode: 0o755 });
+    rmSync(join(envDir, ".complete"), { force: true });
+    mkdirSync(`${envDir}.lock`);
+
+    const saved = { ...process.env };
+    let refused: any;
+    let creatorResult: any;
+    try {
+      process.env.PI_REPLMODE_ENV_DIR = envDir;
+      process.env.PI_REPLMODE_KEEP_RUNNING = "0";
+      process.env.PI_REPLMODE_MAX_CHANNELS = "1";
+      process.env.PI_REPLMODE_READY_TIMEOUT_MS = "30000";
+
+      const creator = ext.callTool("run", { code: "print('session one')", channel: "l-doomedcap", timeout: 30 });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await ext.emit({ type: "session_shutdown", reason: "new" });
+      await ext.emit({ type: "session_start", reason: "new" }, { hasUI: true });
+
+      // A different name, so this call is not the one being refused a join: it is refused a *slot*.
+      refused = await ext.callTool("run", { code: "print('another name')", channel: "l-doomedcap-b", timeout: 30 });
+
+      // Let the doomed creation finish being doomed, so a red run cannot leave it in flight.
+      writeFileSync(join(envDir, ".complete"), JSON.stringify({ hash: "000000000000", base: "python3", version: "3" }), "utf8");
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+      creatorResult = await creator;
+    } finally {
+      for (const key of ["PI_REPLMODE_ENV_DIR", "PI_REPLMODE_KEEP_RUNNING", "PI_REPLMODE_MAX_CHANNELS", "PI_REPLMODE_READY_TIMEOUT_MS"]) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key]!;
+      }
+      rmSync(`${envDir}.lock`, { recursive: true, force: true });
+    }
+
+    // The case ran: the occupier is a creation whose session ended, not one the model can reach.
+    expect(text(creatorResult), `the creation holding the slot did not end with its session: ${text(creatorResult)}`).toMatch(
+      /session ended/,
+    );
+
+    const shown = text(refused);
+    expect(refused.isError, `a call refused a slot held by a doomed start was not refused: ${shown}`).toBe(true);
+    expect(shown, `the refusal still tells the model to cancel a start no session can cancel: ${shown}`).not.toMatch(/or cancel it/);
+    expect(shown, `the refusal does not say why nothing can cancel it: ${shown}`).toMatch(/session that has ended/);
+    expect(shown, `the refusal does not say what it will do about it: ${shown}`).toMatch(/another channel name|finish and try again/);
+    // What R3-04 pinned about this sentence still holds.
+    expect(shown, `the refusal blames busy channels again: ${shown}`).not.toMatch(/are busy/);
+    expect(shown, `the refusal does not name the channel holding the slot: ${shown}`).toContain("l-doomedcap");
+    expect(shown, `the refusal does not say where the cap came from: ${shown}`).toContain("PI_REPLMODE_MAX_CHANNELS");
+  });
 });

@@ -3288,3 +3288,241 @@ And for the next tester, from what I re-checked and did not file: R5-03's render
 load-bearing and provable (I enumerated the handler's calls); `signalDiagnosis`'s `Z` branch is
 unreachable; the `Channel.begin` log is opened eagerly, so R5-04's past tense is safe; and pass 5's
 late-spawn pin is solid under load.
+
+---
+
+## Pass 6 fixes — 2026-11-02 (fixer)
+
+Gate inherited: `tsc`/`biome` green, 207 vitest with the three holding tests red, 47 pytest, 66 anchors
+green. Gate left: `tsc`/`biome` green, **218 vitest — 18 files, 0 failing** (two full runs, 64 s each), **47
+pytest**, `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **77 anchors match**, and the full
+mutation pass: **77 mutations, 75 die, 2 survive — both the accepted ones** (`flushLoose`'s
+`lateWrite`→`write`, `failure()`'s status choice).
+
+Product files: `src/manager.ts`, `src/channel.ts`, `src/index.ts`. **No test written by pass 6 was
+edited** — not one assertion, not one line of setup; seven tests were added, and the three holding tests
+went green on the product change. `docs/DEV.md` gained the join/session rule and a bullet on status
+fields.
+
+### R6-01 — a creation that cannot succeed is refused, not inherited
+
+`starting` is now `Map<string, { promise, doomed }>`, and `quit()` sets `doomed` on every creation in
+flight on the same line it bumps the epoch. `getChannel` refuses to join one
+(`ChannelStartDoomedError`) instead of handing it over; `run` answers that error as its own refusal, in
+the error's own words, with `status: "running"`.
+
+Why the *refuse* route and not *start our own*:
+
+- the window route 1 opens is two daemons under one name inside one process — one daemon log, one history
+  file, one IPython profile, for as long as the doomed one takes to die (pass 5 measured **4.5 s** for a
+  daemon that ignores `shutdown` and SIGTERM). Pass 5 accepted that shape *across* pi processes, which
+  cannot coordinate; making one process do it to itself is a choice, not a necessity;
+- it would have made pass 6's own holding test racy. That test's stub writes its pid to
+  `<pidDir>/<channel>.pid`, keyed by the **channel name**, so route 1 puts two daemons behind one file and
+  `expect(isPidAlive(doomedPid)).toBe(false)` becomes a coin flip on which pid the poll sampled. A fix that
+  turns a green pin red is not a fix;
+- route 1 wants the creation's **epoch** at the join, which pulls R5-02's epoch read out of
+  `createChannel` and into `getChannel`. Marking at `quit()` keeps the invariant in the one place that
+  knows a session ended, leaves R5-02's mutation anchor where it is, and cannot drift: the flag is set by
+  the same statement that makes the epoch stale.
+
+What it costs, said out loud. The name stays blocked for the doomed creation's own length — a cold
+environment build in the worst case — and the answer now carries that instead of hiding it:
+
+> `channel "x" is being started by a call that belongs to a session that has ended, so that start cannot
+> finish: nothing was sent by this call, and the name stays held until that other call gives up. Ask again
+> then, or use another channel name.`
+
+The refusal takes no await — the throw is in `getChannel` before any waiting — so the joiner is answered in
+the tick it asked, rather than 535 ms later with somebody else's sentence (pass 6's measurement). The new
+pin asserts both halves of the promise: the sentence (not the dead-session sentence, says whose creation it
+is, says nothing was sent, makes no forecast), and the *afterwards*: once the doomed creation has answered
+its own caller, the same session asks again and gets `[new channel "l-joinrefused"…]` with
+`details.status === "completed"`.
+
+Two things this fix settled that are worth keeping:
+
+- **A joiner that joined *before* the quit is answered with the doomed creation's failure, and that is
+  right.** That call belongs to the session that ended; R6-01's harm was a call made by a session that had
+  not ended. No machinery is needed to break waits that are already running, and none was added.
+- **The window a test can reach is narrower than it looks.** My first attempt at the pin used a stub that
+  sleeps before answering `ready`, and it passed the wrong way: the joiner got its *own* channel. `quit()`
+  awaits the close of every daemon it can see (F4-01's `halfStarted` walk), so a doomed creation whose
+  daemon had spawned is dead — and its slot released — before a `session_start` handler returns and the
+  next session's call can ask. The reachable shape is a creation with **no daemon yet**, and the
+  environment-lock recipe (`PI_REPLMODE_ENV_DIR` at a dir with `bin/python`, no `.complete`, and a
+  `<envDir>.lock` directory) is the only cheap way to hold one. Both R6-01 pins use it; DEV.md now says so.
+
+**F6-02 (found while fixing).** R6-01 makes doomed creations a thing a live session hits twice. The second
+way is the capacity refusal, which still ended *"wait for the call that is starting to finish, or cancel
+it"* — and nobody can cancel a start whose session is gone. That is R3-04's complaint about this very
+sentence, so the branch now says whose session the start belonged to, that nothing can cancel it, and what
+to do instead (wait, or use another name). R3-04's own test passes unchanged: with nothing doomed, the
+sentence is byte-for-byte what it was.
+
+Mutations: *a quit leaves its doomed creation for the next session to join*, *the join takes no notice of a
+creation that cannot succeed*, *the refusal for a doomed start stops explaining whose creation it is*,
+*an aborted joiner is promised what the other call goes on to do*, *the capacity refusal tells the model to
+cancel a start nobody can cancel*.
+
+### R6-02 — a cancelled call's status describes its channel, not its call
+
+`abortedResult` takes the status now: the creator keeps `"dead"` (its own cancel did just close its own
+daemon — R4-06's pinned contract, `run.test.ts`'s `dead` assertion, and the `aborted: true` key all
+untouched), and a joiner gets `"running"`, which is what its sentence says: the start is still in flight,
+held by another call.
+
+The same contradiction was sitting one branch away, unfilled by pass 6: the call cancelled *while queued
+behind another cell* answers "nothing was sent, so nothing ran and **the channel kept its state**" with
+`status: "dead"`. Fixed in the same stroke and pinned by a new test that proves the other half — the channel
+is still there, still holds `kept = 3`, and does not come back as `[new channel`.
+
+**Still deliberately weak:** `"running"` is the least-wrong of five. The enum has no "starting" and no way
+to say "not a channel yet"; `dead` was the field's habit, and it is the one value a model acts on by
+abandoning a channel that works. Two mutations pin the two branches.
+
+### R6-03 — an answer's channel field names the channel its sentence names
+
+`ChannelNamedError(message, channel)`; `bgStop`'s dropped-task branch passes `dropped.channel`, its
+"never heard of that id" branch passes `undefined`, and `failure()` uses the error's channel when it has
+one and **omits the field** when the answer is about none. `ReplDetails.channel` became optional for
+exactly that. Folded in from the same handoff sentence: `bg_wait`'s details no longer quote `infos[0]?.channel ??
+"main"` as *the* channel of an answer whose rows name one channel each (pinned in `listing.test.ts` with a
+registry that spans two channels).
+
+`run`'s answers all still name their channel, and the declared `RUN_OUTPUT` schema is unchanged — it still
+requires `channel`, and `honesty.test.ts`'s walk over every `run` path still finds it. Leaving the field
+out is only done for `bg_stop`/`bg_wait`, which declare no `outputSchema` at all, so nothing is being
+contradicted there.
+
+Mutations: *the failure wrapper fills in a channel the answer never named*, *the dropped-task answer knows
+its channel and does not say so*, *the task listing claims one channel for an answer about all of them*.
+
+### F6-01 — a queued call whose channel went says its cell never went
+
+Pass 6's unpinned measurement, now pinned. `runLocked` checks `channel.closed` next to its
+`signal?.aborted` guard, before `begin` can throw a death note and have the answer be a plain "the Python
+process behind channel X ended". The answer is not `abortedResult`: nothing aborted this call, and
+`aborted: true` would tell the model its own Esc stopped the cell (the new test asserts that key is absent).
+
+Two decisions in that five lines:
+
+- the guard reads `channel.closed`, not `processGone(pid)` (unlike `getChannel`): in the window before node
+  is told, the host really *did* write the cell into the pipe — "nothing was sent" would be false there, and
+  the exec dies a moment later and gets the death answer, which is honest about a cell that was sent;
+- the guard is checked **before** the `signal?.aborted` one, not after. A call can be both cancelled and
+  too late, and the cancel sentence claims "the channel kept its state", which is false for a channel that
+  died while the call waited. The death sentence says nothing was sent too, so the call that is both gets
+  the only answer that is true for it. `test/run.test.ts` queues two calls, kills the daemon, cancels one of
+  them after the death is visible, and asserts the cancelled one's text does not say "kept its state" —
+  which holds whichever of the two conditions `runLocked` sees first, so the pin is not a race.
+
+### Tests added by the fixer (7)
+
+- `lifecycle.test.ts`, *"R6-01: the joiner is refused in its own words, and the name is free once the
+  doomed start is done"* — the sentence, the status, and the "ask again" it tells the model to do.
+- `lifecycle.test.ts`, *"R6-01 (measured by pass 6): and a joiner that gives up is told who can free the
+  channel, not what the other call will do"* — pins the reworded joiner sentence by forbidding a forecast,
+  in the ordinary case where the creation *does* go on fine (so the pin is "makes no forecast", not "the
+  forecast happened to be wrong").
+- `lifecycle.test.ts`, *"R6-01: and the capacity refusal does not tell the model to cancel a start nobody
+  can cancel"* — F6-02, and it re-pins R3-04's three claims about the same sentence on the way.
+- `run.test.ts`, *"R6-02: and the cancelled queued call does not report the channel it was queued for as
+  dead"* — with the channel's aliveness proved (variables intact, no `[new channel`).
+- `run.test.ts`, *"F6-01: a call queued behind a cell whose channel died says its own cell never went"* —
+  marker file still absent, no `aborted` key, and the cancelled-while-dead case gets the death answer
+  rather than one that claims the channel kept its state.
+- `resilience.test.ts`, *"R6-03: and an id this process has never heard of claims no channel at all"*.
+- `listing.test.ts`, *"R6-03: a listing whose tasks span two channels claims no single channel for
+  itself"*.
+
+One test changed: **none**. No assertion of pass 6's was loosened or moved.
+
+### Probed, and left alone (pass 6 fixes)
+
+- **A doomed creation still counts against the cap** (`makeRoom` counts `starting.keys()`). It may hold an
+  environment build and it will hold a daemon for a moment; and letting a live session take the slot under
+  the same name is route 1 again, which is the thing that was rejected. The refusal now says who owns the
+  slot and what to do, which is the honest version of the same fact.
+- **A call that is *already* cancelled and whose creation is doomed gets the doomed refusal, not the
+  "aborted" sentence.** Both are true; the refusal explains the situation and the abort adds nothing the
+  model needs. The order is written twice on purpose (`getChannel` checks `doomed` before waiting, `run`'s
+  catch checks it before the abort branch), so neither can be reordered into shadowing the other silently.
+- **Mixed capacity case** (some starts doomed, some not): the old sentence plus a clause naming how many
+  cannot be cancelled. The pre-existing "the call that is starting" singular-with-many vagueness is pass
+  4's accepted mixed wording, unchanged.
+- `startOutputPolling`, `stoppedResult`, `backgroundResult`, `deadResult`, `finishedResult` and every
+  branch of `run` still set `details.channel` — each of those answers *is* about the channel it names, and
+  the task rows in a listing each carry their own.
+- Nothing in the repo reads `bg_wait`'s `details.channel` (grepped: only pass 6's R6-03 test reads
+  `details.channel` at all), so removing it is not a break for a caller.
+
+### Pass 6's mutations
+
+ELEVEN new mutations (five for R6-01 including F6-02, two for R6-02, three for R6-03, one for F6-01),
+and two existing anchors re-pointed where the code moved (R5-01's `untilAborted(pending…)` became
+`pending.promise`, and its `error instanceof ChannelJoinAbortedError` became `const joined = …`).
+**77 anchors; 75 died, 2 survived, and both survivors are the accepted ones** (`flushLoose` uses
+`Exec.write` again, `failure()` invents `status: error`).
+
+Two of the eleven were first *rejected by the typecheck*, which is the script working as designed but the
+message being easy to misread: a mutation must leave the file parseable and the code reachable. Replacing a
+message that ends a template literal dropped the closing backtick (five `TS1005`s); neutering the join's
+guard with `if (false && pending.doomed)` tripped an unrelated `TS18048: 'pending' is possibly 'undefined'`,
+because the `false &&` stops the narrowing that the `if (!pending) throw` above it establishes. The forms
+that work are a non-constant false (`pending.doomed && this.maxChannels < 0`) and a replacement that carries
+every quote the anchor carried. Both were re-run after the fix and both died; the script's header now says
+this, so the next pass does not lose an hour to it. A rejected mutation is not counted in the total, so the
+75 above is the full pass of 75 that ran in one sweep plus these two verified separately afterwards — the
+tree was unchanged between them (only the script's two anchors moved).
+
+### Two tools this pass added
+
+- `test/anchors.test.ts` parses `scripts/mutation-audit.sh` and fails the ordinary suite when an anchor no
+  longer matches its source, when a label is reused (a reused label can never be selected by the filter),
+  when a named file does not exist, or when a replacement equals its anchor. Pass 4 and pass 5 each lost
+  several anchors to silent rot; this turns that into a red test, which is the only place a tester is
+  guaranteed to look.
+- `scripts/clean-tmp.sh` removes the suite's `/tmp/replmode-{agent,cwd,names}-*` scratch dirs older than an
+  age (30 min by default). A full audit pass leaves a few hundred; the loop runs unattended, so the recipe
+  had to stop being a one-liner someone remembers. `find … -mmin +30 -delete` is the wrong tool and says so
+  in the script's comment.
+
+
+### Handoff to pass 7 (tester)
+
+In the order I would try them:
+
+1. **The `doomed` flag's reach.** It is set in exactly one place (`quit()`). What else ends a session
+   without a quit — a `/reload` with `PI_REPLMODE_KEEP_RUNNING` at its default (must **not** doom: the
+   re-adopted daemons and their in-flight starts are the whole point of `reload.test.ts`), a
+   `session_shutdown` reason the `closeAll` switch does not cover, two `quit()`s with a creation started
+   between them?
+2. **R6-01's refusal under company.** Three calls refused the same doomed creation; the doomed creation's
+   own caller then cancelled (`release` fires on abort — does the refusal stay consistent, and does the
+   joiner that arrives *after* that cancel get a fresh creation?); a quit landing inside another call's
+   `makeRoom` while a doomed creation is in flight (R5-02's shape, now with a doomed occupant).
+3. **R6-02's three statuses.** Try to make `running` false somewhere I did not think of: a joiner cancelled
+   at the same moment the creation it was watching fails; a joiner cancelled while the *env build* is what
+   is wedged; a queued call cancelled while its channel is being retired by `makeRoom` from another call
+   (the closed-vs-abort ordering is settled — the death answer wins, and `run.test.ts` pins that it does not
+   claim "kept its state" — but what the *status* should be for a call that is both cancelled and too late is
+   an answer I chose, not a fact I measured). `running` is the least-wrong value for "the channel exists and
+   is not dead"; if you can make it wrong rather than merely coarse, that is a finding.
+4. **F6-01's guard.** A call queued behind another while a *different* call kills the channel and starts a
+   new one under the same name: the queued call holds the old `Channel` object, so it should get the
+   "already gone" answer — check it never runs a cell on a daemon it was never handed, and check the
+   ordering against `busyTask()` and `withLock`.
+5. **R6-03's shape.** Anything else that fills a field an answer is not about (`details.channel` is gone
+   from two places; check `pi`'s own renderers/UI do not assume it), and whether `status: "running"` on
+   the doomed refusal can send a model to `bg_wait`/`bg_stop` for a task that does not exist.
+6. **The mutation pass is done** — 77 anchors, 75 die, the 2 accepted survivors. If you file anything,
+   add its mutation in the same commit as your holding test, and run `ANCHORS_ONLY=1` *before* the long
+   sweep, never after. If you change product code that an old anchor sits in, expect that anchor to rot:
+   four rotted in one sitting in pass 5 and two of this pass's own anchors were rejected for not compiling.
+7. **Held under attack this pass, so do not re-derive:** the creator/joiner pair of R5-01 (four tests, two
+   mutations); the identity guard on `starting` (now `{promise, doomed}` — the guard still compares promise
+   identity); `quit()`'s `halfStarted` walk and the close-on-sight hook; the one-shot `close`; the
+   epoch-before-`makeRoom` rule (R5-02's anchor moved nowhere); R4-09's two branches and R5-04's
+   `existsSync`; the whole prompt-section renderer totality argument (pass 6's re-check stands); and the
+   accepted list, including the cross-process name collision.

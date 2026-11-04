@@ -6,10 +6,10 @@
  * limit that hands the model a log path and a global instead of a truncation.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
+import { isPidAlive, type LoadedExtension, loadExtension, text, waitFor } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
 
@@ -229,6 +229,78 @@ describe("aborting a call", () => {
     expect(second.isError, `the cancelled queued call answered as if it had run: ${shown}`).toBe(true);
     expect(shown, `the cancelled queued call does not say it was cancelled: ${shown}`).toMatch(/aborted/);
     expect(existsSync(marker), "the cancelled call wrote its file, so its cell ran").toBe(false);
+  });
+
+  it("R6-02: and the cancelled queued call does not report the channel it was queued for as dead", async () => {
+    // The same scenario, aimed at the other half of the answer. `abortedResult` put `status: "dead"` in
+    // both structured views, which was chosen for a call that had its own daemon closed by its own cancel
+    // — and this call's own sentence says the channel kept its state. Measured at pass 6's HEAD: a model
+    // reading `structuredContent.status` is told to give up on a channel that is live and holds its
+    // variables, seconds before the next call runs in it.
+    const holder = run("kept = 3\nimport time\ntime.sleep(3)\nprint('holder done')", { channel: "t-queued-alive", timeout: 30 });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const controller = new AbortController();
+    const queued = run("print('never sent')", { channel: "t-queued-alive", timeout: 30 }, { signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    controller.abort();
+
+    const [first, second] = await Promise.all([holder, queued]);
+    expect(text(first), "the cell that was holding the channel did not finish, so the channel was never live to be judged").toContain(
+      "holder done",
+    );
+    const shown = text(second);
+    expect(second.isError, `the cancelled queued call answered as if it had run: ${shown}`).toBe(true);
+    expect(
+      second.details?.status,
+      `the cancelled queued call calls its channel dead in details while it is alive with its variables: ${JSON.stringify(second.details)}`,
+    ).not.toBe("dead");
+    expect(second.structuredContent?.status, `and in structuredContent: ${JSON.stringify(second.structuredContent)}`).not.toBe("dead");
+    // Which it is: the channel is there, with the variable its first cell set.
+    const after = await run("print(kept)", { channel: "t-queued-alive" });
+    expect(text(after), "the answer called the channel dead, and it is not: its variables went missing").toContain("3");
+    expect(text(after), "a channel that was reported dead turned out to be a fresh one").not.toContain("[new channel");
+  });
+
+  it("F6-01: a call queued behind a cell whose channel died says its own cell never went", async () => {
+    // The queued call already had its channel; the process went while it waited for the lock. `begin`
+    // throws the death note, and the answer built from it is a plain "the Python process behind channel X
+    // ended" — which never says this call's cell was never sent, the fact R4-06 made every answer carry.
+    // Pass 6 measured it and did not file it; this pins the guard that closes it.
+    const marker = join(ext.agentDir, "queued-dead.txt");
+    rmSync(marker, { force: true });
+    const warm = await run("import os", { channel: "t-queued-dead" });
+    const pid = warm.details.pid!;
+    const holder = run("import time\ntime.sleep(6)", { channel: "t-queued-dead", timeout: 30 });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const queued = run(`open(${JSON.stringify(marker)}, "w").write("ran")`, { channel: "t-queued-dead", timeout: 30 });
+    // A second queued call, cancelled as well: whichever of the two conditions reaches `runLocked` first,
+    // the answer must not be the cancel sentence, because that one claims the channel kept its state.
+    const controller = new AbortController();
+    const cancelled = run("print('also never sent')", { channel: "t-queued-dead", timeout: 30 }, { signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isPidAlive(pid), 10_000, "the channel to go while two calls were queued behind a cell on it");
+    controller.abort();
+
+    const [first, second, alsoCancelled] = await Promise.all([holder, queued, cancelled]);
+    const shown = text(second);
+    expect(text(first), "the cell that died with its channel is not reported dead, so the case did not run").toMatch(/dead|ended/);
+    expect(second.isError, `a queued call whose channel went answered as if it had run: ${shown}`).toBe(true);
+    expect(shown, `the queued call says the channel died but never says its own cell was never sent: ${shown}`).toMatch(/nothing was sent/);
+    expect(existsSync(marker), "the queued call wrote its file, so its cell ran on a channel that was gone").toBe(false);
+    // And it must not borrow the aborted call's shape: nothing cancelled this call, and `aborted: true`
+    // would tell the model its own Esc is what stopped the cell.
+    expect(
+      second.structuredContent?.aborted,
+      `the answer blames a cancellation that never happened: ${JSON.stringify(second.structuredContent)}`,
+    ).toBeUndefined();
+
+    // The same channel, for a call that *was* cancelled: it gets the death answer, not the cancel one,
+    // because the cancel sentence says "the channel kept its state" and that is no longer true.
+    const alsoShown = text(alsoCancelled);
+    expect(alsoCancelled.isError, `a cancelled queued call whose channel went answered as if it had run: ${alsoShown}`).toBe(true);
+    expect(alsoShown, `a cancelled queued call claims a dead channel kept its state: ${alsoShown}`).not.toMatch(/kept its state/);
+    expect(alsoShown, `the cancelled queued call does not say its cell was never sent: ${alsoShown}`).toMatch(/nothing was sent/);
   });
 });
 

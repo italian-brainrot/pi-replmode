@@ -7,6 +7,12 @@
 # green. Anchors are exact source text: if one stops matching, the fix moved, so re-find it rather than
 # deleting the line.
 #
+# A mutation has to leave the file *parseable*, and the typecheck says so but not why: a replacement that
+# drops a closing backtick is a syntax error, and a guard neutered with `false &&` can trip an unrelated
+# TS18048 (the narrowing of the check above it stops applying). Neuter a condition with a sub-condition that
+# is false but not constant — `pending.doomed && this.maxChannels < 0` — and keep every quote the anchor
+# carried, backticks included.
+#
 # Usage: bash scripts/mutation-audit.sh [label-substring]   (a filter, because a full pass is minutes)
 #        ANCHORS_ONLY=1 bash scripts/mutation-audit.sh      (check every anchor, run nothing: seconds)
 set -u
@@ -471,13 +477,70 @@ run_mutation "R5-02 the quit epoch is taken after the room is made" src/manager.
     await this.makeRoom();
     const epoch = this.quitEpoch;' "test/lifecycle.test.ts"
 
-run_mutation "R5-01 a call that joined somebody else's start is handed the bare promise again" src/manager.ts '      return untilAborted(pending, signal, name, true);
+run_mutation "R5-01 a call that joined somebody else's start is handed the bare promise again" src/manager.ts '      return untilAborted(pending.promise, signal, name, true);
 ---MUTATE---
-      return pending;' "test/lifecycle.test.ts"
+      return pending.promise;' "test/lifecycle.test.ts"
 
-run_mutation "R5-01 a joiner's own cancel is described as freeing the creator's slot" src/manager.ts '          error instanceof ChannelJoinAbortedError
+run_mutation "R5-01 a joiner's own cancel is described as freeing the creator's slot" src/manager.ts '        const joined = error instanceof ChannelJoinAbortedError;
 ---MUTATE---
-          error instanceof ChannelStartAbortedError' "test/lifecycle.test.ts"
+        const joined = error instanceof ChannelStartAbortedError;' "test/lifecycle.test.ts"
+
+# ── pass 6's fixes ────────────────────────────────────────────────────────────
+
+run_mutation "R6-01 a quit leaves its doomed creation for the next session to join" src/manager.ts '    for (const pending of this.starting.values()) pending.doomed = true;
+---MUTATE---
+    for (const pending of this.starting.values()) pending.doomed = false;' "test/lifecycle.test.ts"
+
+run_mutation "R6-01 the join takes no notice of a creation that cannot succeed" src/manager.ts '      if (pending.doomed) throw new ChannelStartDoomedError(name);
+---MUTATE---
+      if (pending.doomed && this.maxChannels < 0) throw new ChannelStartDoomedError(name);' "test/lifecycle.test.ts"
+
+run_mutation "R6-01 the refusal for a doomed start stops explaining whose creation it is" src/channel.ts '      `channel "${channel}" is being started by a call that belongs to a session that has ended, so that start cannot ` +
+---MUTATE---
+      `channel "${channel}" could not start: another call is still trying to bring it up, so that start will ` +' "test/lifecycle.test.ts"
+
+run_mutation "R6-01 an aborted joiner is promised what the other call goes on to do" src/manager.ts 'this call held neither the daemon nor the slot — only the call that is starting that channel can give either of them up`
+---MUTATE---
+this call held neither the daemon nor the slot — the call that is starting that channel was not cancelled, so it carries on`' "test/lifecycle.test.ts"
+
+run_mutation "R6-01 the capacity refusal tells the model to cancel a start nobody can cancel" src/manager.ts '      if (doomed === starting.length) {
+---MUTATE---
+      if (false && doomed === starting.length) {' "test/lifecycle.test.ts"
+
+run_mutation "R6-02 an aborted joiner reports the channel it was waiting for as dead" src/manager.ts '          joined ? "running" : "dead",
+---MUTATE---
+          "dead",' "test/lifecycle.test.ts"
+
+run_mutation "R6-02 a call cancelled while queued reports the channel it was queued for as dead" src/manager.ts '        // covers both: a call that never sent anything is not evidence about its channel).
+        "running",
+---MUTATE---
+        // covers both: a call that never sent anything is not evidence about its channel).
+        "dead",' "test/run.test.ts"
+
+run_mutation "F6-01 a queued call whose channel went is answered without saying nothing was sent" src/manager.ts '    if (channel.closed) {
+      const note = channel.deathNote ?? `channel "${channel.name}" is closed`;
+---MUTATE---
+    if (false && channel.closed) {
+      const note = channel.deathNote ?? `channel "${channel.name}" is closed`;' "test/run.test.ts"
+
+run_mutation "R6-03 the failure wrapper fills in a channel the answer never named" src/index.ts '  const named = error instanceof ChannelNamedError ? error.channel : channel;
+---MUTATE---
+  const named = channel ?? "main";' "test/resilience.test.ts"
+
+run_mutation "R6-03 the dropped-task answer knows its channel and does not say so" src/manager.ts '          dropped.channel,
+        );
+---MUTATE---
+          undefined,
+        );' "test/resilience.test.ts"
+
+run_mutation "R6-03 the task listing claims one channel for an answer about all of them" src/manager.ts '        running,
+        finished,
+        tasks: infos,
+---MUTATE---
+        channel: infos[0]?.channel ?? "main",
+        running,
+        finished,
+        tasks: infos,' "test/listing.test.ts"
 
 echo "=================================================="
 if [ -n "$ANCHORS_ONLY" ]; then

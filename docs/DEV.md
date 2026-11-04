@@ -45,10 +45,12 @@ scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so
                    definition of where the environment lives)
 scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
                    "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
-                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is ~60 mutations /
-                   ~20 minutes (it typechecks each mutation and re-runs a baseline per test file).
+                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 77 mutations /
+                   ~80 minutes (it typechecks each mutation and re-runs a baseline per test file).
                    `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` checks that every anchor still
                    matches the source and runs nothing: do that first, it takes seconds
+scripts/clean-tmp.sh  delete the suite's scratch dirs under /tmp (agent dirs, cwd dirs, name dirs)
+                   that failed and hand-written runs leave behind; safe, the real env is in ~/.cache
 scripts/smoke-abort-start.sh  the real-pi abort smoke: a pty, the interactive TUI, and the byte for Esc
                    (SIGINT to `pi -p` is a hard kill that runs no shutdown, so nothing else can reach this)
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
@@ -85,11 +87,11 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   quit began walking" branch is reached deterministically.
 - **The scratch space these tests use is disposable, and it accumulates.** Every `loadExtension` makes a
   `/tmp/replmode-agent-XXXX/` and most of them are removed by `dispose()`; failed runs, aborted runs and
-  hand-written probe scripts leave the rest behind. Nothing pins those paths, so this is safe and worth
-  running when `/tmp` looks fat: `find /tmp -maxdepth 1 -name 'replmode-agent-*' -mmin +30 -delete`. Pass 6
-  found 119 of them plus a 1.1 GB `/tmp/scratch-env` venv and 30 MB of probe agent dirs from earlier
-  sessions (~1 GB freed). The environment that actually matters is not in `/tmp`: it is
-  `${XDG_CACHE_HOME:-~/.cache}/pi-replmode/py-env-<hash>`.
+  hand-written probe scripts leave the rest behind, along with `/tmp/replmode-cwd-*` and
+  `/tmp/replmode-names-*`. Nothing pins those paths, so `bash scripts/clean-tmp.sh` is safe whenever `/tmp`
+  looks fat (it takes an age in minutes, 30 by default). Pass 6 cleared 119 agent dirs plus a 1.1 GB
+  `/tmp/scratch-env` venv; a full audit pass adds a few hundred cwd and name dirs. The environment that
+  actually matters is not in `/tmp`: it is `${XDG_CACHE_HOME:-~/.cache}/pi-replmode/py-env-<hash>`.
 - **vitest 5 has no `basic` reporter.** `npx vitest --run test/lifecycle.test.ts --reporter=basic` fails at
   startup with "Failed to load custom Reporter"; the default reporter already prints per-test lines, and
   `grep -E "×|✓|Tests |Test Files"` is what pass 6 filtered it with.
@@ -116,11 +118,19 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   Add the mutation to the script when you fix something — prose fixes get mutations too. Check the new
   anchor before the long run with `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` (seconds, runs no
   tests; a stale anchor is skipped silently by a real run), and pass a label substring (`… R3-0`)
-  while iterating; the whole list is about fifty minutes, so iterate with a filter.
+  while iterating; the whole list is 77 mutations and about eighty minutes, so iterate with a filter.
+  `test/anchors.test.ts` parses the script and fails the normal suite when an anchor no longer matches its
+  source, when a label is reused (the filter then can never select it alone), or when a replacement is
+  identical to its anchor — so a rotted anchor is a red test rather than a surprise an hour into a sweep.
   Two things it guards against, both learned the hard way: a mutation is applied only if the tree still
   `tsc`s (an anchor that no longer matches the code's shape is skipped loudly rather than counted as a
   survival — three anchors had rotted that way), and a mutation counts as dead only when the **set of
   failing test names** changes, because a suite with tests red on purpose fails no matter what you break.
+  A rejected mutation is not in the total, and the rejections are cryptic unless you know the rule: the
+  replacement has to leave the file parseable and the code reachable. Pass 6 lost two anchors to this — one
+  dropped the closing backtick of a template literal, and neutering a guard with `if (false && x)` reported
+  an unrelated `TS18048` because the constant `false` stops the narrowing an `if (!x) throw` above it
+  establishes. Use a sub-condition that is false but not constant (`x && this.maxChannels < 0`).
 - **Real pi smoke**, which catches what neither suite does (registration, prompt section, real
   harness): use a throwaway agent dir so the user's settings are untouched.
 
@@ -216,9 +226,13 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   a call aborted while its daemon is still coming up closes that half-started daemon (the same teardown
   a failed start does, and `Channel.close` is one-shot per channel), releases the slot it was holding,
   and answers "aborted" without putting the cell on the wire; a call aborted while it queued behind
-  another call on the same channel sends nothing either (R4-06). This is consistent with the interrupt
-  rule — an abort detaches or interrupts, it never kills a running cell — and it is what makes Esc the
-  only way out of a wedged start.
+  another call on the same channel sends nothing either (R4-06), and neither does a queued call whose
+  channel went while it waited — `runLocked` checks `channel.closed` before `begin` can throw a death
+  note and have the answer be a plain "the Python process behind channel X ended", which would never say
+  the cell was never sent (F6-01). That check comes **before** the abort check, because the abort sentence
+  claims "the channel kept its state" and that is false for a channel that died while the call waited.
+  This is consistent with the interrupt rule — an abort detaches or interrupts, it never kills a running
+  cell — and it is what makes Esc the only way out of a wedged start.
 - **A quit closes daemons that never finished starting.** `starting` holds promises, and nothing can close
   a promise, so `startChannel` hands the manager the daemon the instant it spawns (`halfStarted`) and
   `quit()` closes those as well as the live channels. `createChannel` also compares a **quit epoch**: a
@@ -228,12 +242,25 @@ spikes/            the experiments that proved interrupt and formatter behaviour
 - **A call that *joins* somebody else's channel creation owns nothing** — not the daemon, not the
   `starting` slot, not the cap. That is what R5-01's `untilAborted(…, joined = true)` and
   `ChannelJoinAbortedError` are for: the joiner's cancel ends its own wait and nothing else, and its
-  answer must not claim it freed a slot it never held. `getChannel`'s join, however, takes **no quit
-  epoch** (open finding R6-01): a creation that can no longer succeed — the session that started it has
-  ended — is still handed to the next session's call, which is then answered with the dead session's
-  sentence. Keep that in mind before treating `starting` as a plain name→promise map, and never "fix" it
-  by clearing `starting` from `quit()`: the creation is still running and would install its daemon into
-  the map the new session owns.
+  answer must not claim it freed a slot it never held. It owns no **session** either: a `quit()` marks
+  every creation in flight as `doomed`, and `getChannel` refuses to hand such a creation to a joiner
+  (`ChannelStartDoomedError`) rather than answer a live session with the ended session's sentence, or
+  leave its name blocked behind a start that cannot succeed (R6-01). Two things to keep straight before
+  touching this: never "fix" it by clearing `starting` from `quit()` — the creation is still running and
+  would install its daemon into the map the new session owns; and do not make the joiner start its own
+  creation instead of refusing, because that puts two daemons under one name in one process (one daemon
+  log, one history file, one IPython profile) for as long as the doomed one takes to die — pass 5 measured
+  4.5 s for a daemon that ignores `shutdown` and SIGTERM. Reachability in a test is narrower than it looks:
+  `quit()` awaits the close of every daemon it can see, so a doomed creation whose daemon had already
+  spawned is dead, and its slot released, before the next session gets to ask. The window is a creation
+  with **no daemon yet** — the env-lock recipe (`PI_REPLMODE_ENV_DIR` at a dir with `bin/python`, no
+  `.complete`, and a `<envDir>.lock` directory) is how both lifecycle tests hold it.
+- **A status field is a claim about the thing the answer names, not about the call.** `details.status` /
+  `structuredContent.status` say `"dead"` when a *channel* is gone. A call that never sent anything and
+  left its channel alive — a cancelled joiner, a call cancelled while it queued, `bg_stop` for an id this
+  process never heard of — must not borrow that status or that channel (R6-02, R6-03). `bg_stop` and
+  `bg_wait` have no channel of their own to fall back on: an error that is about a channel carries it
+  (`ChannelNamedError`), and `failure()` leaves the field out when the answer is about none.
 - **A channel is only a channel while its process is.** `channel.closed` turns true when node is *told*
   about a death, which can lag the death itself, so `getChannel` asks `processGone` (a zombie counts as
   gone) before handing a caller a channel, and the settled-task branch of `bg_stop` asks the same question

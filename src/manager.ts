@@ -28,6 +28,7 @@ import {
   ChannelBusyError,
   ChannelJoinAbortedError,
   ChannelStartAbortedError,
+  ChannelStartDoomedError,
   type Exec,
   type ExecOutcome,
   type ReadyFrame,
@@ -84,6 +85,26 @@ export class ChannelCapacityError extends Error {
   }
 }
 
+/**
+ * A refusal that knows which channel its own sentence is about (R6-03).
+ *
+ * A thrown error becomes a tool result in `index.ts`, and the wrapper only has the channel the *call*
+ * named — for `bg_stop` and `bg_wait` there is no such thing, and the `"main"` it used to fill in put a
+ * channel in `details` and `structuredContent` that the text of the same result said nothing about (or,
+ * worse, said something about under a different name). So an answer about a particular channel carries it,
+ * and an answer about none says so by leaving it out.
+ */
+export class ChannelNamedError extends Error {
+  constructor(
+    message: string,
+    /** The channel the message names, or undefined when the answer is about no channel at all. */
+    readonly channel: string | undefined,
+  ) {
+    super(message);
+    this.name = "ChannelNamedError";
+  }
+}
+
 export interface TaskInfo {
   id: string;
   channel: string;
@@ -102,7 +123,10 @@ export interface TaskInfo {
 }
 
 export interface ReplDetails {
-  channel: string;
+  /** The channel this answer is about — absent when the answer is about none. A `bg_stop` for an id this
+   *  process has never heard of names no channel, and filling one in here puts a channel in the
+   *  structured view that the sentence carrying it says nothing about (R6-03). */
+  channel?: string;
   id?: string;
   status?: TaskStatus;
   elapsed?: number;
@@ -163,7 +187,16 @@ export class ReplManager {
   /** Tasks their channel's closure removed, with the reason: see `bgStop`'s unknown-id answer. */
   private readonly droppedTasks = new Map<string, { channel: string; logPath: string; why: string }>();
 
-  private readonly starting = new Map<string, Promise<Channel>>();
+  /**
+   * Channel creations in flight, so a second call for the same name waits on the first instead of
+   * starting a second daemon.
+   *
+   * `doomed` is set by the `quit()` that passed this creation by: its session is gone, so the start can
+   * only fail, and a call made in the session that came after must not be handed that failure as if it
+   * were about itself (R6-01). The creation itself keeps running — nothing can cancel a promise — and
+   * closes whatever daemon it manages to spawn.
+   */
+  private readonly starting = new Map<string, { promise: Promise<Channel>; doomed: boolean }>();
   /**
    * Daemons that have spawned but not answered `ready` yet. They are in no map a shutdown reads, so a
    * session that ends while one is coming up would leave it running forever (F4-01).
@@ -221,21 +254,28 @@ export class ReplManager {
       // await away from R4-06's fix, and the shape `executeTool` and `run_subagent` hand you).
       // Watching is all a joiner may do. It must not cancel the creation it is watching, close that
       // daemon, or release that slot: another call owns all three, and its teardown still runs.
-      return untilAborted(pending, signal, name, true);
+      //
+      // What it may not do is inherit that creation's *session*. A start that a `quit()` passed by is
+      // guaranteed to fail, and its failure — `the session ended while this channel was starting` — is
+      // the answer of the call that owns it, whose session really did end. Joining it from a session that
+      // is still live would hand that sentence to a call whose session is demonstrably running, and the
+      // name would stay blocked for as long as the doomed creation takes to notice (R6-01).
+      if (pending.doomed) throw new ChannelStartDoomedError(name);
+      return untilAborted(pending.promise, signal, name, true);
     }
 
-    const starting = this.createChannel(name, cwd, onProgress, signal);
-    this.starting.set(name, starting);
+    const creation = this.createChannel(name, cwd, onProgress, signal);
+    this.starting.set(name, { promise: creation, doomed: false });
     // The slot comes back the moment the caller cancels, not when that call's rejection has worked its
     // way back through the await chain: the next `run` can ask for the cap in between, and a slot held
     // by a call that has already been cancelled is what R4-06 is about. `release` is guarded by identity
     // so it can never drop somebody else's creation.
     const release = (): void => {
-      if (this.starting.get(name) === starting) this.starting.delete(name);
+      if (this.starting.get(name)?.promise === creation) this.starting.delete(name);
     };
     signal?.addEventListener("abort", release, { once: true });
     try {
-      return await starting;
+      return await creation;
     } finally {
       // The listener goes away with the wait: one signal can be handed to many calls in a session, and a
       // listener that outlives each of them is a leak measured in channels.
@@ -339,9 +379,23 @@ export class ReplManager {
     const names = (list: string[]): string => list.map((name) => `"${name}"`).join(", ");
 
     if (live.length === 0 && starting.length > 0) {
+      // R6-01 put a new kind of occupant in `starting`: a creation whose session has ended. No call is
+      // left in any session that could cancel one of those, so "or cancel it" here points the model at a
+      // tool call that cannot exist — the harm R3-04 filed this very sentence for.
+      const doomed = [...this.starting.values()].filter((pending) => pending.doomed).length;
+      if (doomed === starting.length) {
+        const one = starting.length === 1;
+        return new ChannelCapacityError(
+          `channel ${names(starting)} ${one ? "is" : "are"} still starting and ${limit}: nothing is running yet, so there is no task to stop ` +
+            `and no idle channel to retire, and ${one ? "that call belongs" : "those calls belong"} to a session that has ended, so nothing ` +
+            `can cancel ${one ? "it" : "them"} — wait for ${one ? "that start" : "those starts"} to finish and try again, or use another channel name`,
+        );
+      }
+      const alsoDoomed =
+        doomed > 0 ? `; ${doomed} of them ${doomed === 1 ? "belongs" : "belong"} to a session that has ended and cannot be cancelled` : "";
       return new ChannelCapacityError(
         `channel ${names(starting)} ${starting.length === 1 ? "is" : "are"} still starting and ${limit}: nothing is running yet, so there is no ` +
-          "task to stop and no idle channel to retire — wait for the call that is starting to finish, or cancel it, and try again then",
+          `task to stop and no idle channel to retire — wait for the call that is starting to finish, or cancel it, and try again then${alsoDoomed}`,
       );
     }
     const alsoStarting = starting.length > 0 ? `; ${names(starting)} ${starting.length === 1 ? "is" : "are"} also still starting` : "";
@@ -405,21 +459,35 @@ export class ReplManager {
       // A capacity refusal is not a channel that failed to start — nothing was started, and every
       // other channel in the session is running. Say which of the two the model is being told.
       const refused = error instanceof ChannelCapacityError;
-      if (!refused && signal?.aborted) {
+      // Nor is a creation this call refused to join because it belongs to an ended session (R6-01): its
+      // own sentence is the whole answer, and what it describes is a name still held by work in flight,
+      // not a channel that died. Answering it with the start-failure wording would tell a live session
+      // its session had ended.
+      const doomed = error instanceof ChannelStartDoomedError;
+      if (!refused && !doomed && signal?.aborted) {
         // The call was cancelled while its channel was coming up: no cell was sent, and the slot is
         // free again. Saying so is the honest answer, and it is not a channel that failed (R4-06).
         // A call that was only *waiting* on somebody else's creation freed nothing when it cancelled —
-        // the other call is still running that start, and says so (R5-01).
+        // the other call is still running that start, and says so (R5-01). It must not promise what that
+        // other call goes on to do, either: pass 6 measured a joiner pointed at a creation that failed
+        // moments later, so the sentence states who *can* free the daemon, not what they will do.
+        //
+        // And the status has to be true for the channel the answer is about, not only for the call.
+        // `"dead"` is what R4-06 chose for a creator whose own cancel had just closed its own daemon; a
+        // joiner owns no daemon, and the channel it walked away from is normally coming up fine — a model
+        // reading `status: "dead"` stops using a channel that is about to work (R6-02).
+        const joined = error instanceof ChannelJoinAbortedError;
         return this.abortedResult(
           channelName,
-          error instanceof ChannelJoinAbortedError
-            ? `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and this call held neither the daemon nor the slot — the call that is starting that channel was not cancelled, so it carries on`
+          joined
+            ? `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and this call held neither the daemon nor the slot — only the call that is starting that channel can give either of them up`
             : `call aborted while channel "${channelName}" was still starting: nothing was sent to it, and the slot its daemon held is free again`,
+          joined ? "running" : "dead",
         );
       }
-      const status: TaskStatus = refused ? "running" : "dead";
+      const status: TaskStatus = refused || doomed ? "running" : "dead";
       return {
-        content: [{ type: "text", text: refused ? note : `channel "${channelName}" could not start: ${note}` }],
+        content: [{ type: "text", text: refused || doomed ? note : `channel "${channelName}" could not start: ${note}` }],
         details: { channel: channelName, status },
         structuredContent: { status, channel: channelName, error: note },
         isError: true,
@@ -429,12 +497,19 @@ export class ReplManager {
     return channel.withLock(() => this.runLocked(channel, code, timeoutSec, signal, onUpdate));
   }
 
-  /** A call its user cancelled before any cell went on the wire (R4-06). */
-  private abortedResult(channelName: string, text: string): ReplResult {
+  /**
+   * A call its user cancelled before any cell went on the wire (R4-06).
+   *
+   * The `status` is the caller's to choose, because the two cancels are not the same event: the call that
+   * was *starting* a channel has just had its own daemon closed and its channel really is gone, while a
+   * call that was only waiting on somebody else's start leaves that channel to come up without it
+   * (R6-02). Both answers say nothing was sent; only the first may say the channel is dead.
+   */
+  private abortedResult(channelName: string, text: string, status: TaskStatus): ReplResult {
     return {
       content: [{ type: "text", text }],
-      details: { channel: channelName, status: "dead" },
-      structuredContent: { status: "dead", channel: channelName, aborted: true, error: text },
+      details: { channel: channelName, status },
+      structuredContent: { status, channel: channelName, aborted: true, error: text },
       isError: true,
     };
   }
@@ -446,6 +521,25 @@ export class ReplManager {
     signal: AbortSignal | undefined,
     onUpdate?: (partial: ReplResult) => void,
   ): Promise<ReplResult> {
+    // The two ways a queued call reaches its turn to a channel that is no longer there, or to a call its
+    // user has given up on, in the order that keeps both answers true. `begin` would throw the death note
+    // for a gone channel and the answer built from it is a plain "the Python process behind channel X
+    // ended", which never says this call's cell never went on the wire — the fact R4-06 made every answer
+    // carry (pass 6 measured it; the guard is what pins it, F6-01).
+    //
+    // The death is checked *first* because the cancel sentence claims "the channel kept its state", and
+    // that is false for a channel that went while the call waited. A call that is both cancelled and too
+    // late gets the truer of the two; both say nothing was sent.
+    if (channel.closed) {
+      const note = channel.deathNote ?? `channel "${channel.name}" is closed`;
+      const text = `nothing was sent to channel "${channel.name}": it had already gone before this call's turn came (${note})`;
+      return {
+        content: [{ type: "text", text }],
+        details: { channel: channel.name, status: "dead" },
+        structuredContent: { status: "dead", channel: channel.name, error: text },
+        isError: true,
+      };
+    }
     // Same rule one step later: a call that was cancelled while it queued behind another call on this
     // channel does not get to send its cell anyway. A cell has side effects from its first line, and
     // the user has already pressed Esc (R4-06).
@@ -453,6 +547,10 @@ export class ReplManager {
       return this.abortedResult(
         channel.name,
         `call aborted before it reached channel "${channel.name}": nothing was sent, so nothing ran and the channel kept its state`,
+        // The channel is there and kept its state — that is what the sentence says. `"dead"` here is the
+        // same contradiction R6-02 filed for a joiner, from the other queued-call branch (R6-02's fix
+        // covers both: a call that never sent anything is not evidence about its channel).
+        "running",
       );
     }
     const busy = channel.busyTask();
@@ -795,7 +893,10 @@ export class ReplManager {
     return {
       content: [{ type: "text", text: [summary, ...taskSection(infos, this.droppedTasks.size)].join("\n") }],
       details: {
-        channel: infos[0]?.channel ?? "main",
+        // No `channel`: this answer is about the whole task registry, and its rows name a channel each.
+        // The first task's channel used to be quoted as the answer's own (and `"main"` when there were no
+        // tasks), which is R6-03's mistake wearing a listing — a model reading `details.channel` is told
+        // the call was about a channel it was not.
         running,
         finished,
         tasks: infos,
@@ -864,15 +965,21 @@ export class ReplManager {
         // manager outlives `/new`, `/resume` and `/reload`, and each of those boundaries runs the
         // retention sweep, so the file a killed task named can be gone long before the id is asked about
         // (R5-04).
-        throw new Error(
+        throw new ChannelNamedError(
           `unknown task: ${taskId}. Its channel "${dropped.channel}" was ${dropped.why}, which removed that channel's tasks from this session. ` +
             (existsSync(dropped.logPath)
               ? `The cell's output is in ${dropped.logPath}, and the channel's variables went with it.`
               : `The cell's output was in ${dropped.logPath} (the log file is no longer there), and the channel's variables went with it.`),
+          // The channel the sentence names, so the structured view of this same result cannot name another
+          // one (R6-03).
+          dropped.channel,
         );
       }
-      throw new Error(
+      // Nothing to name: this id belongs to no channel this process knows, and an answer about an unknown
+      // id must not borrow a channel from the tool wrapper to fill the field in (R6-03).
+      throw new ChannelNamedError(
         `unknown task: ${taskId}. The ID comes from a run that moved to the background; tasks are tracked per pi process and pruned after ${Math.round(RETENTION_MS / 86_400_000)} days.`,
+        undefined,
       );
     }
 
@@ -1136,6 +1243,12 @@ export class ReplManager {
     // spawned, and those can (F4-01). A half-started channel is closed with the same one-shot `close`
     // the start path uses, so whichever of the two gets there first is the one that acts.
     ++this.quitEpoch;
+    // Every creation still in flight belongs to the session that just ended, and `createChannel`'s own
+    // epoch check guarantees it will be answered as a failure. Marking them here is what lets a call in
+    // the *next* session refuse to join one rather than be answered with that other session's sentence
+    // about itself (R6-01) — `starting` is not cleared, because the creation is still running and would
+    // install its daemon into the map the new session owns.
+    for (const pending of this.starting.values()) pending.doomed = true;
     const channels = [...this.channels.values(), ...this.halfStarted];
     this.channels.clear();
     await Promise.all(channels.map((channel) => channel.close()));

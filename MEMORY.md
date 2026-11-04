@@ -10,35 +10,41 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
 - Status: M1 (core) and M2 (channels, timeouts→background, bg_wait/bg_stop, reload re-adoption) are
   done and covered by real-process tests (pytest + vitest). M3 = display/images, `pi.read_image`,
   `pi.ask`, `pi.run_subagent` over a `call`/`call_reply` pump — not started.
-- Audit loop state: **pass 6 (tester) is complete — three findings filed (R6-01, R6-02, R6-03), each with
-  a holding test that stays red. Next is pass 6 (fixer).** Read [docs/AUDIT.md](docs/AUDIT.md)
-  §"Pass 6 audit — 2026-11-01 (tester)": per-finding write-ups (mechanism, measured reproduction, what the
-  fix must not break), §"Re-checking pass 5's fixes — what held", §"Probed, measured, and not filed", and
-  §"Handoff to the fixer (pass 6)" for the order of preference. Gate this pass leaves: tsc/biome green,
-  **207 vitest — 204 pass, 3 fail on purpose** (two identical full runs, only timings differed), **47
-  pytest**, `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **66 anchors match**. The **full 66-mutation
-  run was not repeated by pass 6** (no product code changed; the anchor check is the part that rots) — the
-  fixer owes it after the fixes, and owes R6-01's fix a mutation of its own (the join's two mutations are
-  both about the answer, neither about epochs).
-  New test ids: `R6-01: a call made after a session ended is not part of that session` and `R6-02: an
-  aborted joiner does not report the channel it was waiting for as dead` (both `lifecycle.test.ts`, both in
-  the new describe "a call that joins a channel creation which cannot succeed"), and `R6-03: and the
-  answer's channel field names the channel its own sentence names` (`resilience.test.ts`, in "killing a
-  channel"). Pass 6 changed no test assertion and no product file; it added three tests.
-- What pass 6's findings and measurement establish, one line each: **a join is not an owner, and it is not
-  an epoch either** — `getChannel` joins whatever is in `starting` regardless of which session started it,
-  so with `PI_REPLMODE_KEEP_RUNNING=0` (which makes every `/new` and `/resume` run `quit()`) a call in a
-  live session waits 535 ms for a doomed creation and is answered with the dead session's sentence,
-  `the session ended while this channel was starting`, and its aborted sibling is told the other call
-  "carries on" with a creation that failed moments later (R6-01, red; the fix must not clear `starting`
-  from `quit()`, and the "start our own" route re-opens the measured 4.5 s two-daemons-one-name window);
-  **reusing an answer shape reuses its claims** — a cancelled *joiner* is answered by R4-06's
-  `abortedResult`, so it reports `status: "dead"` in both structured views about a channel that completed
-  and was met again by pid a second later, contradicting its own sentence (R6-02, red); **an answer built
-  by `throw` inherits the tool's channel, not the answer's** — `failure(error, "main")` gives `bg_stop`'s
-  dropped-task answer `details.channel`/`structuredContent.channel` = `"main"` while its text names the
-  killed channel, and the generic "unknown task" branch invents `"main"` for an id that never existed
-  (R6-03, red).
+- Audit loop state: **pass 6 (fixer) is complete — R6-01, R6-02, R6-03 and pass 6's two unpinned
+  measurements (F6-01 a queued call whose channel went, F6-02 the capacity refusal's uncancellable advice)
+  are fixed, and the three holding tests went green with not one line of them edited. Next is pass 7
+  (tester).** Read [docs/AUDIT.md](docs/AUDIT.md) §"Pass 6 fixes — 2026-11-02 (fixer)": per-fix write-ups
+  (including why R6-01 *refuses the join* instead of starting a second creation), §"Probed, and left alone
+  (pass 6 fixes)", §"Pass 6's mutations" and §"Handoff to pass 7 (tester)" for the attack list. Gate this
+  pass leaves: `tsc`/`biome` green, **218 vitest — 18 files, 0 failing** (two full runs), **47 pytest**,
+  `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **77 anchors match**, and the full sweep: **77
+  mutations, 75 die, the 2 survivors the accepted ones**. Pass 6's fixer changed no test assertion and added
+  seven tests; R6-01 added five mutations, R6-02 two, R6-03 three, F6-01 one.
+- What pass 6's findings established (mechanisms and measurements are in AUDIT): **a join is not an owner,
+  and it is not an epoch either** — `getChannel` joined whatever was in `starting` whichever session started
+  it, so a live session's call could be answered with a dead session's sentence, and its aborted sibling told
+  what the other call "carries on" to do (R6-01); **reusing an answer's shape reuses its claims** — R4-06's
+  `abortedResult` put `status: "dead"` into a joiner's answer about a channel that came up fine (R6-02); **an
+  answer built by `throw` inherits the tool's channel, not the answer's** — `failure(error, "main")` named
+  `"main"` in answers about another channel or about none (R6-03). All three fixed; the three shapes are the
+  lesson for pass 7.
+- What pass 6's *fixes* establish, one line each: **a creation that cannot succeed is refused, not joined** —
+  `starting` holds `{promise, doomed}`, `quit()` marks every one of them on the same line it bumps the epoch
+  (one source of truth), and `getChannel` throws `ChannelStartDoomedError` rather than adopting a doomed
+  start, so a live session's call is answered in its own words with `status: "running"` while the doomed call
+  keeps the failure that belongs to it; the name stays held for that start's own length and the refusal says
+  so. Route 1 — start our own creation — was rejected: it puts two daemons under one name inside one process
+  (one daemon log, one history file, one profile, for the measured 4.5 s a stubborn `close()` takes) and it
+  makes pass 6's holding test racy, because that test samples the pid from `<pidDir>/<channel>.pid`, which is
+  keyed by *name*; **a status field is a claim about the channel the answer names, not about the call** — an
+  aborted joiner and a cancelled queued call both say `running`, while a creator who cancelled its own channel
+  keeps `dead` (pinned); **an answer's `channel` field must name the channel its own sentence names** —
+  `ChannelNamedError` carries it where there is one, `failure()` omits the field where there is none,
+  `ReplDetails.channel` is optional, and `bg_wait`'s details no longer quote one channel for an answer whose
+  rows name one each; `run`'s answers always name theirs and `RUN_OUTPUT` still requires the field; **a queued
+  call whose channel went says nothing was sent** — `runLocked` checks `channel.closed` *before*
+  `signal?.aborted`, because the cancel sentence claims the channel kept its state, and the guard is not
+  `processGone` because a cell really was in the pipe before node is told.
 - What pass 6 held under attack, so it is not re-derived: **R5-03's renderer really is total, and so is
   the handler around it** (`ensureDirs` swallows per-directory errors, so `pruneRetention` cannot throw;
   `lastHistoryByChannel`'s per-file body is in a `try`, `ts` is coerced, `channel` is shape-checked before
@@ -138,7 +144,8 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   report waits only `STDIO_DRAIN_MS` (200 ms) for the dead daemon's stderr, and bytes past the 64 KB startup
   buffer are gone (now exactly the oldest ones, counted in the answer and in the file);
   `structuredContent.output` is the capture without the traceback; the banner and notes ride a couple of KB
-  above 50 000 (the suite's `+5_000` slack encodes that); the clipping numbers (60/120/200/500) are
+  above 50 000 (the suite's `+5_000` slack encodes that — measured worst legitimate answer 47 553
+  characters with a 481-character agent dir, so it only breaks past ~800-character agent-dir paths); the clipping numbers (60/120/200/500) are
   legibility choices, not derived; and **only the call that is starting a channel can free it** — `bg_stop`
   has no task id to take, so a wedged creation holds a slot until its own caller is cancelled (that is what
   R4-06 made possible) or the ready timeout fires, which the capacity refusal says out loud. Added by pass
@@ -168,30 +175,26 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   `session_start` was fixed by pass 5's R5-03 change.) Pass 3's suggested cheap signal
   for the unattributable case — read `/proc/<daemon>/task/*/children` at exec end and say "this cell left
   processes running" — is still argued, not implemented.
-- Pass 2 attacked pass 1's fixes; pass 3 attacked pass 2's; pass 4 attacked the pass-3 fixes, and eight of
-  its nine findings landed there; **pass 5 attacked the pass-4 fixes and landed seven (R5-01…R5-07), three of
-  them inside pass-4 fixes** — a signal never threaded into a *join*, a value captured after an await (the quit
-  epoch must be read before `makeRoom`), and a guard that trusted `length` on a field whose shape it did not
-  check. Held under attack and re-pinned: the one-shot `close`; the promise-identity guard on the `starting`
-  slot, now green-pinned for two aborted starts of one name under a cap of 1; `processGone`'s liveness read
-  against a stopped process, a recycled pid and a reload-adopted channel (nothing found — R5-05 is the
-  *diagnosis*, not the liveness read); `startFailureReported`; the `historyChannelLabel` refusal (the section
-  stays useful with the name refused); R4-02's digest rule and its `torn` wording; and the `+5_000` slack,
-  measured this time rather than spot-checked (worst legitimate answer 47 553 characters with a 481-character
-  agent dir, ≈52–54 KB with the maximum note pile-up, so it breaks only past ~800-character agent-dir paths). Held under attack and re-pinned: the interrupt design (both paths), the
-  group kill and its process-group exception, the cap arithmetic (a cap of 1, and failed starts releasing a
-  slot), the out-of-band note, the traceback budget, windowed truncation coordinates, the name encoder's
-  shape (property test), the history-file upgrade path, R3-02's argv, R3-06's prose, R3-09's two units, and
-  R3-10's attribution. Did not hold, found and fixed in pass 4: quoting a field only at its write (R4-01),
-  a file stem used as a channel key (R4-02), a start path that never reaches its own reporting (R4-03), a
-  fixed branch of a three-branch function (R4-04, R4-09), an env value reported after being ignored (R4-05),
-  an abort that is not threaded through the thing it cancels (R4-06), a rule that exists only in the error
-  that enforces it (R4-07), and a README claim the suite's `+5_000` slack had been hiding (R4-08). **Pass 5's
-  fixes landed all seven: R5-01, R5-02 and R5-03 changed behaviour, R5-04/05/06/07 changed answers.** Pass 6
-  attacks those fixes; the attack list is the last section of AUDIT's pass-5 write-up, and the thin places are
-  listed under "Added by pass 5's fixes, and weak on purpose" above.
+  Added by pass 6's fixes, and weak on purpose: `status: "running"` on an aborted joiner, a cancelled queued
+  call and a refused doomed join is the **least-wrong of five** — the enum has no "starting" and no way to
+  name "not a channel yet", `dead` is the value a model acts on by abandoning a channel that works, and the
+  creator of its own channel keeps `dead` because its cancel really did close it; a doomed creation still
+  holds its channel name and its capacity slot for its own length (a cold env build in the worst case), and
+  the refusal only says who can free it and to use another name; the mixed capacity case keeps pass 4's
+  singular-with-many vagueness and adds one clause; `ReplDetails.channel` is now optional, so anything that
+  reads it must handle its absence (only the tests do); and the F6-01 guard reads `channel.closed`, not
+  `processGone`, so in the window before node is told about a death a queued call can still be told its cell
+  was sent — it is, and it dies a moment later with an honest answer.
+- Passes alternate attack and fix: pass 2 attacked pass 1's fixes, pass 3 pass 2's, pass 4 the pass-3 fixes
+  (nine findings), pass 5 the pass-4 fixes (seven, three of them inside pass-4 fixes), pass 6 the pass-5 fixes
+  (three, and R6-01 is the third finding whose trigger is a session boundary). The shapes that keep recurring
+  are worth knowing: a rule that exists only in prose, a value read after an await, a field reused from
+  another answer's shape, a bound applied only where the value is written, and a signal not threaded into the
+  thing it cancels. Every R-nn has its write-up in AUDIT — do not re-derive them. Pass 7 attacks the pass-6
+  fixes; the thin places are under "Added by pass 6's fixes, and weak on purpose" below and in AUDIT's
+  pass-6 handoff.
 - Mutation testing is a tool now: `scripts/mutation-audit.sh`, ~90 lines, takes a label substring
-  (`bash scripts/mutation-audit.sh R3-0`); the full list is 66 mutations and **~50 minutes** (it is dominated
+  (`bash scripts/mutation-audit.sh R3-0`); the full list is **77 mutations and ~80 minutes** (it is dominated
   by the lifecycle/resilience files, which are ~45 s each, and each mutation runs one baseline plus one
   mutated run of its file). It restores the mutated file
   from a copy taken before the break — **not** with `git checkout`, which threw away uncommitted work — and a
@@ -204,8 +207,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   red on purpose — and it refuses to apply an anchor that does not typecheck. Pass 5's final run:
   **66 mutations, every anchor matching, 64 die, the two survivors the accepted ones** (`flushLoose`'s
   `lateWrite`→`write`, `failure()`'s status choice). Pass 6 (tester) re-ran only the anchor check — all 66
-  still match after its test-only changes — and left the ~50-minute full run to the pass-6 fixer, who owes
-  it plus a mutation for whatever R6-01's fix turns out to be. Traps learned the hard way, still true: a multi-line anchor must be **one** single-quoted
+  still match after its test-only changes — **Pass 6's fixer ran the 77: 75 died, the same two survived, and two of its own eleven anchors were first rejected by the typecheck** — a replacement that dropped a closing backtick (five TS1005s), and `if (false && x)`, which breaks the narrowing the `if (!x) throw` above it establishes and reports an unrelated TS18048. Neuter a condition with a non-constant false (`x && this.maxChannels < 0`), keep every quote the anchor carried, and remember a rejected mutation is not counted in the total. Traps learned the hard way, still true: a multi-line anchor must be **one** single-quoted
   bash argument (a missing closing quote there swallows the following `run_mutation` lines and the failure
   only shows up as `bash -n` complaining), so run `bash -n scripts/mutation-audit.sh` and
   `ANCHORS_ONLY=1 …` before the long run; a mutation whose *testspec* names the wrong test file reads as a
@@ -247,7 +249,14 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   the prompt section (shape-checked `definitions`, and an unreadable record prints as one line saying so);
   every log path an answer sends the model to is `existsSync`-checked at the answer (R5-04, and the settled
   `bg_stop` branch); the busy `bg_stop` answer quotes the process-table state when it is `T`/`t`/`D`/`Z` and
-  only then drops the "blocks signals" guess (R5-05); and `bg_wait`'s listing never contradicts its own
+  only then drops the "blocks signals" guess (R5-05); `bg_wait`'s listing never contradicts its own
+  summary (R5-07); a creation marked doomed at `quit()` is refused to joiners, in its own sentence, and
+  the name is free once it answers its own caller (R6-01); an aborted joiner and a cancelled queued call
+  say `status: "running"`, a creator says `dead`, and the two branches are pinned apart (R6-02); a
+  `bg_stop` for an unknown id claims no channel at all, and a listing whose tasks span two channels
+  claims none for itself (R6-03); a queued call whose channel went says "nothing was sent", and a call
+  that is both cancelled and too late gets that answer rather than one claiming the channel kept its
+  state (F6-01); and
   summary (R5-07).
 - Three rules that must not change: a timeout never kills a cell, the daemon never uses
   `asyncio.run()`, and a test is never weakened to make a fix pass — argue it in AUDIT.md instead. Never
@@ -265,7 +274,8 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   file's *contents* — the cold marker absent, the hot one present — so the case proving it ran is pinned too.
   Pass 5's fixes also added assertions to one holding test (the aborted joiner must not claim it freed a slot:
   `not.toMatch(/free again|its daemon/)`), which is an addition, not a change. Pass 6 (tester) changed no
-  assertion anywhere and added three tests of its own.
+  assertion anywhere and added three tests of its own; pass 6's fixer changed no test at all (the three
+  holding tests went green on the product change alone) and added seven.
 - **Housekeeping the suite never does:** `/tmp/replmode-agent-*` dirs from failed/aborted test runs and
   probe scripts accumulate (pass 6 cleared 119 of them plus a 1.1 GB stray venv `/tmp/scratch-env`); they
   are disposable — `find /tmp -maxdepth 1 -name 'replmode-agent-*' -mmin +30 -delete`. The real Python env

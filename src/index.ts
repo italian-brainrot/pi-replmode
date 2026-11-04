@@ -9,7 +9,15 @@
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ChannelBusyError } from "./channel.ts";
-import { DEFAULT_BG_WAIT_TIMEOUT_SEC, getManager, type ReplResult, type RunParams, resolveTimeout, type TaskStatus } from "./manager.ts";
+import {
+  ChannelNamedError,
+  DEFAULT_BG_WAIT_TIMEOUT_SEC,
+  getManager,
+  type ReplResult,
+  type RunParams,
+  resolveTimeout,
+  type TaskStatus,
+} from "./manager.ts";
 import { historyChannelLabel, renderSection, SECTION_NAME } from "./prompt.ts";
 
 const RUN_DESCRIPTION =
@@ -140,7 +148,9 @@ export default function (pi: ExtensionAPI): void {
       try {
         return await manager.bgWait(timeoutSec, signal);
       } catch (error) {
-        return failure(error, "main");
+        // No channel to name: a `bg_wait` refusal is about the task registry, not about a channel, and
+        // the `"main"` this used to pass became a field claiming one (R6-03).
+        return failure(error);
       }
     },
   });
@@ -160,7 +170,9 @@ export default function (pi: ExtensionAPI): void {
       try {
         return await manager.bgStop(taskId, reason, kill === true);
       } catch (error) {
-        return failure(error, "main");
+        // The answer's own channel comes from the error when there is one to name (R6-03); `bg_stop` is
+        // called with a task id and cannot know a channel in advance.
+        return failure(error);
       }
     },
   });
@@ -205,17 +217,29 @@ export default function (pi: ExtensionAPI): void {
 }
 
 /** A thrown error becomes a tool error rather than a pi-level crash. */
-function failure(error: unknown, channel: string): ReplResult {
+function failure(error: unknown, channel?: string): ReplResult {
   const text = error instanceof Error ? error.message : String(error);
   // A status from the enum the tool declares, and the same one in both views of the result: a busy
   // channel is `running`, and every other refusal here is a call that never got a live channel. The
   // `"error"` this used to put in `structuredContent` is not a status at all, and contradicted
   // `details.status` in the same object (R2-05).
   const status: TaskStatus = error instanceof ChannelBusyError ? "running" : "dead";
+  // An error that knows which channel its own sentence is about says so, and an error that knows it is
+  // about no channel at all leaves the field out — the `"main"` this used to fill in for `bg_stop` and
+  // `bg_wait` named a channel no part of the answer was about (R6-03).
+  const named = error instanceof ChannelNamedError ? error.channel : channel;
+  if (named === undefined) {
+    return {
+      content: [{ type: "text", text }],
+      details: { status },
+      structuredContent: { status, error: text },
+      isError: true,
+    };
+  }
   return {
     content: [{ type: "text", text }],
-    details: { channel, status },
-    structuredContent: { status, channel, error: text },
+    details: { channel: named, status },
+    structuredContent: { status, channel: named, error: text },
     isError: true,
   };
 }

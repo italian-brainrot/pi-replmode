@@ -283,6 +283,22 @@ describe("killing a channel", () => {
     ).toBe("r-dropfield");
   });
 
+  it("R6-03: and an id this process has never heard of claims no channel at all", async () => {
+    // The other branch of the same answer. There is no channel in "unknown task: repl-… tasks are tracked
+    // per pi process and pruned after 3 days", and the tool wrapper still filled `channel` with `"main"`
+    // in both structured views — so the result reported that a channel called "main" was dead, for a call
+    // that never named one.
+    const again = await bgStop("repl-nosuchid");
+    const shown = text(again);
+    expect(again.isError, `a stop for an id nothing ever backgrounded was not an error: ${shown}`).toBe(true);
+    expect(shown, `the answer does not say it has never heard of that id: ${shown}`).toContain("unknown task");
+    expect(
+      again.details?.channel,
+      `the answer is about no channel and details names one: ${JSON.stringify(again.details)} — ${shown}`,
+    ).toBeUndefined();
+    expect(again.structuredContent?.channel, `and so does structuredContent: ${JSON.stringify(again.structuredContent)}`).toBeUndefined();
+  });
+
   it("R1-10: takes the processes that its cell started down with it", async () => {
     // The escalation the model is offered when a task will not stop: `kill: true` says it ends
     // every cell in the channel. The daemon exits on the shutdown frame, so the group-kill
