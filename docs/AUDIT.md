@@ -3635,6 +3635,13 @@ their descriptions.
    not `forceSystemPrompt`. With only `forceSystemPrompt` set, pi renders no sections at all, so the
    guidelines this extension appends are computed and thrown away harmlessly. Worth confirming, not worth
    a guard, unless a run shows otherwise.
-5. **The pi version moved.** The smoke ran against installed pi **1.5.0**; `node_modules` pins **1.4.0**
-   for types. `customPrompt`/`promptGuidelines`/`sections` behave the same in both as far as the tests and
-   the smoke can see.
+5. **`buildRules` dedupes, and the order is pi's.** pi's rule list is built from the active tools'
+   `toolGuidelines` and then `options.promptGuidelines`, each entry trimmed and added only once (a `seen`
+   set), rendered as `- <rule>`. So this extension cannot make the same bullet appear twice, and cannot
+   put its bullets before pi's — which is fine for a listing, but does mean a bullet that happens to equal
+   one another extension wrote is silently merged. If a future finding is about a sentence not appearing,
+   check for that collision before blaming the handler.
+6. **The types now match the runtime.** `node_modules` pins pi **1.5.0**, which is the pi on this machine
+   and the one `scripts/smoke-prompt-surface.sh` ran against; the bump was checked by reading 1.5.0's
+   `system-prompt.js` (`customPrompt` still replaces the whole prompt body — no `preamble`, `tools`,
+   `rules` or `docs` — and `buildRules` is unchanged) and by the suite going green on it untouched.
