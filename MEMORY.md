@@ -32,7 +32,11 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   (pass 6 fixes)", §"Pass 6's mutations", §"Design change — 2026-11-05" and §"Handoff to pass 7 (tester)"
   for the attack list. Gate this leaves: `tsc`/`biome` green, **226 vitest — 18 files, 0 failing**, **47
   pytest**, `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **79 anchors match**, and the **full sweep
-  re-run on the changed tree: 79 mutations, 77 die, the 2 survivors the accepted ones**. Pass 6's fixer changed no
+  re-run on the changed tree: 79 mutations, 77 die, the 2 survivors the accepted ones**. The pi
+  devDependencies moved to **1.5.0** with the change, so the types describe the runtime the smoke ran
+  against; 1.5.0's `system-prompt.js` was read to confirm `customPrompt` still replaces the whole prompt
+  body and `buildRules` still appends `promptGuidelines` after the active tools' guidelines, deduped by
+  trimmed text (a bullet equal to another extension's is merged, never doubled). Pass 6's fixer changed no
   test assertion and added seven tests; R6-01 added five mutations, R6-02 two, R6-03 three, F6-01 one.
 - What pass 6's findings established (mechanisms and measurements are in AUDIT): **a join is not an owner,
   and it is not an epoch either** — `getChannel` joined whatever was in `starting` whichever session started
