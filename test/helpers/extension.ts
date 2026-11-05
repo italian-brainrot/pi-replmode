@@ -198,6 +198,50 @@ export async function loadExtension(options: LoadOptions = {}): Promise<LoadedEx
 
 export const repoRoot = resolve(import.meta.dirname, "..", "..");
 
+/**
+ * The prompt options pi hands a `before_agent_start` handler, filled the way its own
+ * `normalizeBuildSystemPromptOptions` fills them. Tests assert on these fields because they are the only
+ * prompt surface an extension is allowed to touch: pi renders `preamble`, `tools` and `rules` (the last
+ * one from `toolGuidelines` and `promptGuidelines`) itself, and leaves all three out when `customPrompt`
+ * is set — which is what a `SYSTEM.md` in the agent dir or the project, or `--system-prompt`, does.
+ */
+export function promptOptions(overrides: Record<string, unknown> = {}): any {
+  return {
+    cwd: "/test",
+    customPrompt: undefined,
+    forceSystemPrompt: undefined,
+    selectedTools: ["run", "bg_wait", "bg_stop"],
+    hiddenTools: [],
+    toolSnippets: {},
+    toolGuidelines: {},
+    promptGuidelines: [],
+    appendSystemPrompt: "",
+    sections: {},
+    contextFiles: [],
+    skills: [],
+    ...overrides,
+  };
+}
+
+/** Emit `before_agent_start` and hand back the prompt options as the extension left them. */
+export async function emitPrompt(ext: LoadedExtension, overrides: Record<string, unknown> = {}): Promise<any> {
+  const options = promptOptions(overrides);
+  await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: options });
+  return options;
+}
+
+/**
+ * Everything this extension put in the prompt for this turn, as one text: the guideline bullets it
+ * appended, plus anything it wrote into `sections` (which it must never do — a test pins that it is
+ * empty, and reading it here is what makes that test able to fail).
+ */
+export async function promptText(ext: LoadedExtension, overrides: Record<string, unknown> = {}): Promise<string> {
+  const options = await emitPrompt(ext, overrides);
+  const guidelines: string[] = Array.isArray(options.promptGuidelines) ? options.promptGuidelines : [];
+  const sections: unknown[] = Object.values(options.sections ?? {});
+  return [...guidelines, ...sections.map((text) => String(text))].join("\n");
+}
+
 export function text(result: { content: Array<{ type: string; text?: string }> }): string {
   return result.content
     .filter((part) => part.type === "text")

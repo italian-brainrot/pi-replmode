@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MAX_OUTPUT_CHARS } from "../src/format.ts";
 import { channelFileStem } from "../src/names.ts";
-import { type LoadedExtension, loadExtension, text } from "./helpers/extension.ts";
+import { emitPrompt, type LoadedExtension, loadExtension, promptText, text } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
 
@@ -71,14 +71,12 @@ describe("text the daemon chooses", () => {
 
   it("R3-01: and those names do not end up in the prompt the next session starts with", async () => {
     // Whatever a cell binds is recorded in the channel's history (up to 20 names per record) and quoted
-    // back at the model as a prompt section by the next session. The bound that matters is against the
-    // section the same channel produces when it binds nothing remarkable: one cell's identifier lengths
+    // back at the model in the guidelines of the next session. The bound that matters is against the
+    // listing the same channel produces when it binds nothing remarkable: one cell's identifier lengths
     // must not be able to move it.
     const measure = async () => {
-      const sections: Record<string, string> = {};
       await ext.emit({ type: "session_start", sessionId: `l-hint-${Date.now()}-${Math.random()}` }, { hasUI: true });
-      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
-      return sections.replmode ?? "";
+      return promptText(ext);
     };
 
     // A channel that has run out of daemon is the one whose last cell gets quoted, so each measurement
@@ -97,10 +95,10 @@ describe("text the daemon chooses", () => {
     await lastCell(`for n in ${JSON.stringify(names)}:\n    exec(n + " = 1")`);
 
     const after = await measure();
-    expect(after, "the section no longer names what a cell defined").toContain("defined:");
+    expect(after, "the listing no longer names what a cell defined").toContain("defined:");
     expect(
       after.length,
-      `the prompt section grew from ${baseline.length} to ${after.length} characters because of the names one cell bound`,
+      `the prompt listing grew from ${baseline.length} to ${after.length} characters because of the names one cell bound`,
     ).toBeLessThan(baseline.length + 2_000);
   });
 
@@ -131,7 +129,7 @@ describe("text the daemon chooses", () => {
   });
 
   it("F3-03: and the channel's history file does not keep the names whole either", async () => {
-    // The result and the prompt section are two copies of what a cell bound; the history file is the copy
+    // The result and the prompt listing are two copies of what a cell bound; the history file is the copy
     // that outlives the session and is re-read by every later one. Bounding it where it is written is what
     // keeps a 3001-character identifier from being carried around for ever, whatever later code quotes.
     const names = Array.from({ length: 20 }, (_, index) => `z`.repeat(3000) + index);
@@ -145,15 +143,13 @@ describe("text the daemon chooses", () => {
     expect(recorded.length, `the history file for one channel is ${recorded.length} characters`).toBeLessThan(20_000);
   });
 
-  it("F3-04: and the prompt section bounds a name it is quoted from any history file", async () => {
+  it("F3-04: and the prompt listing bounds a name it is quoted from any history file", async () => {
     // The other half of the same bound: a history file may have been written by a build that did not clip
-    // (or by anything else at all), so the section has to shorten what it quotes rather than trust the
+    // (or by anything else at all), so the listing has to shorten what it quotes rather than trust the
     // record. This is the copy that is re-sent on every request of every later session.
     const measure = async () => {
-      const sections: Record<string, string> = {};
       await ext.emit({ type: "session_start", sessionId: `f3-04-${Date.now()}-${Math.random()}` }, { hasUI: true });
-      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
-      return sections.replmode ?? "";
+      return promptText(ext);
     };
 
     const before = await measure();
@@ -172,26 +168,28 @@ describe("text the daemon chooses", () => {
     writeFileSync(join(dir, "h-hintq.jsonl"), `${JSON.stringify(record)}\n`, "utf8");
 
     const after = await measure();
-    expect(after, "the section no longer names what a cell defined").toContain("defined:");
-    expect(after, "a remembered 3000-character name is quoted whole in the prompt section").not.toContain("q".repeat(300));
-    expect(after.length, `the prompt section grew from ${before.length} to ${after.length} over one remembered cell`).toBeLessThan(
+    expect(after, "the listing no longer names what a cell defined").toContain("defined:");
+    expect(after, "a remembered 3000-character name is quoted whole in the prompt listing").not.toContain("q".repeat(300));
+    expect(after.length, `the prompt listing grew from ${before.length} to ${after.length} over one remembered cell`).toBeLessThan(
       before.length + 1_000,
     );
     expect(readdirSync(dir), "the hand-written history file was rewritten by the way").toContain("h-hintq.jsonl");
   });
 
-  it("R4-01: and the section bounds the channel *name* it quotes from a history file", async () => {
+  it("R4-01: and the listing bounds the channel *name* it quotes from a history file", async () => {
     // F3-04 clipped the remembered *definitions* on the read path, because a history file may have been
     // written by a build that did not clip. The channel name is the other field of that same record, and
-    // it is bounded only on the write side (F3-02's refusal, added in the same pass): `lostChannelsLines`
-    // pastes `note.channel` raw. A file written before that refusal — or by anything else, which F3-04
+    // it is bounded only on the write side (F3-02's refusal, added in the same pass): the note pastes
+    // `note.channel` raw. A file written before that refusal — or by anything else, which F3-04
     // already assumes — still sizes the prompt of every later session and the session_start notification
     // that lists the same names.
     const measure = async () => {
-      const sections: Record<string, string> = {};
       await ext.emit({ type: "session_start", sessionId: `r4-01-${Date.now()}-${Math.random()}` }, { hasUI: true });
-      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
-      return { section: sections.replmode ?? "", notes: ext.notified.map((note) => note.message).join("\n") };
+      const options = await emitPrompt(ext);
+      return {
+        listing: (options.promptGuidelines as string[]).join("\n"),
+        notes: ext.notified.map((note) => note.message).join("\n"),
+      };
     };
 
     const before = await measure();
@@ -211,34 +209,31 @@ describe("text the daemon chooses", () => {
     );
 
     const after = await measure();
-    expect(after.section, "a remembered channel is no longer reported as lost").toContain("answer = 42");
-    expect(after.section, "a 3000-character remembered channel name is quoted whole in the prompt section").not.toContain("z".repeat(300));
+    expect(after.listing, "a remembered channel is no longer reported as lost").toContain("answer = 42");
+    expect(after.listing, "a 3000-character remembered channel name is quoted whole in the prompt listing").not.toContain("z".repeat(300));
     expect(
-      after.section.length,
-      `the prompt section grew from ${before.section.length} to ${after.section.length} characters over one remembered name`,
-    ).toBeLessThan(before.section.length + 1_000);
+      after.listing.length,
+      `the prompt listing grew from ${before.listing.length} to ${after.listing.length} characters over one remembered name`,
+    ).toBeLessThan(before.listing.length + 1_000);
     expect(after.notes, "the restart notification quotes the whole remembered name as well").not.toContain("z".repeat(300));
   });
 
-  it("R4-01: and a legal channel name cannot reshape the section it is quoted into", async () => {
+  it("R4-01: and a legal channel name cannot reshape the listing it is quoted into", async () => {
     // The other half of the same missing clip, reachable today with no foreign file involved: a channel
     // name may contain a newline (`run` only refuses names over 200 characters), the history record keeps
-    // it whole, and the section is a list of one-line notes that the name is pasted into raw. One cell
-    // can put a line of its own choosing into the system prompt of every later session.
+    // it whole, and each note is one guideline bullet that the name is pasted into raw. One cell
+    // can put a bullet of its own choosing into the system prompt of every later session.
     const measure = async () => {
-      const sections: Record<string, string> = {};
       await ext.emit({ type: "session_start", sessionId: `r4-01b-${Date.now()}-${Math.random()}` }, { hasUI: true });
-      await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
-      return sections.replmode ?? "";
+      return promptText(ext);
     };
 
-    // Measured twice, because by now this file has killed several channels of its own and the section
-    // already carries one note line for each: what must not change is the number *this* channel adds.
-    // "Note line" means a line of the note list as the section writes it — indented, and naming the cell.
-    // A name that carries a newline breaks its own note in half, and the half after the break is not an
-    // indented line, so this counts 0 for that channel and the delta fails.
-    const notesIn = (section: string): number =>
-      section.split("\n").filter((line) => line.startsWith("  ") && line.includes("last cell")).length;
+    // Measured twice, because by now this file has killed several channels of its own and the listing
+    // already carries one bullet for each: what must not change is the number *this* channel adds. A
+    // bullet is one entry of the guidelines list, so a name that carries a newline cannot split it — but
+    // a name that carried a quote of its own could try to start a second bullet, and the count is what
+    // catches that.
+    const notesIn = (listing: string): number => listing.split("\n").filter((line) => line.includes("last cell")).length;
     const before = notesIn(await measure());
 
     // A channel that is gone by the next session boundary, so its last cell is the one that gets quoted.
@@ -248,11 +243,11 @@ describe("text the daemon chooses", () => {
 
     const shown = await measure();
     expect(shown, "the lost channel is no longer reported at all").toContain("INJECTED_MARKER");
-    expect(shown, `a channel name put a second line into the section:\n${shown.split("\n").slice(-6).join("\n")}`).not.toContain(
+    expect(shown, `a channel name put a second line into the listing:\n${shown.split("\n").slice(-6).join("\n")}`).not.toContain(
       "- and a line the model wrote",
     );
     const added = notesIn(shown) - before;
-    expect(added, `one lost channel added ${added} note lines to the section, where it is allowed only one`).toBe(1);
+    expect(added, `one lost channel added ${added} note bullets to the listing, where it is allowed only one`).toBe(1);
   });
 });
 

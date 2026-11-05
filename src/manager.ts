@@ -440,7 +440,7 @@ export class ReplManager {
     const channelName = (params.channel ?? "main").trim() || "main";
     if (channelName.length > MAX_CHANNEL_NAME_CHARS) {
       // One long name here is not just one long answer: it goes into the channel's history file and from
-      // there into the prompt section of every later session, where it is paid for on every request.
+      // there into the prompt guidelines of every later session, where it is paid for on every request.
       // The wording has to state the boundary the code enforces — a name of exactly the limit is
       // accepted, so "keep it under 200" forbids a call the tool would have made (R4-07) — and state the
       // real reason, which is that the name comes back to the model. It is not a file-name limit:

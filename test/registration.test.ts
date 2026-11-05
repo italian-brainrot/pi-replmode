@@ -2,11 +2,13 @@
  * What the extension registers, and what it refuses to do.
  *
  * Displacing pi's built-in tools is the user's setting, not this extension's business, so the tool
- * set has to stay exactly three names and the runtime API calls exactly two.
+ * set has to stay exactly three names and the runtime API calls exactly two. The same goes for the
+ * system prompt: the extension contributes through the tool declarations and pi's guidelines list, and
+ * writes no prompt section of its own.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type LoadedExtension, loadExtension } from "./helpers/extension.ts";
+import { emitPrompt, type LoadedExtension, loadExtension } from "./helpers/extension.ts";
 
 let ext: LoadedExtension;
 
@@ -40,7 +42,9 @@ describe("registration", () => {
     const run = ext.tools.get("run")!;
     expect(run.description).toContain("stateful");
     expect(run.description).toContain("50000");
-    expect(run.promptSnippet).toBeTruthy();
+    for (const name of ["run", "bg_wait", "bg_stop"]) {
+      expect(ext.tools.get(name)!.promptSnippet, name).toBeTruthy();
+    }
     expect(run.promptGuidelines?.length).toBeGreaterThan(0);
   });
 
@@ -58,26 +62,31 @@ describe("registration", () => {
   });
 });
 
-describe("prompt section", () => {
-  it("is offered under its own tag and explains the contract", async () => {
-    const sections: Record<string, string> = {};
-    await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
-    expect(sections.replmode).toBeTruthy();
-    expect(sections.replmode).toContain("stateful IPython REPL");
-    expect(sections.replmode).toContain("bg_stop");
-    expect(sections.replmode).toContain("timeout");
-    expect((sections.replmode ?? "").split("\n").length).toBeLessThan(40);
+describe("the prompt it asks pi for", () => {
+  it("uses pi's own slots and writes no section of its own", async () => {
+    // A `<replmode>` section was a block the extension put into the system prompt under a tag of its own
+    // choosing, which pi then wrapped and replayed like any of its own sections. It is gone: the tool
+    // declarations, the tools' `promptGuidelines`, and the session's own guidelines are the whole surface.
+    const options = await emitPrompt(ext);
+    expect(options.sections).toEqual({});
   });
 
-  it("does not change between runs of one session, so the prompt cache survives", async () => {
-    const first: Record<string, string> = {};
-    const second: Record<string, string> = {};
-    await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections: first } });
-    await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections: second } });
-    expect(second.replmode).toBe(first.replmode);
+  it("adds nothing to a prompt the user overrode with SYSTEM.md or --system-prompt", async () => {
+    // `customPrompt` is how pi carries that. pi renders no preamble, tools, or rules section then, so the
+    // snippets and guidelines registered on the tools are already out of it, and the extension's own
+    // bullets stay out too.
+    const options = await emitPrompt(ext, { customPrompt: "Say what I wrote and nothing else." });
+    expect(options.promptGuidelines).toEqual([]);
+    expect(options.sections).toEqual({});
   });
 
-  it("survives a runtime that offers no sections at all", async () => {
+  it("is the same on every turn of one session, so the prompt cache survives", async () => {
+    const first = await emitPrompt(ext);
+    const second = await emitPrompt(ext);
+    expect(second.promptGuidelines).toEqual(first.promptGuidelines);
+  });
+
+  it("survives a runtime that offers no prompt options at all", async () => {
     await expect(ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: undefined })).resolves.toBeDefined();
   });
 });

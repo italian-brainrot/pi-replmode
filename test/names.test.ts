@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { getManager } from "../src/manager.ts";
 import { channelFileStem } from "../src/names.ts";
-import { type LoadedExtension, loadExtension, makeTempDir, text } from "./helpers/extension.ts";
+import { type LoadedExtension, loadExtension, makeTempDir, promptText, text } from "./helpers/extension.ts";
 
 const agent = makeTempDir("replmode-names-");
 
@@ -25,10 +25,9 @@ async function fresh(): Promise<LoadedExtension> {
   return loadExtension({ agentDir: agent.path, env: { PI_REPLMODE_MAX_CHANNELS: "12" } });
 }
 
-async function section(ext: LoadedExtension): Promise<string> {
-  const sections: Record<string, string> = {};
-  await ext.emit({ type: "before_agent_start", systemPrompt: "", systemPromptOptions: { sections } });
-  return sections.replmode ?? "";
+/** What this extension put in the prompt for this turn: pi's guidelines, joined. */
+async function listing(ext: LoadedExtension): Promise<string> {
+  return promptText(ext);
 }
 
 describe("a channel whose name is not already a file name", () => {
@@ -37,10 +36,10 @@ describe("a channel whose name is not already a file name", () => {
     const started = await ext.callTool("run", { code: "prepared = load_data()\nprint('working in it')", channel: "n-slash/live" });
     expect(text(started)).toContain("[new channel");
 
-    // A session boundary inside the same process (`/new`, `/resume`) re-renders the section. The
+    // A session boundary inside the same process (`/new`, `/resume`) re-reads history. The
     // daemon is still running and `prepared` is still bound.
     await ext.emit({ type: "session_start", sessionId: "n-session" }, { hasUI: true });
-    const shown = await section(ext);
+    const shown = await listing(ext);
     expect(shown, `a live channel was listed among the lost ones:\n${shown.split("\n").slice(-6).join("\n")}`).not.toContain("n-slash");
     expect(ext.notified.map((note) => note.message).join("\n"), "the notification lied about a live channel").not.toContain("n-slash");
 
@@ -142,7 +141,7 @@ describe("the file names a channel name becomes", () => {
     // starts later is told about one of the two channels and never about the other.
     const second = await fresh();
     await second.emit({ type: "session_start", sessionId: "r3-own-session" }, { hasUI: true });
-    const shown = await section(second);
+    const shown = await listing(second);
     expect(shown, `the note does not mention "r3-own/x":\n${shown.split("\n").slice(-8).join("\n")}`).toContain("r3-own/x");
     expect(shown).toContain(crafted);
 
@@ -294,7 +293,7 @@ describe("a channel name that looks like a command-line option", () => {
     );
 
     await ext.emit({ type: "session_start", sessionId: "r4-stem" }, { hasUI: true });
-    const shown = await section(ext);
+    const shown = await listing(ext);
     expect(shown, `a live channel was reported lost under its file stem:\n${shown.split("\n").slice(-6).join("\n")}`).not.toContain(stem);
     expect(ext.notified.map((note) => note.message).join("\n"), "the notification named a channel that is running").not.toContain(stem);
 
@@ -310,7 +309,7 @@ describe("a channel name that looks like a command-line option", () => {
 describe("a channel name that is not a sane length", () => {
   it("F3-02: is refused, because the name is kept and quoted for ever", async () => {
     // Fixer hardening in the class of R3-01: a channel name is not only a file name, it is pasted into
-    // every result about that channel and, through the history file, into the prompt section of every
+    // every result about that channel and, through the history file, into the prompt guidelines of every
     // later session — where it is paid for on every request. Refusing is cheaper than quoting it.
     const ext = await fresh();
     const huge = `n${"z".repeat(500)}`;
@@ -320,8 +319,8 @@ describe("a channel name that is not a sane length", () => {
 
     // Nothing about that name was written anywhere a later session would have to carry.
     await ext.emit({ type: "session_start", sessionId: "f3-02-name" }, { hasUI: true });
-    const shown = await section(ext);
-    expect(shown, "a refused channel name reached the prompt section").not.toContain("zzzz");
+    const shown = await listing(ext);
+    expect(shown, "a refused channel name reached the prompt listing").not.toContain("zzzz");
 
     // A name that is merely long is still fine — this is a guard, not a rename of the feature.
     const long = `n${"w".repeat(150)}`;
@@ -354,7 +353,7 @@ describe("a history file written before channel names got digests", () => {
 
     const ext = await fresh();
     await ext.emit({ type: "session_start", sessionId: "r3-old-style" }, { hasUI: true });
-    const shown = await section(ext);
+    const shown = await listing(ext);
     expect(shown, "a channel remembered under the old file name is not reported as lost").toContain("old/way");
     expect(shown).toContain("legacy_marker");
 
@@ -401,7 +400,7 @@ describe("two channels whose names sanitise to one file", () => {
     const names = readdirSync(join(agent.path, "replmode/history"));
     const second = await fresh();
     await second.emit({ type: "session_start", sessionId: "n-session-2" }, { hasUI: true });
-    const shown = await section(second);
+    const shown = await listing(second);
 
     // Both channels ran, both are gone now, and the model only ever knew them by these names.
     expect(shown).toContain("n-coll_x");
