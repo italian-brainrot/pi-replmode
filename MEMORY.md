@@ -127,7 +127,12 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   (the identity guard, green-pinned in pass 5), and a channel that is `ready` is never timed out — so a daemon
   the manager loses track of stays alive forever, which is how R5-02 was measured.
 - Real-`pi` smoke: the DEV.md prompt, a dash-named channel, `os._exit(3)`, and a `bg_stop {kill: true}`
-  (its answer ends with `Log: <path>`). Pass 5's fixes added two checks that cost one run each: ask the
+  (its answer ends with `Log: <path>`). For anything about the **prompt**, `bash
+  scripts/smoke-prompt-surface.sh` — it reads the system message out of the session file, which is the only
+  way to see what pi actually rendered (the sections are `preamble tools rules docs project_context skills
+  cwd addendum …`, and with `customPrompt` set `tools`/`rules`/`docs` are simply absent), and its greps must
+  skip `project_context`, because pi quotes AGENTS.md, which mentions pi-replmode and "stateful IPython
+  REPL". Pass 5's fixes added two checks that cost one run each: ask the
   model to quote the `channel` parameter description verbatim (that is how a wrong sentence in the schema
   is proven to be believed), and drop a hand-written `~/.pi/agent/replmode/history/<name>.jsonl` with
   `"definitions": "df"` and look for `Extension error` — at HEAD it printed twice and the section vanished.
@@ -296,9 +301,10 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   assertion anywhere and added three tests of its own; pass 6's fixer changed no test at all (the three
   holding tests went green on the product change alone) and added seven.
 - **Housekeeping the suite never does:** `/tmp/replmode-agent-*` dirs from failed/aborted test runs and
-  probe scripts accumulate (pass 6 cleared 119 of them plus a 1.1 GB stray venv `/tmp/scratch-env`); they
-  are disposable — `find /tmp -maxdepth 1 -name 'replmode-agent-*' -mmin +30 -delete`. The real Python env
-  is in `~/.cache/pi-replmode/`, never in `/tmp`. And vitest 5 has no `--reporter=basic` (startup error).
+  probe scripts accumulate (pass 6 cleared 119 of them plus a 1.1 GB stray venv `/tmp/scratch-env`), and so
+  does the agent dir a real-pi smoke leaves behind — `bash scripts/clean-tmp.sh` now takes
+  `/tmp/pi-replmode-*-smoke` too. The real Python env is in `~/.cache/pi-replmode/`, never in `/tmp`. And
+  vitest 5 has no `--reporter=basic` (startup error).
 - Tests drive real processes only; where a daemon must misbehave (never ready, dies after answering,
   closes its protocol fd, dies on SIGINT, writes its complaint to the capture stream, emits a `fatal`
   frame) `test/lifecycle.test.ts` swaps in a **stub interpreter** via `PI_REPLMODE_ENV_DIR` — a dir with
