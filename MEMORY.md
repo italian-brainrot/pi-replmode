@@ -10,16 +10,30 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
 - Status: M1 (core) and M2 (channels, timeouts→background, bg_wait/bg_stop, reload re-adoption) are
   done and covered by real-process tests (pytest + vitest). M3 = display/images, `pi.read_image`,
   `pi.ask`, `pi.run_subagent` over a `call`/`call_reply` pump — not started.
+- **Prompt-surface rule (changed by the user on 2026-11-05, do not re-open):** the extension writes **no
+  system-prompt section** — never `options.sections[...]`. Behaviour goes in the tool and parameter
+  descriptions, guidance in each tool's `promptGuidelines`, and the one session-dynamic fact (channels an
+  earlier process left) as bullets appended to `options.promptGuidelines` in `before_agent_start`, which
+  the handler skips entirely when `options.customPrompt !== undefined` (a `SYSTEM.md` in the agent dir or
+  the project, or `--system-prompt` — pi then renders no `preamble`/`tools`/`rules`, so snippets and
+  guidelines are already out). No Python idioms in a description (`open(path).read()`, `subprocess.run`):
+  they teach nothing and shift the model's preferences. `prompt.ts` renders the listing only
+  (`lostChannelGuidelines`; `renderSection`/`SECTION_NAME` are gone), and every bound and guard on the
+  untrusted history record stayed. AUDIT §"Design change — 2026-11-05" has the write-up, the three new
+  mutations and the pass-7 attack list (including whether `rules` is the right slot for a state disclosure
+  and whether `/reload` re-sends the whole `rules` section). `bash scripts/smoke-prompt-surface.sh` checks
+  all of it against real pi by reading the session file's system sections.
 - Audit loop state: **pass 6 (fixer) is complete — R6-01, R6-02, R6-03 and pass 6's two unpinned
   measurements (F6-01 a queued call whose channel went, F6-02 the capacity refusal's uncancellable advice)
-  are fixed, and the three holding tests went green with not one line of them edited. Next is pass 7
-  (tester).** Read [docs/AUDIT.md](docs/AUDIT.md) §"Pass 6 fixes — 2026-11-02 (fixer)": per-fix write-ups
+  are fixed, and the three holding tests went green with not one line of them edited. Then the
+  prompt-surface change above landed (2026-11-05). Next is pass 7 (tester).** Read
+  [docs/AUDIT.md](docs/AUDIT.md) §"Pass 6 fixes — 2026-11-02 (fixer)": per-fix write-ups
   (including why R6-01 *refuses the join* instead of starting a second creation), §"Probed, and left alone
-  (pass 6 fixes)", §"Pass 6's mutations" and §"Handoff to pass 7 (tester)" for the attack list. Gate this
-  pass leaves: `tsc`/`biome` green, **218 vitest — 18 files, 0 failing** (two full runs), **47 pytest**,
-  `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **77 anchors match**, and the full sweep: **77
-  mutations, 75 die, the 2 survivors the accepted ones**. Pass 6's fixer changed no test assertion and added
-  seven tests; R6-01 added five mutations, R6-02 two, R6-03 three, F6-01 one.
+  (pass 6 fixes)", §"Pass 6's mutations", §"Design change — 2026-11-05" and §"Handoff to pass 7 (tester)"
+  for the attack list. Gate this leaves: `tsc`/`biome` green, **226 vitest — 18 files, 0 failing**, **47
+  pytest**, `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **79 anchors match**, and the **full sweep
+  re-run on the changed tree: 79 mutations, 77 die, the 2 survivors the accepted ones**. Pass 6's fixer changed no
+  test assertion and added seven tests; R6-01 added five mutations, R6-02 two, R6-03 three, F6-01 one.
 - What pass 6's findings established (mechanisms and measurements are in AUDIT): **a join is not an owner,
   and it is not an epoch either** — `getChannel` joined whatever was in `starting` whichever session started
   it, so a live session's call could be answered with a dead session's sentence, and its aborted sibling told
@@ -91,7 +105,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   answer just reported, while R4-09's accepted "no rows for killed tasks" stands (R5-07, fixed).
 - What pass 4's fixes established, one line each (write-ups in AUDIT): a model-facing field is bounded
   **where it is read**, not only where it is written — a history file may predate any bound, and no field of
-  a hand-written record may reshape the prompt section (`historyChannelLabel` refuses to print a name it
+  a hand-written record may reshape the prompt listing (`historyChannelLabel` refuses to print a name it
   cannot print); a file stem is never a channel key; a daemon that never reports `ready` is stopped and
   answered through the same `startFailureError()` as one that died; `bg_stop`'s three branches (stopped,
   settled, unknown id) each have their own wording and each is pinned; a task removed because its channel
@@ -138,7 +152,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
 - What pass 3 and its fixes established, so a future session does not re-derive it: the 50 000 promise now
   has to hold for *every copy* of a cell-chosen string, not just the capture and the traceback — the daemon
   note ring (each entry clipped to 500 characters at store time in `Channel.note`), the "defined by this
-  cell" note (25 names × 60), the history file (20 × 120), the prompt section's `definitionHint` (6 × 60,
+  cell" note (25 names × 60), the history file (20 × 120), the listing's `definitionHint` (6 × 60,
   bounded independently of the write because a history file may predate the bound), `ename` (200, also in
   the task listing), and the channel name itself (`run` refuses > 200: it lands in results, in the history
   file and in every later prompt). `details.definitions` stays raw on purpose.
@@ -158,7 +172,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   walking **is now pinned** (pass 5's fixes; the deterministic route is in AUDIT); `processGone` trusts the
   pid the host spawned and is Linux-specific in its zombie check (so is `signalDiagnosis`, which shares its
   state read and is handed the *daemon's* pid — a cell's child sitting in `T` is not diagnosed); the
-  200-character name rule is in the tool schema, not in the prompt section, and why the number is 200 is a
+  200-character name rule is in the tool schema, not in the prompt body, and why the number is 200 is a
   prompt-cost judgement the tests do not pin; the capacity refusal's "all N are busy" wording is still mixed
   when some names are starting; and **a joiner's cancel does not free a wedged creation** — only the call
   that is starting it can, and R5-01's fix says exactly that in the answer instead of implying otherwise.
@@ -167,8 +181,8 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   `bg_stop`), and that count comes from the process-wide `droppedTasks`, so after `/new` it can include the
   previous session's drops (the sentence says "tracked", not "this session", to stay true); the R5-04 answer
   still names a log it knows is gone, and says not-where rather than why; `session_start` does **not** catch
-  throws — the renderer is total instead, and `section = renderSection([])` before the notes is insurance no
-  test can reach, because nothing reachable can make it throw; the unreadable-record line names the channel
+  throws — the renderer is total instead (and since 2026-11-05 it renders guideline bullets, so a throw would
+  cost the listing for one turn rather than leave a stale section); the unreadable-record line names the channel
   but quotes no fields; and `signalDiagnosis` reads the state at answer time, so a process continued in the
   meantime gets the generic sentence. Pass 5 also probed and
   left alone: two daemons for one name can coexist for the length of a `close()` — measured at **4.5 s** for a
@@ -199,7 +213,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   fixes; the thin places are under "Added by pass 6's fixes, and weak on purpose" below and in AUDIT's
   pass-6 handoff.
 - Mutation testing is a tool now: `scripts/mutation-audit.sh`, ~90 lines, takes a label substring
-  (`bash scripts/mutation-audit.sh R3-0`); the full list is **77 mutations and ~80 minutes** (it is dominated
+  (`bash scripts/mutation-audit.sh R3-0`); the full list is **79 mutations and ~80 minutes** (it is dominated
   by the lifecycle/resilience files, which are ~45 s each, and each mutation runs one baseline plus one
   mutated run of its file). It restores the mutated file
   from a copy taken before the break — **not** with `git checkout`, which threw away uncommitted work — and a
@@ -251,7 +265,7 @@ Registers `run`, `bg_wait`, `bg_stop` only — it never touches the active tool 
   asks `processGone` before reusing a channel (F4-01, F4-02); a call that *joins* somebody else's channel
   creation waits through `untilAborted(…, joined=true)`, so its own cancel answers it promptly, and the two
   answers differ — the joiner held neither the daemon nor the slot (R5-01); one history record cannot delete
-  the prompt section (shape-checked `definitions`, and an unreadable record prints as one line saying so);
+  the prompt listing (shape-checked `definitions`, and an unreadable record prints as one bullet saying so);
   every log path an answer sends the model to is `existsSync`-checked at the answer (R5-04, and the settled
   `bg_stop` branch); the busy `bg_stop` answer quotes the process-table state when it is `T`/`t`/`D`/`Z` and
   only then drops the "blocks signals" guess (R5-05); `bg_wait`'s listing never contradicts its own

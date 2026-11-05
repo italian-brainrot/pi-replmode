@@ -45,7 +45,7 @@ scripts/py.*.mjs   pytest / env building (they import src/env.ts through jiti so
                    definition of where the environment lives)
 scripts/mutation-audit.sh  break one fixed defect at a time and see which tests notice — the
                    "is this fix actually pinned?" check, run it after a pass's fixes; it takes a label
-                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 77 mutations /
+                   filter (`bash scripts/mutation-audit.sh R3-0`), and the full list is 79 mutations /
                    ~80 minutes (it typechecks each mutation and re-runs a baseline per test file).
                    `ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` checks that every anchor still
                    matches the source and runs nothing: do that first, it takes seconds
@@ -53,6 +53,10 @@ scripts/clean-tmp.sh  delete the suite's scratch dirs under /tmp (agent dirs, cw
                    that failed and hand-written runs leave behind; safe, the real env is in ~/.cache
 scripts/smoke-abort-start.sh  the real-pi abort smoke: a pty, the interactive TUI, and the byte for Esc
                    (SIGINT to `pi -p` is a hard kill that runs no shutdown, so nothing else can reach this)
+scripts/smoke-prompt-surface.sh  three real pi runs against a throwaway agent dir, reading the system
+                   sections out of the session file: no `<replmode>` tag, the lost-channel listing inside
+                   pi's `rules`, and nothing from this extension in a prompt the user overrode with
+                   `SYSTEM.md` (costs three model calls; the session files stay for inspection)
 spikes/            the experiments that proved interrupt and formatter behaviour — read before M3
 ```
 
@@ -131,7 +135,7 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   dropped the closing backtick of a template literal, and neutering a guard with `if (false && x)` reported
   an unrelated `TS18048` because the constant `false` stops the narrowing an `if (!x) throw` above it
   establishes. Use a sub-condition that is false but not constant (`x && this.maxChannels < 0`).
-- **Real pi smoke**, which catches what neither suite does (registration, prompt section, real
+- **Real pi smoke**, which catches what neither suite does (registration, prompt surface, real
   harness): use a throwaway agent dir so the user's settings are untouched.
 
   ```bash
@@ -142,7 +146,7 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   PI_CODING_AGENT_DIR=/tmp/pi-smoke-agent pi --no-builtin-tools -p "Use the run tool twice: set answer = 6*7, then print(answer)."
   ```
 
-  It answers 42 when registration, the prompt section, and cross-call state all work. Two more prompts are
+  It answers 42 when registration, the prompt surface, and cross-call state all work. Two more prompts are
   worth running after anything that touches startup or death: a channel named `-smoke-dash` (a leading dash
   must not reach argparse as a separate token, and the definitions note should still be there), and
   `import os; os._exit(3)` followed by a second call on the same channel (the death reported, a fresh
@@ -205,6 +209,18 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   (R2-07); the header for pre-first-block bytes is a different one, because no cell had ended (R3-10). Do
   not "fix" any of it with per-exec capture pipes without reading the deadlock argument in
   `docs/AUDIT.md`.
+- **The system prompt is pi's, and the extension only fills pi's slots.** Behaviour → the tool and
+  parameter descriptions; guidance → each tool's `promptGuidelines`; the one session-dynamic fact (which
+  channels an earlier process left) → bullets appended to `options.promptGuidelines` in
+  `before_agent_start`. Never `options.sections[...]`: pi wraps those in a tag of their own name and keeps
+  them when the user overrides the prompt. `event.systemPromptOptions.customPrompt` is set by `SYSTEM.md`
+  (agent dir or `.pi/` in the project) and by `--system-prompt`, and pi then renders no `preamble` of its
+  own, no `tools` section and no `rules` — so snippets and guidelines are already out, and the handler
+  returns without touching anything. The extension's contract still reaches the model, because an active
+  tool is declared with its description and parameters whatever the prompt says. `bash
+  scripts/smoke-prompt-surface.sh` reads the rendered sections out of the session file and checks all of
+  it against real pi. Do not put Python idioms (`open(path).read()`, `subprocess.run`) in a description
+  either: they teach a model nothing it does not already know, and they shift its preferences.
 - **A channel name is three file names** — the daemon log, the history file, the IPython profile — and
   they must come from `names.ts`, the one place that keeps the mapping one-to-one. Naive sanitising puts
   `a/b` and `a_b` in one log, one history file and one sqlite profile; keying the "these channels are
@@ -215,11 +231,11 @@ spikes/            the experiments that proved interrupt and formatter behaviour
   nothing may feed a stem back into it; and the name travels as a daemon argument, where a leading `-`
   reads as an option, so it is passed as one token, `--channel=<name>` (R3-02). `run` also refuses names
   over 200 characters, because a channel name is quoted in results, in the history file and in every later
-  session's prompt section (F3-02).
+  session's prompt guidelines (F3-02).
 - **Anything the host pastes into an answer is part of the size of the answer.** The 50 000 budget covers
   the capture and the traceback, and most of what is left is text a *cell* (or a caller) chooses: the
   daemon's `log` frames, reachable from a cell via a `signal` handler's `__name__`; the names a cell bound,
-  which land in the result, in the history file, and in the prompt section of every later session; an
+  which land in the result, in the history file, and in the prompt guidelines of every later session; an
   exception's `__name__`, bounded only by what `type()` accepts; and the channel name itself. Bound every
   one of them where it is quoted (`oneLine`, with the limits as constants in `manager.ts`/`prompt.ts`, and
   the note ring clipped in `Channel.note` so the host never holds the whole string). `details.definitions`

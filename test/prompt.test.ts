@@ -170,13 +170,22 @@ describe("where the extension is allowed to write in the prompt", () => {
     // `customPrompt` is how pi carries both. With it set, pi renders no preamble, no tool list and no
     // rules, so the snippets and the guidelines registered on the tools are already out of the prompt;
     // the only thing left to decide is whether the session's own listing goes in, and the answer is that
-    // the extension leaves the prompt alone.
+    // the extension leaves the prompt alone — including the guidelines somebody else put there.
     const listing = await promptText(ext);
     expect(listing, "this case needs a listing to withhold").toContain("load_big_thing");
-    const options = await emitPrompt(ext, { customPrompt: "My prompt, my rules." });
-    expect(options.promptGuidelines).toEqual([]);
+    const options = await emitPrompt(ext, { customPrompt: "My prompt, my rules.", promptGuidelines: ["a rule the user wrote"] });
+    expect(options.promptGuidelines).toEqual(["a rule the user wrote"]);
     expect(options.sections).toEqual({});
     expect(options.appendSystemPrompt).toBe("");
+  });
+
+  it("appends its bullets to what is already in the guidelines list, and does not reorder it", async () => {
+    // pi dedupes rules and renders them in the order they arrive, so the extension's contribution has to
+    // join the end of the list rather than replace it.
+    const options = await emitPrompt(ext, { promptGuidelines: ["a rule the user wrote"] });
+    const guidelines = options.promptGuidelines as string[];
+    expect(guidelines[0]).toBe("a rule the user wrote");
+    expect(guidelines.slice(1).join("\n"), "the listing is missing from a session with the default prompt").toContain("load_big_thing");
   });
 
   it("still tells the user about lost channels when the prompt is overridden", async () => {

@@ -3548,3 +3548,93 @@ In the order I would try them:
    closes it, which is why "refuse the join" cannot race a creation that turns out fine); that pi renders a
    `details` object with no `channel` key; and the accepted list, including the cross-process name
    collision.
+
+---
+
+## Design change — 2026-11-05: the prompt surface moved onto pi's own slots (not a pass)
+
+The user asked for this directly, so it is recorded here rather than as an `R<n>-<nn>` finding: the
+extension's model-facing text had been written into a system-prompt section of its own (`options.sections.replmode`,
+rendered by `prompt.ts::renderSection`), and that is not a thing an extension should do. What it looked
+like, and what replaced it:
+
+- **No `options.sections[...]` write at all.** pi builds `preamble`, `tools` and `rules` itself and wraps
+  every other key of `sections` in a tag of that key's name, so `<replmode>` sat in the prompt as a block
+  of instructions with the same status as pi's own sections — including surviving a prompt the user
+  overrode.
+- **Behaviour lives in the tool and parameter descriptions** (they are declarations, not prompt body). The
+  `run` description lost every recipe — `open(path).read()`, `subprocess`, "define the tool you want as a
+  function and reuse it" — and kept what the tool *does*: same process across calls, a raising cell keeps
+  its state, 50 000 characters with head and tail kept plus the log file and the global, a cell past its
+  `timeout` moves to the background, what is installed, what `pi.*` holds. `bg_wait`'s and `bg_stop`'s
+  descriptions lost their `wait -n` analogy and their `open(path).read()` pointer.
+- **Guidance lives in each tool's `promptGuidelines`**, which pi pulls into `rules` for the tools that are
+  active. This is where the cap, the idlest-channel retirement, the timeout-blocks-the-channel rule and the
+  `kill: true` process-group exception now sit; `run` has five bullets, `bg_wait` one, `bg_stop` none.
+- **The session-dynamic listing** — the channels an earlier pi process left behind — is appended to
+  `options.promptGuidelines` in `before_agent_start`: one bullet per remembered channel plus a lead-in and
+  a closing bullet. `renderSection`/`SECTION_NAME` are gone; `lostChannelsLines` became
+  `lostChannelGuidelines`, and every bound, guard and per-record `try` in `prompt.ts` stayed where it was
+  (R3-01, R4-01, R5-03 all still apply — the record is still not trusted, it just lands in a different slot).
+- **`options.customPrompt !== undefined` ⇒ the handler returns immediately.** `customPrompt` is what pi
+  sets from a `SYSTEM.md` in the agent dir or the project, or from `--system-prompt`; pi renders no
+  `preamble`, `tools` or `rules` then, so the tool snippets and guidelines are already out of the prompt,
+  and this extension adds nothing else. `bg_wait` and `bg_stop` gained `promptSnippet`s so all three are
+  listed when pi does render its tool list.
+
+Gate after the change: `tsc`/`biome` green; **226 vitest — 18 files, 0 failing**; **47 pytest**;
+`ANCHORS_ONLY=1 bash scripts/mutation-audit.sh` → all **79 anchors match** (was 77: one prompt.ts anchor
+rotted with the section and was replaced, three new ones added). The **full sweep, re-run on the changed
+tree: 79 mutations, 77 die, the 2 survivors the accepted ones** (`flushLoose` back to `Exec.write`,
+`failure()` inventing `status: error`) — no anchor rotted silently, no mutation rejected by the typecheck.
+Four anchors rotted in the sitting and were re-found: the section's process-group line, the run-guidelines line (reworded), the restart
+notification's `notes` → `lostNotes`, and the unreadable-record `catch` body.
+
+New mutations, each one dying to a named test:
+
+- `P7-01 the session's listing is written back as a prompt section of its own` — write to
+  `options.sections.replmode` instead of pushing guidelines → *writes no prompt section of its own*,
+  *R2-10: does not change between turns*.
+- `P7-01 the listing is pushed into a prompt the user overrode with SYSTEM.md` — guard on
+  `forceSystemPrompt` instead of `customPrompt` → *adds nothing at all when the prompt is overridden*,
+  *still tells the user about lost channels when the prompt is overridden*.
+- `P7-02 the run description goes back to teaching Python instead of describing the tool` — put
+  `read a file with open(path).read()` into the `run` description → *gives no recipes for Python*.
+
+### Measured against real pi
+
+`scripts/smoke-prompt-surface.sh` (new): three real runs against a throwaway agent dir, reading the system
+message out of the **session file** rather than asking a model what it was told. Run 2 (pi's own prompt)
+carries `cwd docs preamble project_context rules tools`; run 3 (with a `SYSTEM.md` written into the agent
+dir) carries `cwd preamble project_context` — no `rules`, no `tools`, no `docs`, and no pi-replmode text
+in any section. Both greps have to skip `project_context`: pi quotes `AGENTS.md`, which contains the words
+"pi-replmode" and "stateful IPython REPL", and the first run of this smoke "failed" on exactly that. Run 2
+also proves the tools' own `promptGuidelines` reach pi's `rules` — the cap bullet and the `kill: true`
+bullet are both found there — and run 3 proves the tools are still *declared* (`run`, `bg_wait`,
+`bg_stop`) with a prompt that carries no rules at all, which is exactly why the contract had to move into
+their descriptions.
+
+### What this leaves for pass 7 to attack
+
+1. **Is `rules` the right slot for a state disclosure?** pi calls them guidelines and renders every entry
+   as `- <rule>`; the listing is a sentence about the world, not an instruction. Nothing here is wrong
+   about that, but it is a judgement the user prompted and I made — argue it in this file if you disagree.
+2. **Does a mid-session `session_start` rewrite `rules` and cost the cache?** `session_start` fires on
+   `/new`, `/resume` and `/reload`. `/new` and `/resume` start a fresh transcript, so a rewrite is free;
+   `/reload` keeps the transcript, so the *whole* `rules` section is re-sent as a patch if the listing
+   changed — and one remembered channel is enough to change it. Measured for the old section (it was
+   byte-stable for the same reason), never measured for `rules`. If it is a problem, the fix is to keep
+   the listing out of `rules` entirely (the per-answer note on a channel that has history is the obvious
+   route, and it needs a boot id in the history record to tell "earlier process" from "recreated here").
+3. **`before_agent_start` is per agent run, not per session.** It also runs for retries and compaction
+   paths. The handler assumes pi hands it a fresh normalized copy of `_baseSystemPromptOptions` every run,
+   so appends cannot accumulate; `prompt.test.ts` pins that two emits give equal arrays, which catches an
+   accumulation *inside one process*. What it cannot catch is pi itself caching the mutated object — that
+   needs a real-pi check.
+4. **What a `forceSystemPrompt` from another extension does to this** — the guard checks `customPrompt`,
+   not `forceSystemPrompt`. With only `forceSystemPrompt` set, pi renders no sections at all, so the
+   guidelines this extension appends are computed and thrown away harmlessly. Worth confirming, not worth
+   a guard, unless a run shows otherwise.
+5. **The pi version moved.** The smoke ran against installed pi **1.5.0**; `node_modules` pins **1.4.0**
+   for types. `customPrompt`/`promptGuidelines`/`sections` behave the same in both as far as the tests and
+   the smoke can see.

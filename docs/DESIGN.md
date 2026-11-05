@@ -241,10 +241,32 @@ a dead channel).
 
 ## Prompt surface
 
-Short `promptSnippet` + a few `promptGuidelines` on the tool, plus one `before_agent_start` section
-(`replmode`) that explains statefulness, channels, the `pi` namespace, and the timeout/background
-contract — same mechanism pi-takeover uses for `<takeover>`. Kept to ~15 lines: the model is
-expected to be fluent in Python already.
+pi owns the system prompt, and this extension only fills pi's own slots:
+
+- **Behaviour goes in the tool declarations** — the description, the parameter descriptions, and
+  `outputSchema`. What has to be stated there is what a plain IPython REPL does not do: the process is the
+  same one across calls, what happens at the 50 000-character limit, that a cell past its `timeout` moves
+  to the background rather than dying, what is installed. Nothing else: no `open(path).read()` and no
+  "define the tool you want as a function", because the model already knows how to write Python and a
+  recipe in a description is a nudge paid for on every request.
+- **Guidance goes in the tools' `promptGuidelines`** — pi pulls those into its `rules` section for the
+  tools that are active, and leaves them out when the tool is not. This is where the channel cap, what
+  retiring a channel costs, and what a `bg_stop {kill: true}` can and cannot reach are written down.
+- **The one session-dynamic fact goes into `options.promptGuidelines`** in `before_agent_start`: which
+  channels an earlier pi process left behind, which is the only thing the model cannot see for itself and
+  cannot be carried by a static description. It is rendered by `prompt.ts` as one bullet per remembered
+  channel, bounded on the read path because the history file is not trusted.
+- **No `options.sections[...]` entry, and nothing at all when `options.customPrompt` is set.** pi builds
+  `preamble`, `tools` and `rules` itself, and drops all three — and with them the snippets and guidelines —
+  when the user overrides the prompt with `SYSTEM.md` (agent dir or project) or `--system-prompt`. A
+  `<replmode>` section used to be written into `options.sections`, which survived that override and spoke
+  over a prompt whose owner had asked for their own words. What the model needs survives in the tool
+  declarations (an active tool is declared whatever the prompt says), and the human still gets the
+  `session_start` notification about lost channels.
+
+The bullets are computed once per session and never rewritten mid-session: pi diffs the prompt against the
+system message it is replaying, so rules that move mid-session are written into the transcript again and
+cost the provider's prompt cache from there down. Only `session_start` re-reads history.
 
 ## Python environment
 
@@ -346,9 +368,9 @@ a scripted fake would paper over.
    `pi.ask` and `pi.run_subagent` over the stdin pump, and the `call`/`call_reply` pump in the
    daemon. `pi.ask` from Python alone is the piece most likely to fight the interrupt design, so
    start with `read_image`, which has no round trip.
-4. **M4 — packaging & polish**: mostly done (env strategy, prompt section, README, CI, the
-   displacement question settled). Left: TUI renderers for a backgrounded cell, and flipping this
-   repo over to dogfooding itself.
+4. **M4 — packaging & polish**: mostly done (env strategy, the prompt surface settled onto pi's own
+   slots, README, CI, the displacement question settled). Left: TUI renderers for a backgrounded cell, and
+   flipping this repo over to dogfooding itself.
 
 ## Decisions the spec left open
 
@@ -373,6 +395,11 @@ Settled with the user; implement these, do not re-open them.
    digested, since a stem is a name a model can copy back into `channel` (R3-03). The consequence to
    remember: the encoder is not idempotent, and only a channel's real name may be passed to it. A channel
    name is also capped in length, because it is quoted in results and in every later session's prompt.
+7. **The prompt surface is pi's, not the extension's** (pass 7). Behaviour in the tool and parameter
+   descriptions, guidance in the tools' `promptGuidelines`, one session-dynamic listing appended to
+   `options.promptGuidelines`. No custom `options.sections[...]` block, and no prompt contribution at all
+   when `options.customPrompt` is set — see [Prompt surface](#prompt-surface). Do not put Python idioms
+   in a description: they shift the model's trained-in preferences and teach it nothing.
 
 ## Where the next session starts
 

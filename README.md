@@ -43,6 +43,17 @@ pi --no-builtin-tools
 
 Or keep some built-ins and drop others: `"defaultTools": ["read", "edit"]`.
 
+### With pi's system prompt
+
+pi writes the system prompt; this extension only fills pi's own slots in it — the one-line entry each
+tool contributes to the tool list, the guideline bullets its tools register (the channel cap, what
+retiring a channel costs, what `bg_stop { kill: true }` can and cannot reach), and one bullet per
+channel an earlier pi process left behind, so a resumed session knows those variables are gone. It
+writes no section of its own. Override the prompt — `SYSTEM.md` in `~/.pi/agent/` or in `.pi/`, or
+`--system-prompt` — and pi leaves those slots out entirely, so nothing from this extension reaches your
+prompt; the tools keep working, and what they do is still stated in their declarations, which are not
+part of the prompt.
+
 ## Tools
 
 | tool | what it does |

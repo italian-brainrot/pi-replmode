@@ -201,14 +201,25 @@ run_mutation "R3-05 bgStop mentions the death but not the variables" src/manager
 ---MUTATE---
     if (death) return `\n${death}; the channel went`;' "test/resilience.test.ts"
 
-run_mutation "R3-06 the section drops the process-group exception" src/prompt.ts '  "  the process group it kills (a child that left that group survives), and it loses every variable",
-  "  in the channel.",
+run_mutation "R3-06 the run guidelines drop the process-group exception" src/index.ts '"`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the servers, builds and subprocesses its cells started, except any that moved into a process group of their own.",
 ---MUTATE---
-  "  its cells started, and it loses every variable in the channel.",' "test/prompt.test.ts"
+"`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the servers, builds and subprocesses its cells started.",' "test/prompt.test.ts"
 
-run_mutation "R3-06 the run guidelines drop it too" src/index.ts '"`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started, except any that moved into a process group of their own.",
+# The prompt surface itself. The pass-6 design wrote a `<replmode>` section into the system prompt; that
+# is gone, and these two are what keep it gone: the listing goes into pi's guidelines list, and it is
+# withheld entirely from a prompt the user overrode.
+run_mutation "P7-01 the session's listing is written back as a prompt section of its own" src/index.ts '    options.promptGuidelines.push(...bullets);
 ---MUTATE---
-"`bg_stop` interrupts one cell and keeps its channel; `bg_stop {kill: true}` takes the channel down and ends the processes its cells started.",' "test/prompt.test.ts"
+    if (!options.sections || typeof options.sections !== "object") options.sections = {};
+    options.sections.replmode = bullets.join("\n");' "test/prompt.test.ts"
+
+run_mutation "P7-01 the listing is pushed into a prompt the user overrode with SYSTEM.md" src/index.ts '    if (options.customPrompt !== undefined) return undefined;
+---MUTATE---
+    if (options.forceSystemPrompt !== undefined) return undefined;' "test/prompt.test.ts"
+
+run_mutation "P7-02 the run description goes back to teaching Python instead of describing the tool" src/index.ts '  "50000 characters is cut with head and tail kept; the whole text is written to a log file and bound to " +
+---MUTATE---
+  "50000 characters is cut; read a file with open(path).read() and write one with open(path, the whole text goes to a log file and bound to " +' "test/prompt.test.ts"
 
 run_mutation "R3-08 two history files, and the last one read wins" src/manager.ts '            if (!known || known.ts <= record.ts) latest.set(record.channel, record);
 ---MUTATE---
@@ -301,9 +312,9 @@ run_mutation "R4-01 a channel name with a newline still reshapes the section" sr
 ---MUTATE---
   if (false && UNQUOTABLE.test(name)) return UNQUOTABLE_NAME;' "test/limits.test.ts"
 
-run_mutation "R4-01 the restart notification quotes the raw remembered name" src/index.ts '(${notes.map((note) => historyChannelLabel(note)).join(", ")})
+run_mutation "R4-01 the restart notification quotes the raw remembered name" src/index.ts '(${lostNotes.map((note) => historyChannelLabel(note)).join(", ")})
 ---MUTATE---
-(${notes.map((note) => note.channel).join(", ")})' "test/limits.test.ts"
+(${lostNotes.map((note) => note.channel).join(", ")})' "test/limits.test.ts"
 
 run_mutation "R4-03 the never-ready daemon is answered with the bare timeout again" src/channel.ts '        throw await channel.reportNeverReady(`the channel daemon did not report ready within ${readyTimeoutMs / 1000}s`);
 ---MUTATE---
@@ -463,8 +474,8 @@ run_mutation "R5-03 a remembered definitions field of the wrong shape is trusted
 ---MUTATE---
   const names: readonly unknown[] = (note.definitions ?? []) as readonly unknown[];' "test/prompt.test.ts"
 
-run_mutation "R5-03 one unreadable history record takes the whole section with it" src/prompt.ts '  } catch {
-    return `  ${label}: (a record this section could not read)`;
+run_mutation "R5-03 one unreadable history record takes the whole listing with it" src/prompt.ts '  } catch {
+    return `channel "${label}": (a record this note could not read)`;
   }
 ---MUTATE---
   } catch (error) {
